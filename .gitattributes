@@ -1,0 +1,87 @@
+# Robust Git attributes for Swift/Xcode projects
+# Normalize line endings and treat text files consistently
+* text=auto eol=lf
+
+# Source code (text)
+*.swift text eol=lf
+*.h     text eol=lf
+*.m     text eol=lf
+*.mm    text eol=lf
+*.c     text eol=lf
+*.cc    text eol=lf
+*.cpp   text eol=lf
+*.hpp   text eol=lf
+*.hh    text eol=lf
+*.metal text eol=lf
+
+# Scripts and configuration (text)
+*.sh    text eol=lf
+*.py    text eol=lf
+*.rb    text eol=lf
+*.js    text eol=lf
+*.ts    text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.xml   text eol=lf
+*.plist text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+
+# Xcode project files (text; union merge to reduce conflicts)
+*.pbxproj        text eol=lf merge=union
+*.xcscheme       text eol=lf
+*.xcworkspacedata text eol=lf
+*.xcsettings     text eol=lf
+*.xcconfig       text eol=lf
+
+# Interface Builder (XML text)
+*.storyboard text eol=lf
+*.xib       text eol=lf
+
+# Swift Package Manager
+Package.resolved text eol=lf merge=union
+
+# CocoaPods / Carthage lockfiles
+Podfile         text eol=lf
+Podfile.lock    text eol=lf merge=union
+Cartfile        text eol=lf
+Cartfile.resolved text eol=lf merge=union
+
+# Localization files
+*.strings     text eol=lf
+*.stringsdict text eol=lf
+
+# Asset catalogs
+# JSON manifests should be text; images within are binary (handled below)
+*.xcassets/**/Contents.json text eol=lf
+
+# Images and other binary assets (disable diff, no eol normalization)
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.tif  binary
+*.tiff binary
+*.heic binary
+*.webp binary
+*.bmp  binary
+*.ico  binary
+
+# Archives and bundles
+*.zip  binary
+*.tar  binary
+*.gz   binary
+*.bz2  binary
+*.7z   binary
+*.dmg  binary
+*.ipa  binary
+*.xcarchive binary
+
+# Xcode-generated binary/state files
+*.car        binary
+*.xcuserstate binary
+*.dSYM       binary
+.DS_Store    binary

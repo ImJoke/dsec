@@ -1,0 +1,11 @@
+version: '3'
+services:
+  deepseek-free-api:
+    container_name: deepseek-free-api
+    image: ghcr.io/fu-jie/deepseek-free-api:latest
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - TZ=Asia/Shanghai
+      - DEEP_SEEK_CHAT_AUTHORIZATION=${DEEP_SEEK_CHAT_AUTHORIZATION}
