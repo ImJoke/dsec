@@ -9,7 +9,7 @@
  ╚═════╝ ╚══════╝╚══════╝ ╚═════╝
 ```
 
-> **Agentic AI security assistant** for Bug Bounty, HackTheBox, CTF, and Vulnerability Research — powered by DeepSeek R1 with live research, semantic memory, and context-aware compression.
+> **Agentic AI security assistant** for Bug Bounty, HackTheBox, CTF, and Vulnerability Research — powered by DeepSeek with live research, semantic memory, and context-aware compression.
 
 ---
 
@@ -134,14 +134,6 @@ dsec config --set research_max_results 5
 | `research_max_results` | `5` | Max results per research source |
 | `memory_similarity_threshold` | `0.82` | Minimum cosine similarity for memory injection |
 | `memory_max_inject` | `3` | Max memory entries injected per query |
-
-## ✅ Testing
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
----
 
 ## 💻 Usage
 
@@ -406,11 +398,3 @@ dsec processes every query through a 12-step pipeline:
 10. **Update session** — save conversation ID, increment message count, append history
 11. **Auto-extract memories** — regex-extract CVEs, software versions, credentials, and successful techniques from the AI response
 12. **Store memories** — persist extracted snippets to ChromaDB with `confidence: suspected`
-
----
-
-## 📄 License
-
-MIT License. See [LICENSE](LICENSE) for details.
-
-Built with ❤️ for the security community.
