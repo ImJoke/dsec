@@ -1081,7 +1081,7 @@ def _launch_shell(
         "no_research": no_research,
         "no_memory": no_memory,
         "quick": quick,
-        "auto_exec": False,   # /autoexec toggle
+        "auto_exec": True,   # /autoexec toggle
     }
 
     _print_shell_banner(shell_session, shell_domain, shell_model)
