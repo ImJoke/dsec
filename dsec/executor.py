@@ -7,7 +7,9 @@ from __future__ import annotations
 import os
 import re as _re
 import shlex
+import stat
 import subprocess
+import tempfile
 import threading
 from typing import Callable, Optional
 
@@ -25,14 +27,25 @@ def _has_sudo(cmd: "str | list[str]") -> bool:
     return bool(_SUDO_RE.search(cmd))
 
 
-def _inject_sudo_S(cmd: "str | list[str]") -> "str | list[str]":
-    """Ensure sudo uses -S (read password from stdin) without modifying anything else."""
+def _inject_sudo_A(cmd: "str | list[str]") -> "str | list[str]":
+    """Replace first sudo with sudo -A (use SUDO_ASKPASS helper)."""
     if isinstance(cmd, list):
-        if cmd and cmd[0] == "sudo" and "-S" not in cmd:
-            return ["sudo", "-S"] + cmd[1:]
+        if cmd and cmd[0] == "sudo" and "-A" not in cmd:
+            return ["sudo", "-A"] + cmd[1:]
         return cmd
-    # Shell string: add -S after first sudo occurrence
-    return _SUDO_RE.sub("sudo -S", cmd, count=1)
+    return _SUDO_RE.sub("sudo -A", cmd, count=1)
+
+
+def _create_askpass(password: str) -> str:
+    """Write a temp chmod-700 shell script that prints the sudo password."""
+    fd, path = tempfile.mkstemp(prefix=".dsec_ap_", suffix=".sh")
+    try:
+        script = f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(password)}\n"
+        os.write(fd, script.encode())
+        os.fchmod(fd, stat.S_IRWXU)
+    finally:
+        os.close(fd)
+    return path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,18 +172,22 @@ class CommandRunner:
                 return CommandResult(command, "", "Empty command.", 1)
             # shutil.which would be ideal but let the OS raise FileNotFoundError
 
-        # Prepare sudo password injection (-S reads password from stdin)
+        # Prepare sudo password injection via SUDO_ASKPASS (no stdin race condition)
         _sudo_inject = bool(sudo_password and _has_sudo(argv))
+        _askpass_path: Optional[str] = None
         if _sudo_inject:
-            argv = _inject_sudo_S(argv)  # type: ignore[assignment]
+            argv = _inject_sudo_A(argv)  # type: ignore[assignment]
+            _askpass_path = _create_askpass(sudo_password)
 
         try:
             env = os.environ.copy()
             env.pop("DSEC_SUDO_PASS", None)  # don't leak into child env
+            if _askpass_path:
+                env["SUDO_ASKPASS"] = _askpass_path
             with self._lock:
                 self._proc = subprocess.Popen(
                     argv,
-                    stdin=subprocess.PIPE if _sudo_inject else None,
+                    stdin=None,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -180,19 +197,6 @@ class CommandRunner:
                     env=env,
                 )
             proc = self._proc  # local ref for thread closures
-
-            # Write password to stdin then close it so sudo can proceed
-            if _sudo_inject and proc.stdin:
-                _pw = sudo_password  # capture for closure
-                def _write_sudo_stdin() -> None:
-                    try:
-                        assert proc.stdin is not None
-                        proc.stdin.write(_pw + "\n")
-                        proc.stdin.flush()
-                        proc.stdin.close()
-                    except (OSError, BrokenPipeError):
-                        pass
-                threading.Thread(target=_write_sudo_stdin, daemon=True).start()
 
             def _read_stdout() -> None:
                 assert proc.stdout is not None
@@ -245,6 +249,11 @@ class CommandRunner:
         finally:
             with self._lock:
                 self._proc = None
+            if _askpass_path:
+                try:
+                    os.unlink(_askpass_path)
+                except OSError:
+                    pass
 
         return CommandResult(
             command=command,
