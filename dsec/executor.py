@@ -5,10 +5,34 @@ Run local shell commands with streaming output and interrupt support.
 from __future__ import annotations
 
 import os
+import re as _re
 import shlex
 import subprocess
 import threading
 from typing import Callable, Optional
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sudo helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SUDO_RE = _re.compile(r'\bsudo\b')
+
+
+def _has_sudo(cmd: "str | list[str]") -> bool:
+    if isinstance(cmd, list):
+        return bool(cmd) and cmd[0] == "sudo"
+    return bool(_SUDO_RE.search(cmd))
+
+
+def _inject_sudo_S(cmd: "str | list[str]") -> "str | list[str]":
+    """Ensure sudo uses -S (read password from stdin) without modifying anything else."""
+    if isinstance(cmd, list):
+        if cmd and cmd[0] == "sudo" and "-S" not in cmd:
+            return ["sudo", "-S"] + cmd[1:]
+        return cmd
+    # Shell string: add -S after first sudo occurrence
+    return _SUDO_RE.sub("sudo -S", cmd, count=1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,6 +128,7 @@ class CommandRunner:
         timeout: int = 300,
         shell: bool = False,
         cwd: Optional[str] = None,
+        sudo_password: Optional[str] = None,
     ) -> CommandResult:
         """
         Run *command* (synchronously) and return a CommandResult.
@@ -134,11 +159,18 @@ class CommandRunner:
                 return CommandResult(command, "", "Empty command.", 1)
             # shutil.which would be ideal but let the OS raise FileNotFoundError
 
+        # Prepare sudo password injection (-S reads password from stdin)
+        _sudo_inject = bool(sudo_password and _has_sudo(argv))
+        if _sudo_inject:
+            argv = _inject_sudo_S(argv)  # type: ignore[assignment]
+
         try:
             env = os.environ.copy()
+            env.pop("DSEC_SUDO_PASS", None)  # don't leak into child env
             with self._lock:
                 self._proc = subprocess.Popen(
                     argv,
+                    stdin=subprocess.PIPE if _sudo_inject else None,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -149,21 +181,38 @@ class CommandRunner:
                 )
             proc = self._proc  # local ref for thread closures
 
+            # Write password to stdin then close it so sudo can proceed
+            if _sudo_inject and proc.stdin:
+                _pw = sudo_password  # capture for closure
+                def _write_sudo_stdin() -> None:
+                    try:
+                        assert proc.stdin is not None
+                        proc.stdin.write(_pw + "\n")
+                        proc.stdin.flush()
+                        proc.stdin.close()
+                    except (OSError, BrokenPipeError):
+                        pass
+                threading.Thread(target=_write_sudo_stdin, daemon=True).start()
+
             def _read_stdout() -> None:
                 assert proc.stdout is not None
-                from .formatter import console
-                for line in proc.stdout:
-                    stdout_parts.append(line)
-                    if on_stdout:
-                        on_stdout(line)
+                try:
+                    for line in proc.stdout:
+                        stdout_parts.append(line)
+                        if on_stdout:
+                            on_stdout(line)
+                except (OSError, ValueError):
+                    pass
 
             def _read_stderr() -> None:
                 assert proc.stderr is not None
-                from .formatter import console
-                for line in proc.stderr:
-                    stderr_parts.append(line)
-                    if on_stderr:
-                        on_stderr(line)
+                try:
+                    for line in proc.stderr:
+                        stderr_parts.append(line)
+                        if on_stderr:
+                            on_stderr(line)
+                except (OSError, ValueError):
+                    pass
 
             t_out = threading.Thread(target=_read_stdout, daemon=True)
             t_err = threading.Thread(target=_read_stderr, daemon=True)
@@ -174,10 +223,15 @@ class CommandRunner:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
                 interrupted = True
 
-            t_out.join(timeout=3)
-            t_err.join(timeout=3)
+            t_out.join(timeout=10)
+            t_err.join(timeout=10)
 
             returncode = proc.returncode if proc.returncode is not None else 0
 

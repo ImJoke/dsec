@@ -311,3 +311,36 @@ def check_tokens() -> Dict[str, Any]:
         "current_index": config.get("current_token_index", 0),
         "base_url": config.get("base_url", DEFAULT_CONFIG["base_url"]),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sudo password (stored as an extra key, not part of DEFAULT_CONFIG)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_sudo_password() -> str:
+    """Return the persisted sudo password, or empty string if not set."""
+    try:
+        if CONFIG_FILE.exists():
+            with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if isinstance(raw, dict):
+                return str(raw.get("sudo_password", ""))
+    except (OSError, json.JSONDecodeError):
+        pass
+    return ""
+
+
+def set_sudo_password(password: str) -> None:
+    """Persist the sudo password in config (stored as an extra key)."""
+    config = load_config()
+    extras = _read_extra_keys()
+    extras["sudo_password"] = password
+    _write_config({**extras, **config})
+
+
+def clear_sudo_password() -> None:
+    """Remove the sudo password from config."""
+    config = load_config()
+    extras = _read_extra_keys()
+    extras.pop("sudo_password", None)
+    _write_config({**extras, **config})

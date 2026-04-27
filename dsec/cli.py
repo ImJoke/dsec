@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import os as _os
 import re as _re
 import sys
 import threading
@@ -36,11 +37,14 @@ from .config import (
     ConfigError,
     add_tokens,
     check_tokens,
+    clear_sudo_password,
     get_next_token,
+    get_sudo_password,
     init_config,
     list_tokens,
     load_config,
     save_config,
+    set_sudo_password,
 )
 from .domain import detect_domain, get_domain, get_system_prompt
 from .formatter import (
@@ -448,10 +452,10 @@ def _run_agentic_loop(
                 else:
                     try:
                         console.print(
-                            "  [bold green]\\[y][/bold green]es  "
-                            "[bold red]\\[n][/bold red]o  "
-                            "[bold yellow]\\[A][/bold yellow]ll yes  "
-                            "[bold]\\[e][/bold]dit"
+                            "  [bold green]\\[y]es[/bold green]  "
+                            "[bold red]\\[n]o[/bold red]  "
+                            "[bold yellow]\\[A]ll yes[/bold yellow]  "
+                            "[bold]\\[e]dit[/bold]"
                         )
                         choice = _safe_input("> ").lower()
                     except (EOFError, KeyboardInterrupt):
@@ -483,21 +487,23 @@ def _run_agentic_loop(
 
                 result_holder: List[Optional[CommandResult]] = [None]
 
-                def _worker(c: str = edited_cmd) -> None:
+                def _worker(c: str = edited_cmd, _sp: Optional[str] = state.get("sudo_password")) -> None:
                     result_holder[0] = runner.run(
                         c,
                         on_stdout=lambda line: console.print(line, end="", highlight=False),
                         on_stderr=lambda line: console.print(f"[#888888]{line}[/]", end="", highlight=False),
                         shell=True,
+                        sudo_password=_sp,
                     )
 
                 t = threading.Thread(target=_worker, daemon=True)
                 t.start()
                 try:
-                    t.join()
+                    while t.is_alive():
+                        t.join(timeout=0.25)
                 except KeyboardInterrupt:
                     runner.interrupt()
-                    t.join(timeout=3)
+                    t.join(timeout=5)
                     console.print()
                     print_warning("Command interrupted.")
 
@@ -602,14 +608,15 @@ def _generate_shell_session_name() -> str:
     return datetime.now().strftime("shell-%Y%m%d-%H%M%S")
 
 
-def _print_shell_banner(session_name: str, domain: str, model: str) -> None:
+def _print_shell_banner(session_name: str, domain: str, model: str, sudo_set: bool = False) -> None:
     domain_cfg = get_domain(domain)
     color = domain_cfg.get("color", "white")
+    sudo_indicator = "  [bold yellow]🔑 sudo[/bold yellow]" if sudo_set else ""
     console.print()
-    console.print(f"[{color}]●[/{color}] [bold]DSEC Interactive[/bold]")
+    console.print(f"[{color}]●[/{color}] [bold]DSEC Interactive[/bold]{sudo_indicator}")
     console.print(f"  [#888888]session:[/] {session_name}  [#888888]domain:[/] {domain_cfg.get('display', domain)}  [#888888]model:[/] {model}")
     cmds = ["!<cmd>", "/history", "/note", "/domain", "/model",
-            "/autoexec", "/mcp", "/status", "/help", "/exit"]
+            "/autoexec", "/sudo", "/mcp", "/status", "/help", "/exit"]
     console.print(f"  [cyan]{'  '.join(cmds)}[/cyan]\n")
 
 
@@ -628,6 +635,13 @@ def _print_shell_help() -> None:
                 "[bold cyan]── Agentic Execution ────────────────────────────[/bold cyan]\n"
                 "[bold]/autoexec on[/bold]      auto-approve AI <bash> blocks (no confirm)\n"
                 "[bold]/autoexec off[/bold]     (default) ask y/n/A/e before each AI command\n\n"
+                "[bold cyan]── Sudo Auto-Inject ─────────────────────────────[/bold cyan]\n"
+                "[bold]/sudo[/bold]             prompt for sudo password (hidden input)\n"
+                "[bold]/sudo <pass>[/bold]      set sudo password inline\n"
+                "[bold]/sudo save[/bold]        persist password to ~/.dsec/config.json\n"
+                "[bold]/sudo clear[/bold]       remove password (in-session and from config)\n"
+                "[bold]/sudo status[/bold]      show whether sudo password is active\n"
+                "                  [#888888]Also reads DSEC_SUDO_PASS env var on startup.[/]\n\n"
                 "[bold cyan]── Session ──────────────────────────────────────[/bold cyan]\n"
                 "[bold]/session[/bold]          show session details (notes, flags, history)\n"
                 "[bold]/history[/bold]          show last 10 conversation turns\n"
@@ -678,9 +692,50 @@ def _print_shell_status(state: Dict[str, Any]) -> None:
     info.append("Auto-exec:   ", style="bold")
     ae = state.get("auto_exec", False)
     info.append(f"[bold {'green' if ae else 'red'}]{'ON' if ae else 'OFF'}[/bold {'green' if ae else 'red'}]\n")
+    info.append("Sudo pass:   ", style="bold")
+    sudo_set = bool(state.get("sudo_password"))
+    info.append(f"[bold {'yellow' if sudo_set else 'dim'}]{'🔑 set' if sudo_set else 'not set'}[/bold {'yellow' if sudo_set else 'dim'}]\n")
     from rich import box
     from rich.panel import Panel
     console.print(Panel(info, title="[bold]Shell Status[/bold]", title_align="left", border_style="blue", box=box.MINIMAL))
+
+
+def _handle_sudo_command(arg: str, state: Dict[str, Any]) -> None:
+    """Handle /sudo subcommands."""
+    if arg == "clear":
+        state["sudo_password"] = None
+        clear_sudo_password()
+        print_success("Sudo password cleared.")
+        return
+    if arg == "save":
+        pw = state.get("sudo_password")
+        if not pw:
+            print_warning("No sudo password active. Set one first with [bold]/sudo[/bold].")
+            return
+        set_sudo_password(pw)
+        print_success("Sudo password saved to [bold]~/.dsec/config.json[/bold].")
+        return
+    if arg == "status":
+        has = bool(state.get("sudo_password"))
+        print_info(f"Sudo password: {'🔑 active' if has else 'not set'}")
+        return
+    if arg:
+        state["sudo_password"] = arg
+        print_success("Sudo password set [#888888](🔑 auto-injecting for sudo commands)[/]")
+        return
+    # No argument: hidden prompt via getpass
+    import getpass
+    try:
+        pw = getpass.getpass("Sudo password (input hidden): ")
+    except (KeyboardInterrupt, EOFError):
+        console.print()
+        print_info("Cancelled.")
+        return
+    if pw:
+        state["sudo_password"] = pw
+        print_success("Sudo password set [#888888](🔑 auto-injecting for sudo commands)[/]")
+    else:
+        print_info("No password entered.")
 
 
 def _handle_shell_command(raw: str, state: Dict[str, Any]) -> bool:
@@ -770,6 +825,11 @@ def _handle_shell_command(raw: str, state: Dict[str, Any]) -> bool:
         _handle_mcp_command(arg, state)
         return True
 
+    # ── sudo ──────────────────────────────────────────────────────────────────
+    if command == "/sudo":
+        _handle_sudo_command(arg, state)
+        return True
+
     print_warning(f"Unknown shell command: {command}. Use /help.")
     return True
 
@@ -829,15 +889,17 @@ def _shell_run_command(cmd: str, state: Dict[str, Any]) -> None:
             on_stdout=lambda line: console.print(line, end="", highlight=False),
             on_stderr=lambda line: console.print(f"[#888888]{line}[/]", end="", highlight=False),
             shell=True,  # shell=True for convenience in security ops
+            sudo_password=state.get("sudo_password"),
         )
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
     try:
-        t.join()
+        while t.is_alive():
+            t.join(timeout=0.25)
     except KeyboardInterrupt:
         runner.interrupt()
-        t.join(timeout=3)
+        t.join(timeout=5)
 
     console.print("\n[#888888]─────────────────────────────[/]")
     result: CommandResult = result_holder[0]  # type: ignore[assignment]
@@ -859,8 +921,8 @@ def _shell_run_command(cmd: str, state: Dict[str, Any]) -> None:
     try:
         console.print(
             "\n[bold]Send this output to the AI?[/bold]  "
-            "[bold green]\\[s][/bold green]end  [bold]\\[d][/bold]iscard  "
-            "[bold]\\[a][/bold]sk a question first"
+            "[bold green]\\[s]end[/bold green]  [bold]\\[d]iscard[/bold]  "
+            "[bold]\\[a]sk a question first[/bold]"
         )
         choice = console.input("> ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -1004,7 +1066,7 @@ def _handle_mcp_command(arg: str, state: Dict[str, Any]) -> None:
                 console.print(Syntax(_json2.dumps(result, indent=2), "json"))
             # Offer to send to AI
             try:
-                console.print("\n[bold]Send result to AI?[/bold] [bold green]\\[y][/bold green]/[bold]\\[n][/bold]")
+                console.print("\n[bold]Send result to AI?[/bold] [bold green]\\[y]es[/bold green]/[bold]\\[n]o[/bold]")
                 if console.input("> ").strip().lower() == "y":
                     output_str = result if isinstance(result, str) else _json2.dumps(result, indent=2)
                     _run_chat(
@@ -1058,8 +1120,8 @@ def _launch_shell(
                 console.print(
                     rf"[#888888]Last session:[/] [bold]{last}[/bold] "
                     rf"[#888888]({msgs} messages)[/]  "
-                    rf"[bold cyan]\[r][/bold cyan][#888888]esume  [/]"
-                    rf"[bold cyan]\[n][/bold cyan][#888888]ew[/]"
+                    rf"[bold cyan]\[r]esume[/bold cyan]  "
+                    rf"[bold cyan]\[n]ew[/bold cyan]"
                 )
                 choice = console.input("> ").strip().lower()
             except (EOFError, KeyboardInterrupt):
@@ -1072,6 +1134,9 @@ def _launch_shell(
         _resolve_session(shell_session, "", config, domain_override, model_override)
     shell_domain = domain_override or detect_domain("", shell_session)
     shell_model = model_override or config.get("default_model", "deepseek-expert-r1-search")
+    # Resolve sudo password: env var → persisted config → None
+    _initial_sudo = _os.environ.get("DSEC_SUDO_PASS") or get_sudo_password() or None
+
     state: Dict[str, Any] = {
         "session_name": shell_session,
         "domain_override": domain_override,
@@ -1082,9 +1147,10 @@ def _launch_shell(
         "no_memory": no_memory,
         "quick": quick,
         "auto_exec": True,   # /autoexec toggle
+        "sudo_password": _initial_sudo,
     }
 
-    _print_shell_banner(shell_session, shell_domain, shell_model)
+    _print_shell_banner(shell_session, shell_domain, shell_model, sudo_set=bool(_initial_sudo))
 
     # ── Build prompt_toolkit session (falls back to None if unavailable) ──────
     pt_session = build_prompt_session(state)
