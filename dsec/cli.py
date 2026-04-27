@@ -702,6 +702,21 @@ def _run_agentic_loop(
                     tool_responses.append({"name": tool_name, "result": "[error: empty command]"})
                     continue
 
+                # ── Wrong format detection ────────────────────────────────────
+                import re as _re
+                _MARKDOWN_LINK_RE = _re.compile(r'\[[^\]]+\]\([^)]+\)')
+                md_links = _MARKDOWN_LINK_RE.findall(cmd)
+                if md_links:
+                    examples = ", ".join(f"'{m}'" for m in md_links[:3])
+                    fix_hint = _MARKDOWN_LINK_RE.sub(lambda m: m.group(0).split('](')[0][1:], cmd)
+                    warn_msg = (
+                        f"Wrong format detected: command contains markdown link(s) {examples}. "
+                        f"Use plain text filenames/paths, not markdown. Suggested fix: {fix_hint}"
+                    )
+                    print_warning(warn_msg)
+                    tool_responses.append({"name": tool_name, "result": f"[error: {warn_msg}]"})
+                    continue
+
                 print_tool_header("bash", idx, len(tool_calls), domain)
 
                 # We no longer print a large Panel. We just print a compact line.
