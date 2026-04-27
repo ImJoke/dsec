@@ -603,6 +603,7 @@ def _run_agentic_loop(
     no_think: bool,
     no_memory: bool,
     auto_exec: bool = False,
+    sudo_password: Optional[str] = None,
     max_iterations: int = 999
 ) -> Optional[str]:
     """
@@ -791,13 +792,13 @@ def _run_agentic_loop(
 
                 result_holder: List[Optional[CommandResult]] = [None]
 
-                def _worker(c: str = edited_cmd, _sp: Optional[str] = state.get("sudo_password")) -> None:
+                def _worker(c: str = edited_cmd) -> None:
                     result_holder[0] = runner.run(
                         c,
                         on_stdout=lambda line: console.print(line, end="", highlight=False),
                         on_stderr=lambda line: console.print(f"[#888888]{line}[/]", end="", highlight=False),
                         shell=True,
-                        sudo_password=_sp,
+                        sudo_password=sudo_password,
                     )
 
                 t = threading.Thread(target=_worker, daemon=True)
@@ -1487,6 +1488,7 @@ def _shell_run_command(cmd: str, state: Dict[str, Any]) -> None:
                 no_memory=state["no_memory"],
                 quick=state["quick"],
                 _tool_output=result.as_tool_output(),
+                _sudo_password=state.get("sudo_password"),
             )
         except KeyboardInterrupt:
             console.print()
@@ -1509,6 +1511,7 @@ def _shell_run_command(cmd: str, state: Dict[str, Any]) -> None:
                     no_memory=state["no_memory"],
                     quick=state["quick"],
                     _tool_output=result.as_tool_output(),
+                    _sudo_password=state.get("sudo_password"),
                 )
             except KeyboardInterrupt:
                 console.print()
@@ -1625,6 +1628,7 @@ def _handle_mcp_command(arg: str, state: Dict[str, Any]) -> None:
                         no_memory=state["no_memory"],
                         quick=state["quick"],
                         _tool_output=f"[MCP {srv_name}/{tool_name}]\n{output_str}",
+                        _sudo_password=state.get("sudo_password"),
                     )
             except (EOFError, KeyboardInterrupt):
                 pass
@@ -1748,6 +1752,7 @@ def _launch_shell(
                     _auto_exec=state.get("auto_exec", False),
                     _mode=state.get("mode", "auto"),
                     _personality=state.get("personality", "professional"),
+                    _sudo_password=state.get("sudo_password"),
                 )
             except KeyboardInterrupt:
                 console.print()
@@ -1812,11 +1817,12 @@ def _run_chat(
     no_research: bool,
     no_memory: bool,
     quick: bool,
-    _tool_output: str = "",   # pre-injected tool output (from /run or /mcp call)
-    _auto_exec: bool = False, # auto-approve AI-requested commands
-    _mode: str = "auto",      # agent mode (architect, recon, exploit, ask, auto)
-    _personality: str = "professional", # agent personality
-    deliver: str = "local",    # delivery target (local, telegram, slack)
+    _tool_output: str = "",
+    _auto_exec: bool = False,
+    _mode: str = "auto",
+    _personality: str = "professional",
+    _sudo_password: Optional[str] = None,
+    deliver: str = "local",
 ) -> None:
     config = load_config()
     stdin_content = _tool_output or _read_stdin_content()
@@ -1948,6 +1954,7 @@ def _run_chat(
             no_think=no_think,
             no_memory=no_memory,
             auto_exec=_auto_exec,
+            sudo_password=_sudo_password,  # passed down from shell state
         )
 
     # ── delivery notification ──────────────────────────────────────────────────

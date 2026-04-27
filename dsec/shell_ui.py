@@ -57,9 +57,12 @@ _SLASH_COMMANDS: List[str] = [
     "/mode",
     "/personality",
     "/scope",
+    "/sudo",
     "/exit",
     "/quit",
 ]
+
+_SUDO_SUBS: List[str] = ["clear", "save", "status"]
 
 _DOMAIN_CHOICES: List[str] = ["htb", "bugbounty", "ctf", "research", "programmer"]
 
@@ -124,12 +127,23 @@ if _PROMPT_TOOLKIT_AVAILABLE:
             if text.lstrip().startswith("/autoexec"):
                 parts = text.split()
                 if len(parts) == 1 and not text.endswith(" "):
-                    # No space yet — prefix completions with a space
                     for c in ("on", "off"):
                         yield Completion(" " + c, start_position=0)
                     return
                 word = parts[-1] if len(parts) > 1 and not text.endswith(" ") else ""
                 yield from _completions_for(["on", "off"], word)
+                return
+
+            if text.lstrip().startswith("/sudo"):
+                parts = text.split()
+                if len(parts) == 1 and not text.endswith(" "):
+                    for c in _SUDO_SUBS:
+                        yield Completion(" " + c, start_position=0)
+                    return
+                word = parts[-1] if len(parts) > 1 and not text.endswith(" ") else ""
+                if word.startswith("/"):
+                    word = ""
+                yield from _completions_for(_SUDO_SUBS, word)
                 return
 
             if text.lstrip().startswith("/domain"):
