@@ -125,6 +125,7 @@ from .session import (
 # ────────────────────────────────────────────────────────────────────────────
 
 _ANSI_ESCAPE_RE = _re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_MARKDOWN_LINK_RE = _re.compile(r'\[[^\]]+\]\([^)]+\)')
 
 
 def _safe_input(prompt: str) -> str:
@@ -703,8 +704,6 @@ def _run_agentic_loop(
                     continue
 
                 # ── Wrong format detection ────────────────────────────────────
-                import re as _re
-                _MARKDOWN_LINK_RE = _re.compile(r'\[[^\]]+\]\([^)]+\)')
                 md_links = _MARKDOWN_LINK_RE.findall(cmd)
                 if md_links:
                     examples = ", ".join(f"'{m}'" for m in md_links[:3])
@@ -842,6 +841,11 @@ def _run_agentic_loop(
                     elif res.returncode not in (0,):
                         parts.append(f"[exit code: {res.returncode}]")
                     result_text = "\n".join(parts)
+
+                    # Sudo password not configured
+                    if "sudo: no password was provided" in result_text or "sudo: a password is required" in result_text:
+                        result_text += "\n\n[SYSTEM] Sudo requires a password. Run /sudo to set it, or redesign the command without sudo."
+                        print_warning("Sudo password not set. Run /sudo to configure it.")
 
                     # Stuck detection for failed commands
                     if res.returncode != 0:
