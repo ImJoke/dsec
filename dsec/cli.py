@@ -1009,8 +1009,8 @@ def _run_agentic_loop(
                 if _sd and "history" in _sd:
                     for _t in _sd["history"]:
                         _cm.add_turn(_t["role"], _t.get("content", ""), _t.get("thinking", ""))
-                if _cm.usage_percent >= 85:
-                    _target = int(_cm.budget * 0.55)
+                if _cm.usage_percent >= 50:
+                    _target = int(_cm.budget * 0.40)
                     _pruned = _cm.to_messages(limit=_target)
                     _kept = sum(1 for m in _pruned if m["role"] != "system")
                     if _sd and "history" in _sd:
@@ -1927,10 +1927,10 @@ def _run_chat(
             cm.add_turn(t["role"], t.get("content", ""), t.get("thinking", ""))
     
     history = None
-    if cm.usage_percent >= 90:
+    if cm.usage_percent >= 50:
         print_info(f"Context budget reached ({cm.usage_percent}%). Pruning oldest turns...")
-        # Prune to fit within 60% of budget
-        target_tokens = int(cm.budget * 0.6)
+        # Prune to fit within 40% of budget (conservative — char/token ratio is imprecise for code)
+        target_tokens = int(cm.budget * 0.40)
         history = cm.to_messages(limit=target_tokens)
         
         # Permanently prune the session file so it doesn't just reload the full history on the next turn
@@ -1967,6 +1967,39 @@ def _run_chat(
     if response_content is None:
         return
 
+    # ── Server error auto-retry with forced compaction ────────────────────────
+    _SERVER_ERR_PATTERNS = ["服务暂时不可用", "第三方响应错误", "context length exceeded", "token limit"]
+    if any(p in (response_content or "") for p in _SERVER_ERR_PATTERNS):
+        print_warning("Server returned an error (likely context overflow). Force-compacting and retrying…")
+        _force_target = int(cm.budget * 0.30)
+        _pruned_history = cm.to_messages(limit=_force_target)
+        _kept = sum(1 for m in _pruned_history if m["role"] != "system")
+        if session_data and "history" in session_data:
+            session_data["history"] = session_data["history"][-_kept:] if _kept > 0 else []
+            from dsec.session import save_session
+            save_session(session_name, session_data)
+        generator = chat_stream(
+            message=final_prompt,
+            model=model,
+            conversation_id=None,
+            base_url=config.get("base_url", "http://localhost:8000"),
+            token=get_next_token(),
+            history=_pruned_history,
+        )
+        thinking, response_content, new_conv_id = stream_response(
+            generator=generator,
+            session_name=session_name or "none",
+            domain=domain,
+            model=model,
+            turn=turn,
+            compression_info=compression_info,
+            research_sources=research_sources_used,
+            memory_count=memory_count,
+            show_thinking=config.get("show_thinking", True) and not no_think,
+        )
+        if response_content is None:
+            return
+
     _persist_successful_turn(
         session_name="" if quick else session_name,
         full_input=full_input,
@@ -1975,11 +2008,12 @@ def _run_chat(
         compression_info=compression_info,
         new_conv_id=new_conv_id,
     )
+    _is_error_response = any(p in (response_content or "") for p in _SERVER_ERR_PATTERNS)
     _auto_store_memories(
         response_content,
         session_name,
         domain,
-        enabled=not quick,
+        enabled=not quick and not _is_error_response,
     )
 
     # ── agentic execution loop ─────────────────────────────────────────────────
