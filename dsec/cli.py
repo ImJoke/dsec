@@ -1964,7 +1964,8 @@ def _run_chat(
         show_thinking=config.get("show_thinking", True) and not no_think,
     )
 
-    if response_content is None:
+    if response_content is None or response_content.strip() == "":
+        print_warning("Model returned an empty response. The session may have been compacted — try sending your message again.")
         return
 
     # ── Server error auto-retry with forced compaction ────────────────────────
