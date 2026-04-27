@@ -1000,6 +1000,26 @@ def _run_agentic_loop(
                 thinking=thinking,
             )
 
+            # Auto-compact context inside the loop if approaching the budget
+            if iteration % 5 == 0:
+                from dsec.context_manager import ContextManager
+                from dsec.session import load_session
+                _cm = ContextManager(domain=domain, model=model)
+                _sd = load_session(session_name)
+                if _sd and "history" in _sd:
+                    for _t in _sd["history"]:
+                        _cm.add_turn(_t["role"], _t.get("content", ""), _t.get("thinking", ""))
+                if _cm.usage_percent >= 85:
+                    _target = int(_cm.budget * 0.55)
+                    _pruned = _cm.to_messages(limit=_target)
+                    _kept = sum(1 for m in _pruned if m["role"] != "system")
+                    if _sd and "history" in _sd:
+                        _sd["history"] = _sd["history"][-_kept:] if _kept > 0 else []
+                        from dsec.session import save_session
+                        save_session(session_name, _sd)
+                    current_conv_id = None  # reset server-side context
+                    print_info(f"Context compacted at iteration {iteration} ({_cm.usage_percent}% → pruned to {_kept} turns).")
+
         current_response = new_content
 
     else:

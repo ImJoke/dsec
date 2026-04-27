@@ -370,7 +370,8 @@ def build_prompt_session(state: Dict[str, Any]) -> Optional["PromptSession"]:  #
         try:
             from dsec.context_manager import ContextManager
             from dsec.session import load_session
-            cm = ContextManager(domain=domain)
+            model_override = state.get("model_override") or state.get("model")
+            cm = ContextManager(domain=domain, model=model_override)
             session_data = load_session(session)
             if session_data and "history" in session_data:
                 for t in session_data["history"]:
