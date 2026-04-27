@@ -364,13 +364,13 @@ def build_prompt_session(state: Dict[str, Any]) -> Optional["PromptSession"]:  #
     # ── Toolbar ───────────────────────────────────────────────────────────────
     def _toolbar() -> "HTML":
         session = state.get("session_name", "none")
-        domain  = state.get("domain_override") or "auto"
-        
+        domain  = state.get("resolved_domain") or state.get("domain_override") or "htb"
+
         # Context usage
         try:
             from dsec.context_manager import ContextManager
             from dsec.session import load_session
-            model_override = state.get("model_override") or state.get("model")
+            model_override = state.get("resolved_model") or state.get("model_override") or ""
             cm = ContextManager(domain=domain, model=model_override)
             session_data = load_session(session)
             if session_data and "history" in session_data:

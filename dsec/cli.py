@@ -1729,6 +1729,8 @@ def _launch_shell(
         "session_name": shell_session,
         "domain_override": domain_override,
         "model_override": model_override,
+        "resolved_domain": shell_domain,
+        "resolved_model": shell_model,
         "no_compress": no_compress,
         "no_think": no_think,
         "no_research": no_research,
