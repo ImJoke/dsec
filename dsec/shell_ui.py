@@ -308,6 +308,7 @@ def build_prompt_session(state: Dict[str, Any]) -> Optional["PromptSession"]:  #
         model   = state.get("model_override")  or "default"
         ae      = "⚡auto" if state.get("auto_exec") else ""
         ae_part = f"  <tb.sep>│</tb.sep>  <tb.domain>{ae}</tb.domain>" if ae else ""
+        sudo_part = "  <tb.sep>│</tb.sep>  <tb.domain>🔑</tb.domain>" if state.get("sudo_password") else ""
         return HTML(
             f"<bottom-toolbar>"
             f"  <tb.sep>│</tb.sep>"
@@ -317,6 +318,7 @@ def build_prompt_session(state: Dict[str, Any]) -> Optional["PromptSession"]:  #
             f"  <tb.sep>│</tb.sep>"
             f"  <tb.model> {model} </tb.model>"
             f"{ae_part}"
+            f"{sudo_part}"
             f"  <tb.sep>│</tb.sep>"
             f"  <tb.sep> ↑↓ history  Tab complete  → accept suggestion </tb.sep>"
             f"</bottom-toolbar>"

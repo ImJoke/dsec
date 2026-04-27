@@ -170,7 +170,11 @@ class MCPServer:
         if self._proc:
             try:
                 self._proc.terminate()
-                self._proc.wait(timeout=3)
+                try:
+                    self._proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    self._proc.wait()
             except Exception:  # noqa: BLE001
                 pass
             finally:
