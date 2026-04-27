@@ -3,9 +3,10 @@ DSEC HTTP Client
 OpenAI-compatible streaming client for deepseek-free-api.
 """
 import json
-from typing import Any, Dict, Generator, Optional
+from typing import Any, Dict, Generator, List, Optional
 
 import httpx
+from dsec.providers.manager import provider_chat_stream as chat_stream
 
 
 def chat(
@@ -14,6 +15,7 @@ def chat(
     conversation_id: Optional[str] = None,
     base_url: str = "http://localhost:8000",
     token: Optional[str] = None,
+    provider: str = "deepseek",
 ) -> Dict[str, Any]:
     """
     Non-streaming chat request.
@@ -23,7 +25,7 @@ def chat(
     content_parts = []
     final_conv_id = conversation_id
 
-    for chunk in chat_stream(message, model, conversation_id, base_url, token):
+    for chunk in chat_stream(message, model, conversation_id, base_url, token, provider):
         ctype = chunk.get("type")
         if ctype == "thinking":
             thinking_parts.append(chunk["text"])
@@ -41,12 +43,13 @@ def chat(
     }
 
 
-def chat_stream(
+def _deepseek_chat_stream(
     message: str,
     model: str,
     conversation_id: Optional[str] = None,
     base_url: str = "http://localhost:8000",
     token: Optional[str] = None,
+    history: Optional[List[Dict[str, str]]] = None,
 ) -> Generator[Dict[str, Any], None, None]:
     """
     Streaming chat.  Yields dicts:
@@ -60,15 +63,26 @@ def chat_stream(
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
+    # Use history if provided, otherwise default to current message
+    if history:
+        messages = list(history)
+        # Append current message if it's not already in history
+        if not messages or messages[-1].get("content") != message:
+            messages.append({"role": "user", "content": message})
+    else:
+        messages = [{"role": "user", "content": message}]
+
     payload: Dict[str, Any] = {
         "model": model,
-        "messages": [{"role": "user", "content": message}],
+        "messages": messages,
         "stream": True,
+        "max_tokens": 8192,
     }
     if conversation_id:
         payload["conversation_id"] = conversation_id
 
     conv_id_found: Optional[str] = None
+    in_think_block: bool = False
 
     try:
         with httpx.Client(timeout=httpx.Timeout(180.0, connect=10.0)) as client:
@@ -153,7 +167,23 @@ def chat_stream(
                     # Regular content
                     content = delta.get("content") or ""
                     if content:
-                        yield {"type": "content", "text": content}
+                        # Fallback parser if the API proxy fails to separate reasoning_content
+                        if "<think>" in content:
+                            in_think_block = True
+                            content = content.replace("<think>", "")
+                        
+                        if "</think>" in content:
+                            in_think_block = False
+                            parts = content.split("</think>")
+                            if parts[0]:
+                                yield {"type": "thinking", "text": parts[0]}
+                            if len(parts) > 1 and parts[1]:
+                                yield {"type": "content", "text": parts[1]}
+                        else:
+                            if in_think_block:
+                                yield {"type": "thinking", "text": content}
+                            else:
+                                yield {"type": "content", "text": content}
 
                     # Finish reason
                     finish = choices[0].get("finish_reason")

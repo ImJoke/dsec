@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DSEC | AI Agent Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="logo">
+                <span class="logo-icon">🛡️</span>
+                <span class="logo-text">DSEC</span>
+            </div>
+            <nav>
+                <div class="nav-item active">Overview</div>
+                <div class="nav-item">Knowledge Graph</div>
+                <div class="nav-item">Routines</div>
+                <div class="nav-item">Settings</div>
+            </nav>
+            <div class="status-panel">
+                <div class="status-indicator">
+                    <span class="dot"></span> Operational
+                </div>
+                <div class="timestamp" id="current-time">--:--:-- UTC</div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <header>
+                <h1>Operational Dashboard</h1>
+                <div class="badge">AGENT: <span id="agent-status">ACTIVE</span></div>
+            </header>
+
+            <div class="dashboard-grid">
+                <!-- Knowledge Graph -->
+                <section class="card graph-card">
+                    <h2>KNOWLEDGE GRAPH</h2>
+                    <div id="mynetwork"></div>
+                </section>
+
+                <!-- Active Sessions -->
+                <section class="card sessions-card">
+                    <h2>ACTIVE SESSIONS</h2>
+                    <div id="sessions-list" class="list-container">
+                        <div class="loading">Loading sessions...</div>
+                    </div>
+                </section>
+
+                <!-- Stats Panel -->
+                <section class="card stats-card">
+                    <h2>CONTEXT UTILIZATION</h2>
+                    <div class="gauge-container">
+                        <div class="gauge">
+                            <div class="gauge-inner">87%</div>
+                        </div>
+                    </div>
+                    <div class="stats-list">
+                        <div class="stat"><span>Nodes:</span> <span id="stat-nodes">0</span></div>
+                        <div class="stat"><span>Edges:</span> <span id="stat-edges">0</span></div>
+                        <div class="stat"><span>Routines:</span> <span id="stat-routines">0</span></div>
+                    </div>
+                </section>
+
+                <!-- Routine Scheduler -->
+                <section class="card scheduler-card">
+                    <h2>ROUTINE SCHEDULER</h2>
+                    <div class="timeline" id="routine-timeline">
+                        <!-- Timeline items -->
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>

@@ -1,4 +1,4 @@
-# dsec – DeepSeek Security CLI
+# dsec – Autonomous Security Agent
 
 ```
  ██████╗ ███████╗███████╗ ██████╗
@@ -9,19 +9,65 @@
  ╚═════╝ ╚══════╝╚══════╝ ╚═════╝
 ```
 
-> **Agentic AI security assistant** for Bug Bounty, HackTheBox, CTF, and Vulnerability Research — powered by DeepSeek with live research, semantic memory, and context-aware compression.
+> **Agentic AI security assistant** for Bug Bounty, HackTheBox, CTF, Vulnerability Research, and Code Auditing — powered by DeepSeek with autonomous tool execution, split-pane TUI, hybrid memory (vector + graph), offensive skill bundles, and interactive PTY terminals.
 
 ---
 
 ## ✨ Features
 
-- 🧠 **Semantic Memory** — cross-session ChromaDB memory with anti-hallucination rules; auto-extracts CVEs, credentials, and findings
-- 🔬 **Auto-Research Pipeline** — detects software versions, CVEs, and GTFOBins binaries then fetches live data from NVD, ExploitDB, GitHub Advisories, HackerOne, PortSwigger, and PacketStorm concurrently
-- ⚡ **Smart Compression** — detects and compresses nmap, gobuster, ffuf, feroxbuster, sqlmap, nikto, linpeas, and curl output before sending to the model
-- 🎯 **Domain-Aware Prompts** — specialized system prompts for HTB, Bug Bounty, CTF, and Research contexts, auto-detected from input
-- 🔄 **Session Management** — persistent sessions with history, notes, tags, and conversation continuity
-- 🔑 **Round-Robin Token Rotation** — store multiple DeepSeek tokens for automatic rotation
-- 📡 **Streaming Output** — real-time streaming with thinking process display using Rich
+### Core Intelligence
+- 🧠 **Hybrid Memory** — ChromaDB vector store + JSON knowledge graph with fuzzy entity resolution (difflib 85% threshold). Auto-extracts CVEs, credentials, techniques, and findings across sessions.
+- 🔬 **Auto-Research Pipeline** — detects software versions, CVEs, and GTFOBins binaries then fetches live data from NVD, ExploitDB, GitHub Advisories, HackerOne, PortSwigger, and PacketStorm concurrently.
+- ⚡ **Smart Compression** — detects and compresses nmap, gobuster, ffuf, feroxbuster, sqlmap, nikto, linpeas, and curl output before sending to the model.
+- 🎯 **Domain-Aware Prompts** — specialized system prompts for HTB, Bug Bounty, CTF, Research, and Programmer contexts with auto-detection from input.
+
+### Agentic Capabilities
+- 🤖 **Autonomous Execution** — Hermes-style agentic loop with `<tool_call>` blocks, stuck detection, and configurable iteration budgets (up to 15 iterations).
+- 🖥️ **Interactive PTY Terminals** — spawn persistent background terminals (tmux-style) for interactive tools like `msfconsole`, `nc` listeners, SSH sessions, and Python REPLs. The AI can send raw keystrokes including Ctrl+C/Ctrl+D.
+- 🛡️ **Install Protection** — mandatory manual approval gate for `apt`, `pip`, `brew`, `npm` install commands, even with `/autoexec on`.
+- 📝 **Aider-Style Code Editing** — precise SEARCH/REPLACE block editing with automatic whitespace normalization for vulnerability patching and code review.
+
+### Agent Modes & Personalities
+- 🏗️ **Agent Modes** — constrain AI behavior via `/mode`:
+  - `architect` — planning only, no tool execution
+  - `recon` — scanning & enumeration only
+  - `exploit` — aggressive exploitation & privilege escalation
+  - `ask` — Q&A only, no tool usage
+  - `auto` — full autonomy (default)
+- 🎭 **Personalities** — change communication style via `/personality`:
+  - `professional` — formal, precise, and structured (default)
+  - `hacker` — edgy 1337 speak, calls targets "boxes"
+  - `teacher` — detailed step-by-step explanations
+
+### Offensive Security Skills
+- 📦 **Modular Skill Bundles** — Claude-Red inspired `SKILL.md` methodology checklists that auto-load based on conversation context:
+  - Active Directory Penetration Testing
+  - Cloud Security (AWS / Azure / GCP)
+  - API Security Testing
+  - Mobile App Security (Frida / Objection)
+  - Malware Analysis & Reverse Engineering
+  - Windows Privilege Escalation
+  - Pivoting & Tunneling (Chisel / Ligolo)
+  - Phishing & Social Engineering
+  - Wireless Attacks
+  - Container & Kubernetes Security
+  - Static Analysis (Trail of Bits methodology)
+  - Bug Bounty Recon
+- 🔓 **Offline GTFOBins** — searchable database of 40+ binary exploitation techniques (SUID, sudo, capabilities, file read/write, reverse shell).
+- 🧪 **Learning Loop** — the agent can create and save new `SKILL.md` files from successful engagements via the `save_skill` tool.
+
+### Rich Terminal UI
+- 🖼️ **Split-Pane TUI** — during streaming, the terminal displays two panels: a compact Thinking pane (top, with live word count and elapsed time) and a Response pane (bottom, with Markdown rendering). Inspired by OpenCode and Claude Code.
+- 🎨 **Gradient Banner** — Unicode block-art banner with domain-specific color palettes.
+- 📊 **Context Status Bar** — token usage and context budget tracking after each turn.
+- ⚙️ **Tool Execution Panels** — colored tool headers with argument display and elapsed time.
+
+### Infrastructure
+- 🔄 **Session Management** — persistent sessions with history, notes, tags, and DeepSeek conversation continuity.
+- 🔑 **Round-Robin Token Rotation** — store multiple DeepSeek tokens for automatic rotation.
+- 📡 **Multi-Provider Backend** — supports DeepSeek (Docker proxy), GPT4Free (g4f), and local Ollama-compatible models.
+- 🌐 **MCP Protocol Support** — connect external tool servers via Model Context Protocol.
+- 📈 **Extended Context** — dynamic token budget scaling for 64K, 128K, and 1M context window models.
 
 ---
 
@@ -38,6 +84,7 @@ rich>=13.0.0
 click>=8.1.0
 chromadb>=0.4.0
 beautifulsoup4>=4.12.0
+prompt_toolkit>=3.0.0
 ```
 
 ---
@@ -135,6 +182,8 @@ dsec config --set research_max_results 5
 | `memory_similarity_threshold` | `0.82` | Minimum cosine similarity for memory injection |
 | `memory_max_inject` | `3` | Max memory entries injected per query |
 
+---
+
 ## 💻 Usage
 
 ### Basic Chat
@@ -164,7 +213,7 @@ dsec --no-think "give me a quick python reverse shell one-liner"
 
 ### Interactive Shell
 
-`dsec` now supports an interactive terminal mode for back-and-forth work inside a
+`dsec` supports an interactive terminal mode for back-and-forth work inside a
 single session, closer to a REPL workflow than one-shot prompts.
 
 ```bash
@@ -175,16 +224,57 @@ dsec shell --session htb-permx
 dsec shell --search
 ```
 
-Available shell commands:
+### Shell Commands
 
-- `/help` — show shell commands
-- `/status` — show the current shell settings
-- `/session` — show current session detail and recent history
-- `/note <text>` — add a note to the current session
-- `/domain <htb|bugbounty|ctf|research>` — switch domain
-- `/model <name>` — switch model
-- `/clear` — clear the screen
-- `/exit` or `/quit` — leave the shell
+#### Agent Modes & Personality
+| Command | Description |
+|---------|-------------|
+| `/mode <name>` | Set agent behavior: `architect`, `recon`, `exploit`, `ask`, `auto` |
+| `/personality <name>` | Set persona: `professional`, `hacker`, `teacher` |
+
+#### Agentic Execution
+| Command | Description |
+|---------|-------------|
+| `/autoexec on` | Auto-approve AI tool calls (no confirm prompts) |
+| `/autoexec off` | Require y/n/A/e approval before each command (default) |
+| `!<cmd>` | Run a shell command yourself, optionally pipe output to AI |
+
+#### Session Management
+| Command | Description |
+|---------|-------------|
+| `/session` | Show session details, notes, flags, history |
+| `/history` | Show last 10 conversation turns |
+| `/note <text>` | Add a note to the current session |
+| `/new [name]` | Start a new session (clear context) |
+| `/status` | Show all current settings |
+| `/clear` | Clear screen |
+
+#### Domain & Model
+| Command | Description |
+|---------|-------------|
+| `/domain <name>` | Switch domain: `htb`, `bugbounty`, `ctf`, `research`, `programmer` |
+| `/model <name>` | Switch AI model |
+
+#### Skills & Tools
+| Command | Description |
+|---------|-------------|
+| `/skill [name]` | Load a security methodology skill |
+| `/tools` | List all registered native tools |
+
+#### MCP Servers
+| Command | Description |
+|---------|-------------|
+| `/mcp list` | List configured MCP servers |
+| `/mcp connect <name>` | Connect to server |
+| `/mcp disconnect <name>` | Disconnect |
+| `/mcp tools [name]` | List available tools |
+| `/mcp call <srv> <tool> [json]` | Call a tool |
+
+#### Navigation
+| Command | Description |
+|---------|-------------|
+| `/help` | Show help menu |
+| `/exit` / `/quit` | Leave the shell |
 
 ### Sessions
 
@@ -238,74 +328,42 @@ sqlmap -u "http://target.com/page?id=1" --dbs 2>&1 | dsec -s bb-target "summariz
 
 # Curl HTTP response analysis
 curl -i http://10.10.11.23/ | dsec -s htb-permx "fingerprint this web server"
-
-# Feroxbuster results
-feroxbuster --url http://10.10.11.23 | dsec -s htb-permx "prioritize these paths"
-
-# Read from file
-cat nmap_full.txt | dsec -s htb-permx "full analysis"
 ```
 
-### Notes
-
-Attach structured notes to sessions for later reference.
+### Notes & Tags
 
 ```bash
-# Add a finding note
+# Add notes to sessions
 dsec note "Found admin panel at /admin/login.php" --session htb-permx --type finding
-
-# Add credentials
 dsec note "SSH creds: admin:Password123" --session htb-permx --type credential
-
-# Record the user flag
 dsec note "user.txt: 8f3a2c..." --session htb-permx --type flag
 
-# General note
-dsec note "Machine difficulty: Medium, theme: CMS exploitation" --session htb-permx
-```
-
-Note types: `finding`, `credential`, `flag`, `misc`
-
-### Tags
-
-```bash
-# Tag a session for easy searching
+# Tag sessions
 dsec tags web smb privesc --session htb-permx
-
-# Tags are shown in the sessions table
-dsec sessions
 ```
 
 ### Memory Management
 
-Cross-session semantic memory uses ChromaDB with anti-hallucination safeguards.
+Cross-session semantic memory uses ChromaDB + knowledge graph with anti-hallucination safeguards.
 
 ```bash
 # List all stored memories
 dsec memory --list
 
-# Filter by domain
+# Filter by domain or session
 dsec memory --list --domain htb
-
-# Filter by session
 dsec memory --list --session htb-permx
 
 # Semantic search
 dsec memory --search "chamilo RCE"
-dsec memory --search "CVE-2023"
-dsec memory --search "sudo misconfiguration"
 
 # Manually add a verified memory
-dsec memory --add "CVE-2023-33568: Chamilo LMS unauthenticated RCE via big upload" \
+dsec memory --add "CVE-2023-33568: Chamilo LMS unauthenticated RCE" \
   --type finding --tags "chamilo,rce,cve-2023-33568" --session htb-permx
 
-# Show full memory entry
+# Show / verify / delete
 dsec memory --show <memory-id>
-
-# Upgrade confidence from 'suspected' to 'verified'
 dsec memory --verify <memory-id>
-
-# Delete a memory
 dsec memory --delete <memory-id>
 ```
 
@@ -321,7 +379,6 @@ dsec token --list
 
 # Check token status
 dsec token --check
-dsec token
 ```
 
 ---
@@ -330,22 +387,38 @@ dsec token
 
 dsec auto-detects the security context from your session name and message content:
 
-| Domain | Prefix | Color | Research Sources |
-|--------|--------|-------|-----------------|
-| **HackTheBox** | `htb-` | 🟢 Green | NVD, ExploitDB, GitHub Advisories, PacketStorm, GTFOBins |
-| **Bug Bounty** | `bb-` / `bugbounty-` | 🟡 Yellow | NVD, HackerOne, PortSwigger, GitHub Advisories |
-| **CTF** | `ctf-` | 🔵 Cyan | CTFTime Writeups, GitHub CTF, ExploitDB |
-| **Research** | `research-` / `cve-` | 🟣 Magenta | NVD, GitHub Advisories, ExploitDB, PacketStorm |
+| Domain | Prefix | Color | Use Case |
+|--------|--------|-------|----------|
+| **HackTheBox** | `htb-` | 🟢 Green | CTF-style pentesting, machine pwning |
+| **Bug Bounty** | `bb-` / `bugbounty-` | 🟡 Yellow | Responsible disclosure, scope-aware |
+| **CTF** | `ctf-` | 🔵 Cyan | Capture The Flag competitions |
+| **Research** | `research-` / `cve-` | 🟣 Magenta | Vulnerability research, exploit dev |
+| **Programmer** | — | 🔷 Royal Blue | Code review, secure development |
 
 ---
 
-## 🚩 Flags Reference
+## 🛠️ Native Tools
+
+The agent has access to these built-in tools (viewable via `/tools`):
+
+| Category | Tools |
+|----------|-------|
+| **Memory** | `core_memory_append`, `core_memory_replace`, `core_memory_read`, `graph_memory_insert`, `graph_memory_search`, `graph_memory_forget`, `graph_memory_path` |
+| **PTY Terminal** | `pty_create_pane`, `pty_run_command`, `pty_read_output`, `pty_send_input`, `pty_send_signal`, `pty_list_panes`, `pty_close_pane` |
+| **Browser** | `browser_goto`, `browser_extract`, `web_search`, `browser_screenshot`, `browser_links` |
+| **Code Editing** | `programmer_view_file`, `programmer_edit_file`, `programmer_create_file`, `programmer_tree`, `programmer_search`, `programmer_diff` |
+| **Security** | `gtfobins_search`, `save_skill` |
+| **OSINT** | `osint_crawl_twitter`, `osint_crawl_telegram` |
+
+---
+
+## 🚩 CLI Flags
 
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--session NAME` | `-s` | Use/create named session |
 | `--new-session NAME` | `-n` | Create new session and start chatting |
-| `--domain DOMAIN` | `-d` | Override domain (`htb`/`bugbounty`/`ctf`/`research`) |
+| `--domain DOMAIN` | `-d` | Override domain (`htb`/`bugbounty`/`ctf`/`research`/`programmer`) |
 | `--model MODEL` | `-m` | Override model name |
 | `--search` | | Use search-capable model variant |
 | `--quick` | `-q` | Skip memory, research, session saving |
@@ -359,42 +432,90 @@ dsec auto-detects the security context from your session name and message conten
 ## 📁 Project Structure
 
 ```
-dsec/                           ← repo root
+dsec/                              ← repo root
 ├── README.md
 ├── requirements.txt
-├── install.sh                  ← installer
-├── docker-compose.yml          ← deepseek-free-api container
-├── .env.example                ← environment variable template
-└── dsec/                       ← Python package
-    ├── __init__.py             ← package metadata (version)
-    ├── __main__.py             ← entry point (python -m dsec)
-    ├── cli.py                  ← CLI commands and chat pipeline
-    ├── client.py               ← HTTP streaming client
-    ├── compressor.py           ← tool output compression
-    ├── config.py               ← config management (~/.dsec/config.json)
-    ├── domain.py               ← domain definitions and detection
-    ├── formatter.py            ← Rich terminal output
-    ├── memory.py               ← ChromaDB semantic memory
-    ├── researcher.py           ← auto-research pipeline
-    ├── session.py              ← session CRUD
-    └── sources.py              ← research data sources
+├── install.sh                     ← installer
+├── docker-compose.yml             ← deepseek-free-api container
+├── .env.example                   ← environment variable template
+└── dsec/                          ← Python package
+    ├── __init__.py                ← package metadata (version)
+    ├── __main__.py                ← entry point (python -m dsec)
+    ├── cli.py                     ← CLI commands, shell, and agentic loop
+    ├── client.py                  ← HTTP streaming client
+    ├── compressor.py              ← tool output compression
+    ├── config.py                  ← config management (~/.dsec/config.json)
+    ├── context_manager.py         ← token budget tracking (up to 1M)
+    ├── domain.py                  ← domain definitions, system prompts, modes
+    ├── formatter.py               ← Rich split-pane TUI
+    ├── memory.py                  ← ChromaDB vector + JSON knowledge graph
+    ├── researcher.py              ← auto-research pipeline
+    ├── session.py                 ← session CRUD
+    ├── shell_ui.py                ← prompt_toolkit integration & autocomplete
+    ├── sources.py                 ← research data sources
+    ├── core/
+    │   └── registry.py            ← native tool registry (@register decorator)
+    ├── providers/
+    │   └── manager.py             ← multi-provider backend (DeepSeek, g4f, Ollama)
+    ├── tools/
+    │   ├── memory_tools.py        ← graph + vector memory tools
+    │   ├── pty_terminal.py        ← persistent PTY multiplexer
+    │   ├── gtfobins.py            ← offline GTFOBins database
+    │   └── skill_manager.py       ← learning loop (save_skill)
+    └── skills/
+        ├── loader.py              ← SKILL.md loader with trigger phrases
+        ├── programmer.py          ← code editing tools (view/edit/create/search/diff)
+        └── bundled/               ← 12+ offensive methodology checklists
+            ├── ad-pentest/SKILL.md
+            ├── api-security/SKILL.md
+            ├── bugbounty-recon/SKILL.md
+            ├── cloud-security/SKILL.md
+            ├── container-k8s/SKILL.md
+            ├── malware-analysis/SKILL.md
+            ├── mobile-app/SKILL.md
+            ├── phishing-se/SKILL.md
+            ├── pivoting-tunnel/SKILL.md
+            ├── static-analysis/SKILL.md
+            ├── windows-privesc/SKILL.md
+            └── wireless-attacks/SKILL.md
 ```
 
 ---
 
 ## ⚙️ How It Works
 
-dsec processes every query through a 12-step pipeline:
+dsec processes every query through a multi-stage pipeline:
 
 1. **Read stdin** — detect piped tool output
 2. **Load/create session** — restore conversation history and context
-3. **Compress** — detect tool type (nmap/gobuster/etc.) and compress verbose output; stdin and message are compressed separately to preserve prompt structure
-4. **Search memory** — semantic search of ChromaDB for relevant past findings (similarity ≥ 0.82)
+3. **Compress** — detect tool type (nmap/gobuster/etc.) and compress verbose output
+4. **Search memory** — semantic search of ChromaDB + knowledge graph for relevant past findings (similarity ≥ 0.82)
 5. **Detect research triggers** — scan input for software versions, CVEs, GTFOBins binaries, and vulnerability types
 6. **Run research concurrently** — fetch from all relevant sources in parallel with 12s timeout per source
-7. **Build prompt** — assemble system prompt + memory context + research context + tool output + user message
-8. **Get token** — round-robin token selection from stored pool
-9. **Stream response** — SSE streaming with live Rich terminal updates, thinking process display
-10. **Update session** — save conversation ID, increment message count, append history
-11. **Auto-extract memories** — regex-extract CVEs, software versions, credentials, and successful techniques from the AI response
-12. **Store memories** — persist extracted snippets to ChromaDB with `confidence: suspected`
+7. **Load skills** — auto-detect and inject relevant offensive methodology checklists
+8. **Build prompt** — assemble system prompt (mode + personality) + memory + research + skills + tool output + user message
+9. **Get token** — round-robin token selection from stored pool
+10. **Stream response** — SSE streaming with split-pane Rich TUI (Thinking + Response panels)
+11. **Agentic loop** — if the response contains `<tool_call>` blocks, dispatch tools and feed results back (up to 15 iterations)
+12. **Update session** — save conversation ID, increment message count, append history
+13. **Auto-extract memories** — regex-extract CVEs, software versions, credentials, and successful techniques
+14. **Store memories** — persist extracted snippets to ChromaDB + knowledge graph with `confidence: suspected`
+
+---
+
+## 📜 Credits & Inspiration
+
+Built on insights and patterns from:
+
+| Project | Inspiration |
+|---------|-------------|
+| [Hermes Agent](https://github.com/) | Agentic loop, memory nudge system, iteration budgets |
+| [Claude Code / OpenCode](https://github.com/) | Rich split-pane TUI, keyboard navigation |
+| [Claude-Red](https://github.com/SnailSploit/Claude-Red) | Structured SKILL.md offensive methodology format |
+| [Trail of Bits Skills](https://github.com/trailofbits/skills) | Static analysis patterns |
+| [Mem0](https://github.com/mem0ai/mem0) | Hybrid vector + graph memory architecture |
+| [Letta / MemGPT](https://github.com/letta-ai/letta) | Agentic memory management (core_memory_append/replace) |
+| [Open-Interpreter](https://github.com/) | PTY terminal control patterns |
+| [Aider](https://github.com/) | SEARCH/REPLACE code editing |
+| [Superpowers](https://github.com/obra/superpowers) | Capability-based permissions |
+| [GTFOBins](https://gtfobins.github.io/) | Offline privilege escalation database |

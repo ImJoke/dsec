@@ -52,6 +52,8 @@ from .formatter import (
     print_compression_notice,
     print_error,
     print_info,
+    print_install_warning,
+    print_iteration_header,
     print_memory_detail,
     print_memory_list,
     print_memory_notice,
@@ -60,6 +62,8 @@ from .formatter import (
     print_session_detail,
     print_sessions_table,
     print_success,
+    print_tool_header,
+    print_tool_result,
     print_warning,
     stream_response,
 )
@@ -78,6 +82,26 @@ from .executor import CommandResult, get_runner
 from .mcp_client import get_mcp_manager
 from .shell_ui import build_prompt_session, format_prompt, prompt_available
 from .researcher import format_research_context, run_research, should_research
+from .core.delivery import deliver_to
+
+# Native tool imports (lazy-loaded to avoid circular imports at module level)
+def _ensure_native_tools_loaded():
+    """Import native tool modules so they register with the registry."""
+    try:
+        import dsec.tools.memory_tools  # noqa: F401
+        import dsec.tools.pty_terminal  # noqa: F401
+        import dsec.tools.gtfobins      # noqa: F401
+        import dsec.tools.skill_manager # noqa: F401
+        import dsec.tools.cron_tools    # noqa: F401
+        import dsec.skills.programmer   # noqa: F401
+        import dsec.skills.persistence  # noqa: F401
+        import dsec.tools.payload_tools # noqa: F401
+    except ImportError:
+        pass
+    try:
+        import dsec.browser.browser_tool  # noqa: F401
+    except ImportError:
+        pass
 from .session import (
     add_history_entry,
     add_note,
@@ -287,14 +311,33 @@ def _build_prompt(
     compressed_stdin_content: str,
     message: str,
     final_input: str,
+    mode: str = "auto",
+    personality: str = "professional",
 ) -> str:
     prompt_parts: List[str] = []
 
     if not quick:
         # Selalu inject full system prompt dan instruksi eksekusi di setiap turn
         # agar model (terutama R1) tidak "lupa" format <tool_call>
-        system_prompt = get_system_prompt(domain)
+        system_prompt = get_system_prompt(domain, user_input=final_input, mode=mode, personality=personality)
         prompt_parts.append(f"[SYSTEM INSTRUCTIONS]\n{system_prompt}\n[END SYSTEM]")
+        
+        # Inject Core Memory (Letta-style)
+        from dsec.tools.memory_tools import format_core_memory_context
+        core_mem_ctx = format_core_memory_context()
+        if core_mem_ctx:
+            prompt_parts.append(core_mem_ctx)
+
+        # Inject Current Time
+        from datetime import datetime, timezone
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        prompt_parts.append(f"[CURRENT TIME]\n{now_str}\n[END TIME]")
+
+        # Inject Knowledge Graph Stats
+        from dsec.memory import graph_stats
+        stats = graph_stats()
+        if stats["nodes"] > 0:
+            prompt_parts.append(f"[MEMORY STATS]\nKnowledge Graph: {stats['nodes']} entities, {stats['edges']} relationships.\n[END STATS]")
 
         # MCP context juga selalu di-inject
         mcp_ctx = _build_mcp_context()
@@ -352,35 +395,200 @@ def _auto_store_memories(
     if not enabled or not response_content or not session_name or not memory_available():
         return
 
+    # Fast regex extraction
     extracted = auto_extract_memories(
         response=response_content,
         session=session_name,
         domain=domain,
     )
-    if extracted:
-        print_info(f"Auto-stored {len(extracted)} memory snippet(s) [confidence: suspected]")
+    
+    # SOTA LLM extraction (optional/configurable)
+    from dsec.memory import auto_extract_memories_llm
+    llm_extracted = auto_extract_memories_llm(
+        response=response_content,
+        session=session_name,
+        domain=domain,
+    )
+    
+    total = len(extracted) + len(llm_extracted)
+    if total > 0:
+        print_info(f"Auto-stored {total} memory record(s) (Regex: {len(extracted)}, LLM: {len(llm_extracted)})")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Agentic execution helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-_TOOL_CALL_RE = _re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", _re.DOTALL | _re.IGNORECASE)
+_TOOL_CALL_RE = _re.compile(r"<tool_call(?:[^>]*)>\s*(.*?)\s*</tool_call>", _re.DOTALL | _re.IGNORECASE)
+# Fallback: match <tool_call> without proper closing tag (AI sometimes forgets)
+_TOOL_CALL_FALLBACK_RE = _re.compile(r"<tool_call(?:[^>]*)>\s*(\{.*?\})\s*(?:</tool_call|$)", _re.DOTALL | _re.IGNORECASE)
+# Fallback for when AI puts JSON inside the HTML attributes
+_TOOL_CALL_ATTRS_RE = _re.compile(r'<tool_call\s+name=["\']?([^"\'\s]+)["\']?\s+arguments=["\']?(.*?)(?:["\']?\s*>\s*</tool_call>|["\']?\s*/>|["\']?\s*>)', _re.DOTALL | _re.IGNORECASE)
+_LEGACY_BASH_LINE_RE = _re.compile(r"(?im)^\s*(?:bash|sh|shell)\s*>\s*(.+?)\s*$")
+_NAME_FIELD_RE = _re.compile(r'"(?:name|tool)"\s*:\s*"([^"]+)"', _re.IGNORECASE)
+_COMMAND_FIELD_RE = _re.compile(r'"command"\s*:\s*"((?:\\\\.|[^"\\\\])*)"', _re.DOTALL | _re.IGNORECASE)
+
+def _repair_json(raw: str) -> str:
+    """Import the robust repair logic from core."""
+    from .core.json_repair import repair_json
+    return repair_json(raw)
 
 def _extract_tool_calls(text: str) -> list[dict]:
-    """Ekstrak tool calls berformat JSON dari tag <tool_call>"""
+    """Ekstrak tool calls berformat JSON dari tag <tool_call> atau raw JSON.
+    
+    Handles common AI mistakes:
+    - Missing outer closing brace
+    - Trailing commas
+    - "tool" instead of "name"
+    - Missing <tool_call> tags
+    - Legacy `bash> ...` lines
+    """
+    import json as _json
     calls = []
-    for match in _TOOL_CALL_RE.finditer(text):
-        content = match.group(1).strip()
-        # Cari objek JSON { ... } di dalam konten
-        json_match = _re.search(r"\{.*\}", content, _re.DOTALL)
-        if json_match:
-            try:
-                call_data = _json.loads(json_match.group(0))
-                if isinstance(call_data, dict) and "name" in call_data:
-                    calls.append(call_data)
-            except _json.JSONDecodeError:
+    
+    # 0. Extract from XML attributes if the AI hallucinated HTML syntax
+    for match in _TOOL_CALL_ATTRS_RE.finditer(text):
+        name = match.group(1).strip()
+        args_str = match.group(2).strip()
+        # Clean up any trailing quotes that got caught
+        if args_str.endswith('"') or args_str.endswith("'"):
+            args_str = args_str[:-1]
+            
+        try:
+            call_data = _json.loads(args_str)
+            if isinstance(call_data, dict):
+                calls.append({"name": name, "arguments": call_data})
                 continue
+        except Exception:
+            try:
+                call_data = _json.loads(_repair_json(args_str))
+                if isinstance(call_data, dict):
+                    calls.append({"name": name, "arguments": call_data})
+                    continue
+            except Exception:
+                pass
+                
+        # If JSON parsing failed but it's bash, just extract the command
+        if name == "bash":
+            calls.append({"name": "bash", "arguments": {"command": args_str}})
+        else:
+            # Add it anyway and hope the dispatcher can deal with it or error out
+            calls.append({"name": name, "arguments": {"raw": args_str}})
+
+    if calls:
+        return calls
+    
+    # 1. Extract from <tool_call> tags
+    matches = list(_TOOL_CALL_RE.finditer(text))
+    if not matches:
+        matches = list(_TOOL_CALL_FALLBACK_RE.finditer(text))
+    
+    potential_json_blocks = []
+    for match in matches:
+        potential_json_blocks.append(match.group(1).strip())
+        
+    # 2. If no tags found, try to find raw JSON blocks that look like tool calls
+    if not potential_json_blocks:
+        # Simple heuristic: find blocks starting with { and ending with }
+        # that contain "name": or "tool":
+        raw_matches = _re.finditer(r"\{.*?\}", text, _re.DOTALL)
+        for rm in raw_matches:
+            block = rm.group(0)
+            if '"name":' in block or '"tool":' in block:
+                potential_json_blocks.append(block)
+
+    for content in potential_json_blocks:
+        # Find the first { in the content
+        brace_start = content.find("{")
+        if brace_start == -1:
+            continue
+        raw_json = content[brace_start:]
+        
+        # Try parsing as-is first, then with repair
+        for attempt_json in [raw_json, _repair_json(raw_json)]:
+            try:
+                call_data = _json.loads(attempt_json)
+                if isinstance(call_data, dict):
+                    # Normalize "tool" -> "name"
+                    if "tool" in call_data and "name" not in call_data:
+                        call_data["name"] = call_data["tool"]
+                    
+                    if "name" in call_data:
+                        calls.append(call_data)
+                        break
+            except Exception:
+                continue
+
+    # 2b. JSON-ish fallback: recover common malformed tool payloads where
+    # the outer object is broken but name/command fields are still present.
+    if not calls:
+        for content in potential_json_blocks:
+            name_match = _NAME_FIELD_RE.search(content)
+            if not name_match:
+                continue
+            tool_name = name_match.group(1).strip()
+
+            cmd_match = _COMMAND_FIELD_RE.search(content)
+            if cmd_match:
+                raw_cmd = cmd_match.group(1)
+                try:
+                    command = _json.loads(f'"{raw_cmd}"')
+                except Exception:
+                    command = raw_cmd.replace('\\n', ' ').replace('\\t', ' ')
+                calls.append({"name": tool_name, "arguments": {"command": command}})
+                continue
+
+            # Last-resort extraction for malformed JSON strings with odd escaping.
+            marker = _re.search(r'"command"\s*:\s*"', content, _re.IGNORECASE)
+            if marker:
+                chunk = content[marker.end():]
+                chars: list[str] = []
+                escaped = False
+                for ch in chunk:
+                    if escaped:
+                        chars.append(ch)
+                        escaped = False
+                        continue
+                    if ch == "\\":
+                        escaped = True
+                        chars.append(ch)
+                        continue
+                    if ch == '"':
+                        break
+                    chars.append(ch)
+
+                if chars:
+                    raw_cmd = "".join(chars)
+                    command = (
+                        raw_cmd
+                        .replace('\\\\', '\\')
+                        .replace('\\"', '"')
+                        .replace('\\n', ' ')
+                        .replace('\\t', ' ')
+                    ).strip()
+                    calls.append({"name": tool_name, "arguments": {"command": command}})
+                    continue
+
+            # Non-bash tool without command field: still recover the name.
+            calls.append({"name": tool_name, "arguments": {}})
+
+    # 3. Legacy fallback: convert `bash> cmd` lines into tool calls.
+    # Keep this only as a rescue path when the model ignored the required format.
+    if not calls:
+        for m in _LEGACY_BASH_LINE_RE.finditer(text):
+            cmd = m.group(1).strip()
+            if cmd:
+                calls.append({"name": "bash", "arguments": {"command": cmd}})
+                
+    # 4. Agentic Feedback Loop for unrecoverable syntax
+    if not calls and ("<tool_call" in text.lower() or "bash>" in text.lower() or (potential_json_blocks and '"name"' in text)):
+        calls.append({
+            "name": "__syntax_error__",
+            "arguments": {
+                "message": "CRITICAL SYNTAX ERROR: Your tool call was malformed and could not be parsed. You MUST use exactly this format: <tool_call> {\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}} </tool_call>. DO NOT use XML attributes like <tool_call name=...>. Re-emit your action using the correct JSON format."
+            }
+        })
+        
     return calls
 
 def _run_agentic_loop(
@@ -395,67 +603,164 @@ def _run_agentic_loop(
     no_think: bool,
     no_memory: bool,
     auto_exec: bool = False,
-    max_iterations: int = 10
+    max_iterations: int = 999
 ) -> Optional[str]:
     """
-    Hermes-style agentic loop.
+    Hermes-style agentic loop with stuck detection.
 
     Each iteration:
-      1. Extract all <tool_call> blocks (plus legacy <bash>/<mcp> for backward compat).
-      2. Dispatch each call: bash tools ask for user approval; MCP tools run directly.
+      1. Extract all <tool_call> blocks.
+      2. Dispatch: bash (user approval), native tools (direct), MCP (direct).
       3. Build <tool_response> blocks for every result.
       4. Send results back to the AI and repeat.
 
+    Stuck detection: if the same tool+args fail 3 times, auto-switch to research domain.
+
     Returns the final conversation_id.
     """
+    _ensure_native_tools_loaded()
+    from .core.registry import call_tool as registry_call_tool, get_tool as registry_get_tool
+
     current_conv_id = conversation_id
     current_response = response_content
     runner = get_runner()
+
+    # Stuck detection state
+    _fail_history: Dict[str, int] = {}  # "tool_name:args_hash" -> fail_count
+    _STUCK_THRESHOLD = 3
 
     for iteration in range(1, max_iterations + 1):
         tool_calls = _extract_tool_calls(current_response)
         if not tool_calls:
             break
 
-        console.print(
-            f"\n[bold cyan]⚙  Agent requested "
-            f"{len(tool_calls)} tool call{'s' if len(tool_calls) > 1 else ''}[/bold cyan]"
-        )
+        print_iteration_header(iteration, max_iterations, domain)
 
         tool_responses: List[Dict[str, Any]] = []
         approve_all = auto_exec
 
+        # ── Tool Call Grouping & Dispatch ──────────────────────────────────────
+        # Parallelize safe tools, sequential for bash and unsafe tools
+        safe_parallel_calls = []
+        sequential_calls = []
+        
+        SAFE_PARALLEL_TOOLS = {
+            "memory_search", "list_memories", "get_memory", 
+            "skill_list", "skill_view", "programmer_view_file", 
+            "programmer_list_dir", "gtfobins_search", "gtfobins_get"
+        }
+
         for idx, call in enumerate(tool_calls, 1):
+            name = call["name"]
+            if name == "bash" or name.startswith("mcp__") or name not in SAFE_PARALLEL_TOOLS:
+                sequential_calls.append((idx, call))
+            else:
+                safe_parallel_calls.append((idx, call))
+
+        # 1. Dispatch Parallel Calls
+        if safe_parallel_calls:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                futures = {}
+                for idx, call in safe_parallel_calls:
+                    t_name = call["name"]
+                    t_args = call.get("arguments", {})
+                    futures[executor.submit(registry_call_tool, t_name, t_args)] = (idx, t_name, t_args)
+                
+                for future in concurrent.futures.as_completed(futures):
+                    idx, t_name, t_args = futures[future]
+                    try:
+                        res = future.result()
+                        res_text = str(res) if res is not None else "(no output)"
+                        if len(res_text) > 10000: res_text = res_text[:10000] + "\n... [truncated]"
+                        tool_responses.append({"name": t_name, "result": res_text})
+                        console.print(f"  [bold cyan]⚡ {t_name}[/bold cyan] ([dim]{idx}/{len(tool_calls)}[/dim]) [bold green]✔[/bold green]")
+                    except Exception as e:
+                        print_warning(f"Parallel tool {t_name} failed: {e}")
+                        tool_responses.append({"name": t_name, "result": f"[error: {e}]"})
+
+        # 2. Dispatch Sequential Calls
+        for idx, call in sequential_calls:
             tool_name: str = call["name"]
             arguments: Dict[str, Any] = call.get("arguments", {})
+            
+            # Syntax Error Feedback Loop
+            if tool_name == "__syntax_error__":
+                msg = arguments.get("message", "Syntax error.")
+                print_error("AI syntax error detected. Feeding correction back to the model...")
+                tool_responses.append({"name": "syntax_correction", "result": msg})
+                continue
 
             # ── bash tool ─────────────────────────────────────────────────────
             if tool_name == "bash":
                 cmd = arguments.get("command", "").strip()
+                # Sanitize: remove newlines/tabs that AI sometimes adds for formatting
+                cmd = " ".join(cmd.splitlines()).replace("\t", " ").strip()
+                
                 if not cmd:
                     tool_responses.append({"name": tool_name, "result": "[error: empty command]"})
                     continue
 
-                console.print(
-                    Panel(
-                        Text(cmd, style="bold green"),
-                        title=f"[bold cyan]bash ({idx}/{len(tool_calls)})[/bold cyan]",
-                        border_style="cyan",
-                    )
-                )
+                print_tool_header("bash", idx, len(tool_calls), domain)
+
+                # We no longer print a large Panel. We just print a compact line.
+                short_cmd = cmd if len(cmd) < 80 else cmd[:80] + "…"
+                console.print(f"[bold cyan]▶ bash ({idx}/{len(tool_calls)}):[/bold cyan] [bold green]{short_cmd}[/bold green]")
+
+                # ── Scope Enforcement ─────────────────────────────────────────
+                from dsec.scope import validate_target, scan_command_for_targets
+                targets = scan_command_for_targets(cmd)
+                scope_warning = ""
+                out_of_scope = False
+                for target in targets:
+                    is_allowed, reason = validate_target(target)
+                    if not is_allowed:
+                        out_of_scope = True
+                        scope_warning += f"\n[bold red]SCOPE VIOLATION:[/bold red] {reason}"
+                
+                if out_of_scope:
+                    console.print(scope_warning)
+                    console.print("[bold yellow]Warning: This command contains targets that are OUT OF SCOPE. Execution blocked.[/bold yellow]")
+                    tool_responses.append({"name": tool_name, "result": f"[error: execution blocked by scope enforcement: {scope_warning.strip()}]"})
+                    continue
+
+                # ── Install command protection ────────────────────────────────
+                _INSTALL_PATTERNS = [
+                    "apt install", "apt-get install", "apt -y install",
+                    "yum install", "dnf install", "pacman -S",
+                    "brew install", "pip install", "pip3 install",
+                    "npm install -g", "npm i -g", "cargo install",
+                    "go install", "gem install", "snap install",
+                    "dpkg -i", "make install", "curl | bash",
+                    "curl | sh", "wget | bash", "wget | sh",
+                ]
+                is_install_cmd = any(p in cmd.lower() for p in _INSTALL_PATTERNS)
 
                 edited_cmd = cmd
                 approved = False
 
-                if approve_all:
+                if is_install_cmd:
+                    # Always require manual approval for install commands
+                    # Even in auto_exec mode, installs are never auto-approved
+                    print_install_warning(cmd)
+                    try:
+                        choice = _safe_input("> ").lower()
+                    except (EOFError, KeyboardInterrupt):
+                        console.print()
+                        print_warning("Agentic execution cancelled.")
+                        return current_conv_id
+                    if choice in ("y",):
+                        approved = True
+                    # No "A" option for install commands
+                elif approve_all:
                     approved = True
                 else:
                     try:
                         console.print(
-                            "  [bold green]\\[y]es[/bold green]  "
-                            "[bold red]\\[n]o[/bold red]  "
-                            "[bold yellow]\\[A]ll yes[/bold yellow]  "
-                            "[bold]\\[e]dit[/bold]"
+                            "  [bold green][[y]][/bold green]es  "
+                            "[bold red][[n]][/bold red]o  "
+                            "[bold yellow][[A]][/bold yellow]ll yes  "
+                            "[bold][[e]][/bold]dit"
                         )
                         choice = _safe_input("> ").lower()
                     except (EOFError, KeyboardInterrupt):
@@ -482,7 +787,6 @@ def _run_agentic_loop(
                     tool_responses.append({"name": tool_name, "result": "[user skipped]"})
                     continue
 
-                console.print(f"[bold #888888]$ {edited_cmd}[/bold #888888]")
                 console.print("[#888888]────────────────────────────────────[/]")
 
                 result_holder: List[Optional[CommandResult]] = [None]
@@ -497,15 +801,16 @@ def _run_agentic_loop(
                     )
 
                 t = threading.Thread(target=_worker, daemon=True)
-                t.start()
-                try:
-                    while t.is_alive():
-                        t.join(timeout=0.25)
-                except KeyboardInterrupt:
-                    runner.interrupt()
-                    t.join(timeout=5)
-                    console.print()
-                    print_warning("Command interrupted.")
+                with console.status(f"[bold cyan]Running:[/bold cyan] {short_cmd}", spinner="dots"):
+                    t.start()
+                    try:
+                        while t.is_alive():
+                            t.join(timeout=0.1)
+                    except KeyboardInterrupt:
+                        runner.interrupt()
+                        t.join(timeout=3)
+                        console.print()
+                        print_warning("Command interrupted.")
 
                 console.print("[#888888]────────────────────────────────────[/]")
 
@@ -521,6 +826,22 @@ def _run_agentic_loop(
                     elif res.returncode not in (0,):
                         parts.append(f"[exit code: {res.returncode}]")
                     result_text = "\n".join(parts)
+
+                    # Stuck detection for failed commands
+                    if res.returncode != 0:
+                        fail_key = f"bash:{cmd[:100]}"
+                        _fail_history[fail_key] = _fail_history.get(fail_key, 0) + 1
+                        if _fail_history[fail_key] >= _STUCK_THRESHOLD:
+                            warn_msg = (
+                                f"Stuck detected: '{cmd[:60]}' failed {_STUCK_THRESHOLD} times. "
+                                "Consider switching approach or using /domain research."
+                            )
+                            print_warning(warn_msg)
+                            result_text += f"\n\n[SYSTEM] {warn_msg}"
+                    
+                    # Truncate extremely long output to save context window
+                    if len(result_text) > 15000:
+                        result_text = result_text[:15000] + "\n\n[OUTPUT TRUNCATED: Output too long. Consider using grep, head, or piping to a file.]"
 
                 tool_responses.append({"name": tool_name, "result": result_text})
 
@@ -542,17 +863,76 @@ def _run_agentic_loop(
                     print_warning(f"MCP {srv_name}/{mcp_tool} failed: {mcp_exc}")
                     tool_responses.append({"name": tool_name, "result": f"[error: {mcp_exc}]"})
 
+            # ── Native registered tools ───────────────────────────────────────
+            elif registry_get_tool(tool_name):
+                args_str = _json.dumps(arguments, ensure_ascii=False)
+                if len(args_str) > 100: args_str = args_str[:100] + "…"
+                with console.status(f"[bold magenta]⚙ {tool_name}[/bold magenta] [#888888]{args_str}[/]", spinner="dots") as status:
+                    try:
+                        result = registry_call_tool(tool_name, arguments)
+                        result_text = str(result) if result is not None else "(no output)"
+                        # Truncate very long results for the AI context
+                        if len(result_text) > 10000:
+                            result_text = result_text[:10000] + "\n... [truncated]"
+                        tool_responses.append({"name": tool_name, "result": result_text})
+                        console.print(f"  [bold green]✔ {tool_name}[/bold green] [#888888]{args_str}[/]")
+                        
+                        # Show output to the user so they aren't blind
+                        display_text = result_text.strip()
+                        if display_text and display_text != "(no output)":
+                            from rich.panel import Panel
+                            from rich.text import Text
+                            ui_text = display_text[:1500] + ("\n... [output truncated for UI]" if len(display_text) > 1500 else "")
+                            console.print(
+                                Panel(
+                                    Text(ui_text, style="dim"),
+                                    title=f"[magenta]{tool_name} output[/magenta]",
+                                    border_style="magenta",
+                                    padding=(0, 1)
+                                )
+                            )
+                    except Exception as native_exc:
+                        print_warning(f"Native tool {tool_name} failed: {native_exc}")
+                        tool_responses.append({"name": tool_name, "result": f"[error: {native_exc}]"})
+                        console.print(f"  [bold red]✖ {tool_name}[/bold red] [#888888]{args_str}[/]")
+                continue # skip the old try-except block below since we included it here
             else:
                 tool_responses.append({"name": tool_name, "result": f"[error: unknown tool '{tool_name}']"})
 
         # ── build Hermes-style <tool_response> follow-up ──────────────────────
         response_blocks = []
+        stuck_detected = False
+        
         for tr in tool_responses:
+            if "Stuck detected:" in str(tr["result"]):
+                stuck_detected = True
+                
             payload = _json.dumps({"name": tr["name"], "result": tr["result"]}, ensure_ascii=False)
             response_blocks.append(f"<tool_response>\n{payload}\n</tool_response>")
 
         follow_up = "\n\n".join(response_blocks)
-        follow_up += "\n\nContinue your analysis. Use <tool_call> blocks if more tool calls are needed."
+        
+        # Check for heartbeat requests in tool results
+        heartbeat_requested = False
+        for tr in tool_responses:
+            try:
+                res_data = _json.loads(tr["result"])
+                if isinstance(res_data, dict) and res_data.get("heartbeat"):
+                    heartbeat_requested = True
+            except:
+                pass
+
+        if stuck_detected:
+            follow_up += (
+                "\n\n[SYSTEM WARNING] You are stuck in a loop. A command has failed repeatedly. "
+                "DO NOT RETRY THE EXACT SAME COMMAND. Step back, reflect on why it is failing, "
+                "and PIVOT to a completely different strategy or enumeration approach. "
+                "Use <tool_call> blocks to execute your new approach."
+            )
+        elif heartbeat_requested:
+             follow_up += "\n\n[HEARTBEAT] Continue your reasoning and execution."
+        else:
+            follow_up += "\n\nContinue your analysis. Use <tool_call> blocks if more tool calls are needed."
 
         # ── send follow-up to AI ──────────────────────────────────────────────
         print_info(f"Feeding results back to AI (agent loop iteration {iteration})…")
@@ -586,6 +966,10 @@ def _run_agentic_loop(
 
         if new_content is None:
             break
+            
+        if new_content.strip() == "" and thinking.strip() != "":
+            print_warning("The model generated reasoning but no content (possible API cutoff). Auto-prompting to continue...")
+            new_content = '<tool_call> {"name": "__syntax_error__", "arguments": {"message": "CRITICAL: Your previous generation was cut off or you stopped abruptly. You produced reasoning but NO content or tool call. You MUST immediately emit a valid tool call or message to continue."}} </tool_call>'
 
         if session_name and not no_memory:
             save_turn(
@@ -609,15 +993,30 @@ def _generate_shell_session_name() -> str:
 
 
 def _print_shell_banner(session_name: str, domain: str, model: str, sudo_set: bool = False) -> None:
+    from dsec.formatter import print_banner, _get_palette, _model_short
+    print_banner(domain)
+
+    pal = _get_palette(domain)
+    p = pal["primary"]
     domain_cfg = get_domain(domain)
-    color = domain_cfg.get("color", "white")
-    sudo_indicator = "  [bold yellow]🔑 sudo[/bold yellow]" if sudo_set else ""
+    dom_display = domain_cfg.get("display", domain.upper())
+    model_s = _model_short(model)
+
+    console.print(f"  [{p}]▸[/{p}] [bold]Session:[/bold]  {session_name}")
+    console.print(f"  [{p}]▸[/{p}] [bold]Domain:[/bold]   {dom_display}")
+    console.print(f"  [{p}]▸[/{p}] [bold]Model:[/bold]    {model_s}")
+    console.print(f"  [{p}]▸[/{p}] [bold]Mode:[/bold]     auto  [#666666]│[/]  [bold]Persona:[/bold] professional")
+    if sudo_set:
+        console.print(f"  [{p}]▸[/{p}] [bold yellow]🔑 Sudo:[/bold yellow]  auto-inject active")
     console.print()
-    console.print(f"[{color}]●[/{color}] [bold]DSEC Interactive[/bold]{sudo_indicator}")
-    console.print(f"  [#888888]session:[/] {session_name}  [#888888]domain:[/] {domain_cfg.get('display', domain)}  [#888888]model:[/] {model}")
-    cmds = ["!<cmd>", "/history", "/note", "/domain", "/model",
-            "/autoexec", "/sudo", "/mcp", "/status", "/help", "/exit"]
-    console.print(f"  [cyan]{'  '.join(cmds)}[/cyan]\n")
+
+    cmds = [
+        "[bold]!<cmd>[/bold]", "[bold]/mode[/bold]", "[bold]/personality[/bold]",
+        "[bold]/skill[/bold]", "[bold]/tools[/bold]", "[bold]/new[/bold]",
+        "[bold]/autoexec[/bold]", "[bold]/sudo[/bold]", "[bold]/mcp[/bold]", "[bold]/help[/bold]", "[bold]/exit[/bold]",
+    ]
+    console.print(f"  [{p}]Commands:[/{p}] {' · '.join(cmds)}")
+    console.print()
 
 
 def _print_shell_help() -> None:
@@ -627,13 +1026,27 @@ def _print_shell_help() -> None:
             Text.from_markup(
                 "[bold cyan]── Talking to the AI ────────────────────────────[/bold cyan]\n"
                 "Just type your message and press [bold]Enter[/bold].\n"
-                "If the AI needs to run a command it wraps it in [bold]<bash>[/bold] tags\n"
-                "\xe2\x80\x94 approve each one ([bold]y[/bold]/[bold]n[/bold]/[bold]A[/bold]ll/[bold]e[/bold]dit) before it executes.\n\n"
-                "[bold cyan]── Run Commands Yourself ────────────────────��───[/bold cyan]\n"
+                "If the AI needs to run a command it wraps it in [bold]<tool_call>[/bold] blocks\n"
+                "\u2014 approve each one ([bold]y[/bold]/[bold]n[/bold]/[bold]A[/bold]ll/[bold]e[/bold]dit) before it executes.\n\n"
+
+                "[bold cyan]── Run Commands Yourself ────────────────────────[/bold cyan]\n"
                 "[bold]!<cmd>[/bold]            run a command live (e.g. [#888888]!nmap -sV 10.0.0.1[/])\n"
                 "                  streams output; choose to send to AI or discard.\n\n"
+
+                "[bold cyan]── Agent Modes & Personality ────────────────────[/bold cyan]\n"
+                "[bold]/mode <name>[/bold]      set agent behavior mode:\n"
+                "                  [#888888]architect[/] – plan only, no execution\n"
+                "                  [#888888]recon[/]     – scanning & enumeration only\n"
+                "                  [#888888]exploit[/]   – aggressive exploitation\n"
+                "                  [#888888]ask[/]       – Q&A, no tool usage\n"
+                "                  [#888888]auto[/]      – full autonomy (default)\n"
+                "[bold]/personality <name>[/bold]  set agent persona:\n"
+                "                  [#888888]professional[/] – formal & precise (default)\n"
+                "                  [#888888]hacker[/]       – edgy, 1337 speak\n"
+                "                  [#888888]teacher[/]      – detailed explanations\n\n"
+
                 "[bold cyan]── Agentic Execution ────────────────────────────[/bold cyan]\n"
-                "[bold]/autoexec on[/bold]      auto-approve AI <bash> blocks (no confirm)\n"
+                "[bold]/autoexec on[/bold]      auto-approve AI tool calls (no confirm)\n"
                 "[bold]/autoexec off[/bold]     (default) ask y/n/A/e before each AI command\n\n"
                 "[bold cyan]── Sudo Auto-Inject ─────────────────────────────[/bold cyan]\n"
                 "[bold]/sudo[/bold]             prompt for sudo password (hidden input)\n"
@@ -642,14 +1055,23 @@ def _print_shell_help() -> None:
                 "[bold]/sudo clear[/bold]       remove password (in-session and from config)\n"
                 "[bold]/sudo status[/bold]      show whether sudo password is active\n"
                 "                  [#888888]Also reads DSEC_SUDO_PASS env var on startup.[/]\n\n"
-                "[bold cyan]── Session ──────────────────────────────────────[/bold cyan]\n"
+
+                "[bold cyan]── Session Management ──────────────────────────[/bold cyan]\n"
                 "[bold]/session[/bold]          show session details (notes, flags, history)\n"
                 "[bold]/history[/bold]          show last 10 conversation turns\n"
                 "[bold]/note <text>[/bold]      add a note to the session\n"
-                "[bold]/domain <name>[/bold]    switch domain: [#888888]htb  bugbounty  ctf  research[/]\n"
-                "[bold]/model <name>[/bold]     switch AI model\n"
-                "[bold]/status[/bold]           show all shell settings\n"
+                "[bold]/new [name][/bold]       start a new session (clear context)\n"
+                "[bold]/status[/bold]           show all current shell settings\n"
                 "[bold]/clear[/bold]            clear screen\n\n"
+
+                "[bold cyan]── Domain & Model ──────────────────────────────[/bold cyan]\n"
+                "[bold]/domain <name>[/bold]    switch domain: [#888888]htb  bugbounty  ctf  research  programmer[/]\n"
+                "[bold]/model <name>[/bold]     switch AI model\n\n"
+
+                "[bold cyan]── Skills & Tools ──────────────────────────────[/bold cyan]\n"
+                "[bold]/skill [name][/bold]     load a security methodology skill\n"
+                "[bold]/tools[/bold]            list all registered native tools\n\n"
+
                 "[bold cyan]── MCP Servers ──────────────────────────────────[/bold cyan]\n"
                 "[bold]/mcp list[/bold]                     list configured MCP servers\n"
                 "[bold]/mcp connect <name>[/bold]           connect to server\n"
@@ -661,14 +1083,13 @@ def _print_shell_help() -> None:
                 "[bold]Tab[/bold]      autocomplete      [bold]Ctrl-R[/bold]  reverse search\n"
                 "[bold]Ctrl-C[/bold]   cancel line / cancel streaming request\n"
                 "[bold]Ctrl-D[/bold]   exit shell\n\n"
-                "[bold cyan]── Meta ─────────────────────────────────────────[/bold cyan]\n"
-                "[bold]/help[/bold]             show this message\n"
+                "[bold cyan]── Exit ─────────────────────────────────────────[/bold cyan]\n"
                 "[bold]/exit[/bold] / [bold]/quit[/bold]    leave the shell"
             ),
             title="[bold]DSEC Shell — Help[/bold]",
             title_align="left",
             border_style="blue",
-            box=box.MINIMAL,
+            box=box.ROUNDED,
         )
     )
 
@@ -681,6 +1102,10 @@ def _print_shell_status(state: Dict[str, Any]) -> None:
     info.append(f"{state['domain_override'] or 'auto'}\n")
     info.append("Model:       ", style="bold")
     info.append(f"{state['model_override'] or 'default'}\n")
+    info.append("Mode:        ", style="bold")
+    info.append(f"{state.get('mode', 'auto')}\n")
+    info.append("Personality: ", style="bold")
+    info.append(f"{state.get('personality', 'professional')}\n")
     info.append("Compression: ", style="bold")
     info.append(f"{'off' if state['no_compress'] else 'on'}\n")
     info.append("Thinking:    ", style="bold")
@@ -761,6 +1186,23 @@ def _handle_shell_command(raw: str, state: Dict[str, Any]) -> bool:
         console.clear()
         return True
 
+    # ── new session ───────────────────────────────────────────────────────────
+    if command == "/new":
+        from .session import create_session
+        new_name = arg if arg else _generate_shell_session_name()
+        dom = state["domain_override"] or "htb"
+        create_session(new_name, dom)
+        state["session_name"] = new_name
+        
+        # Clear context and history for the new session
+        if "context" in state:
+            from .context_manager import ContextManager
+            state["context"] = ContextManager(domain=dom, model=state["model_override"])
+        
+        _print_shell_banner(state["session_name"], dom, state["model_override"] or "default")
+        print_success(f"Started new session: {new_name}")
+        return True
+
     # ── session ───────────────────────────────────────────────────────────────
     if command == "/session":
         data = load_session(state["session_name"])
@@ -786,11 +1228,31 @@ def _handle_shell_command(raw: str, state: Dict[str, Any]) -> bool:
 
     # ── domain ────────────────────────────────────────────────────────────────
     if command == "/domain":
-        if arg not in {"htb", "bugbounty", "ctf", "research"}:
-            print_warning("Usage: /domain <htb|bugbounty|ctf|research>")
+        if arg not in {"htb", "bugbounty", "ctf", "research", "programmer"}:
+            print_warning("Usage: /domain <htb|bugbounty|ctf|research|programmer>")
             return True
         state["domain_override"] = arg
         print_success(f"Shell domain set to {arg}.")
+        return True
+
+    # ── mode ──────────────────────────────────────────────────────────────────
+    if command == "/mode":
+        valid_modes = {"architect", "recon", "exploit", "ask", "auto"}
+        if arg not in valid_modes:
+            print_warning(f"Usage: /mode <{'|'.join(valid_modes)}>")
+            return True
+        state["mode"] = arg
+        print_success(f"Agent mode set to {arg}.")
+        return True
+
+    # ── personality ───────────────────────────────────────────────────────────
+    if command == "/personality":
+        valid_pers = {"professional", "hacker", "teacher"}
+        if arg not in valid_pers:
+            print_warning(f"Usage: /personality <{'|'.join(valid_pers)}>")
+            return True
+        state["personality"] = arg
+        print_success(f"Agent personality set to {arg}.")
         return True
 
     # ── model ─────────────────────────────────────────────────────────────────
@@ -828,6 +1290,89 @@ def _handle_shell_command(raw: str, state: Dict[str, Any]) -> bool:
     # ── sudo ──────────────────────────────────────────────────────────────────
     if command == "/sudo":
         _handle_sudo_command(arg, state)
+        return True
+
+    # ── tools ─────────────────────────────────────────────────────────────────
+    if command == "/tools":
+        _ensure_native_tools_loaded()
+        from .core.registry import list_tools as registry_list_tools
+        tools = registry_list_tools()
+        if not tools:
+            print_info("No native tools registered.")
+        else:
+            from rich.table import Table
+            from rich import box
+            table = Table(title="Native Tools", title_justify="left", border_style="#888888", box=box.SIMPLE)
+            table.add_column("Tool", style="bold magenta", min_width=22)
+            table.add_column("Description", overflow="fold")
+            for t in tools:
+                table.add_row(t["name"], t.get("description", ""))
+            console.print(table)
+        return True
+
+    # ── skill ─────────────────────────────────────────────────────────────────
+    if command == "/skill":
+        if not arg:
+            from dsec.skills.loader import list_skills
+            skills = list_skills()
+            if not skills:
+                print_info("No skills available.")
+            else:
+                from rich.table import Table
+                from rich import box
+                table = Table(title="Available Skills", title_justify="left", border_style="#888888", box=box.SIMPLE)
+                table.add_column("Skill", style="bold cyan")
+                table.add_column("Source", style="#888888")
+                table.add_column("Description", overflow="fold")
+                for s in skills:
+                    table.add_row(s["name"], s["source"], s.get("description", ""))
+                console.print(table)
+        else:
+            from dsec.skills.loader import load_skill
+            if load_skill(arg):
+                state.setdefault("active_skills", set()).add(arg)
+                print_success(f"Skill '{arg}' activated for this session.")
+            else:
+                print_error(f"Skill '{arg}' not found.")
+        return True
+
+    # ── scope ─────────────────────────────────────────────────────────────────
+    if command == "/scope":
+        from dsec.scope import add_in_scope, add_out_of_scope, clear_scope, get_scope
+        if not arg:
+            scope_cfg = get_scope()
+            if not scope_cfg["in_scope"] and not scope_cfg["out_of_scope"]:
+                print_info("No scope defined. All targets allowed.")
+            else:
+                from rich.table import Table
+                from rich import box
+                table = Table(title="Target Scope", title_justify="left", border_style="#888888", box=box.SIMPLE)
+                table.add_column("Type", style="bold")
+                table.add_column("Target", overflow="fold")
+                for target in scope_cfg["in_scope"]:
+                    table.add_row("[green]IN SCOPE[/green]", target)
+                for target in scope_cfg["out_of_scope"]:
+                    table.add_row("[red]OUT OF SCOPE[/red]", target)
+                console.print(table)
+        else:
+            parts = arg.split(maxsplit=1)
+            if len(parts) < 2 and parts[0] != "clear":
+                print_warning("Usage: /scope <add|exclude|clear> [target]")
+                return True
+            action = parts[0].lower()
+            if action == "clear":
+                clear_scope()
+                print_success("Scope cleared.")
+            else:
+                target = parts[1].strip()
+                if action == "add":
+                    add_in_scope(target)
+                    print_success(f"Added to IN SCOPE: {target}")
+                elif action in ("exclude", "remove", "block"):
+                    add_out_of_scope(target)
+                    print_success(f"Added to OUT OF SCOPE: {target}")
+                else:
+                    print_warning("Usage: /scope <add|exclude|clear> [target]")
         return True
 
     print_warning(f"Unknown shell command: {command}. Use /help.")
@@ -921,8 +1466,8 @@ def _shell_run_command(cmd: str, state: Dict[str, Any]) -> None:
     try:
         console.print(
             "\n[bold]Send this output to the AI?[/bold]  "
-            "[bold green]\\[s]end[/bold green]  [bold]\\[d]iscard[/bold]  "
-            "[bold]\\[a]sk a question first[/bold]"
+            "[bold green][[s]][/bold green]end  [bold][[d]][/bold]iscard  "
+            "[bold][[a]][/bold]sk a question first"
         )
         choice = console.input("> ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -1066,7 +1611,7 @@ def _handle_mcp_command(arg: str, state: Dict[str, Any]) -> None:
                 console.print(Syntax(_json2.dumps(result, indent=2), "json"))
             # Offer to send to AI
             try:
-                console.print("\n[bold]Send result to AI?[/bold] [bold green]\\[y]es[/bold green]/[bold]\\[n]o[/bold]")
+                console.print("\n[bold]Send result to AI?[/bold] [bold green][[y]][/bold green]/[bold][[n]][/bold]")
                 if console.input("> ").strip().lower() == "y":
                     output_str = result if isinstance(result, str) else _json2.dumps(result, indent=2)
                     _run_chat(
@@ -1120,8 +1665,8 @@ def _launch_shell(
                 console.print(
                     rf"[#888888]Last session:[/] [bold]{last}[/bold] "
                     rf"[#888888]({msgs} messages)[/]  "
-                    rf"[bold cyan]\[r]esume[/bold cyan]  "
-                    rf"[bold cyan]\[n]ew[/bold cyan]"
+                    rf"[bold cyan][[r]][/bold cyan][#888888]esume  [/]"
+                    rf"[bold cyan][[n]][/bold cyan][#888888]ew[/]"
                 )
                 choice = console.input("> ").strip().lower()
             except (EOFError, KeyboardInterrupt):
@@ -1147,6 +1692,8 @@ def _launch_shell(
         "no_memory": no_memory,
         "quick": quick,
         "auto_exec": True,   # /autoexec toggle
+        "mode": "auto",
+        "personality": "professional",
         "sudo_password": _initial_sudo,
     }
 
@@ -1155,11 +1702,8 @@ def _launch_shell(
     # ── Build prompt_toolkit session (falls back to None if unavailable) ──────
     pt_session = build_prompt_session(state)
     if pt_session:
-        print_info(
-            "[bold]↑↓[/bold] history  [bold]←→[/bold] cursor  "
-            "[bold]Tab[/bold] complete  [bold]Ctrl-R[/bold] search  "
-            "[bold]Ctrl-C[/bold] cancel line  [bold]Ctrl-D[/bold] exit"
-        )
+        # Instructions are now in the bottom toolbar
+        pass
 
     def _read_line() -> str:
         """Read one line – prompt_toolkit (with arrow keys) or Rich fallback."""
@@ -1202,6 +1746,8 @@ def _launch_shell(
                     no_memory=state["no_memory"],
                     quick=state["quick"],
                     _auto_exec=state.get("auto_exec", False),
+                    _mode=state.get("mode", "auto"),
+                    _personality=state.get("personality", "professional"),
                 )
             except KeyboardInterrupt:
                 console.print()
@@ -1268,6 +1814,9 @@ def _run_chat(
     quick: bool,
     _tool_output: str = "",   # pre-injected tool output (from /run or /mcp call)
     _auto_exec: bool = False, # auto-approve AI-requested commands
+    _mode: str = "auto",      # agent mode (architect, recon, exploit, ask, auto)
+    _personality: str = "professional", # agent personality
+    deliver: str = "local",    # delivery target (local, telegram, slack)
 ) -> None:
     config = load_config()
     stdin_content = _tool_output or _read_stdin_content()
@@ -1318,7 +1867,34 @@ def _run_chat(
         compressed_stdin_content=compressed_stdin_content,
         message=message,
         final_input=final_input,
+        mode=_mode,
+        personality=_personality,
     )
+
+    # ── Context Pruning ────────────────────────────────────────────────────────
+    from dsec.context_manager import ContextManager
+    cm = ContextManager(domain=domain, model=model)
+    cm.set_system_prompt_tokens(final_prompt) # Base cost
+    if session_data and "history" in session_data:
+        for t in session_data["history"]:
+            cm.add_turn(t["role"], t.get("content", ""), t.get("thinking", ""))
+    
+    history = None
+    if cm.usage_percent >= 90:
+        print_info(f"Context budget reached ({cm.usage_percent}%). Pruning oldest turns...")
+        # Prune to fit within 60% of budget
+        target_tokens = int(cm.budget * 0.6)
+        history = cm.to_messages(limit=target_tokens)
+        
+        # Permanently prune the session file so it doesn't just reload the full history on the next turn
+        kept_count = sum(1 for m in history if m["role"] != "system")
+        if session_data and "history" in session_data:
+            session_data["history"] = session_data["history"][-kept_count:] if kept_count > 0 else []
+            from dsec.session import save_session
+            save_session(session_name, session_data)
+            
+        # Abandon server-side history to reset its counter
+        conversation_id = None
 
     generator = chat_stream(
         message=final_prompt,
@@ -1326,6 +1902,7 @@ def _run_chat(
         conversation_id=conversation_id,
         base_url=config.get("base_url", "http://localhost:8000"),
         token=get_next_token(),
+        history=history,
     )
 
     thinking, response_content, new_conv_id = stream_response(
@@ -1373,6 +1950,16 @@ def _run_chat(
             auto_exec=_auto_exec,
         )
 
+    # ── delivery notification ──────────────────────────────────────────────────
+    if deliver and deliver != "local":
+        final_data = load_session(session_name)
+        if final_data and "history" in final_data:
+            last_assistant = final_data["history"][-1].get("content", "")
+            deliver_to(deliver, f"*DSEC Notification ({session_name})*\n\n{last_assistant}")
+
+    # Context bar is now integrated into the bottom toolbar
+    pass
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # CLI Definition
@@ -1412,7 +1999,7 @@ class ChatGroup(click.Group):
 @click.option("--new-session", "-n", "new_session", default=None, metavar="NAME",
               help="Create a new session with this name and start chatting.")
 @click.option("--domain", "-d", default=None,
-              type=click.Choice(["htb", "bugbounty", "ctf", "research"]),
+              type=click.Choice(["htb", "bugbounty", "ctf", "research", "programmer"]),
               help="Override domain detection.")
 @click.option("--model", "-m", default=None, metavar="MODEL",
               help="Override model (for example: deepseek-expert-r1-search).")
@@ -1565,7 +2152,7 @@ def note_cmd(content, session_name, note_type):
 @cli.command("memory")
 @click.option("--list", "do_list", is_flag=True, help="List all memories.")
 @click.option("--domain", default=None,
-              type=click.Choice(["htb", "bugbounty", "ctf", "research"]),
+              type=click.Choice(["htb", "bugbounty", "ctf", "research", "programmer"]),
               help="Filter by domain.")
 @click.option("--session", "-s", "filter_session", default=None, metavar="NAME",
               help="Filter by session name.")
@@ -1749,7 +2336,7 @@ def tags_cmd(tag_list, session_name):
 @click.option("--new-session", "-n", "new_session", default=None, metavar="NAME",
               help="Create a new shell session with this name.")
 @click.option("--domain", "-d", default=None,
-              type=click.Choice(["htb", "bugbounty", "ctf", "research"]),
+              type=click.Choice(["htb", "bugbounty", "ctf", "research", "programmer"]),
               help="Override domain detection.")
 @click.option("--model", "-m", default=None, metavar="MODEL", help="Override model.")
 @click.option("--no-compress", "no_compress", is_flag=True, help="Skip context compression.")
@@ -1790,6 +2377,47 @@ def shell_cmd(
         no_memory=no_memory,
         quick=quick,
     )
+
+@cli.command("run")
+@click.argument("prompt")
+@click.option("--session", "-s", default="cron", help="Session name for execution.")
+@click.option("--domain", "-d", default="auto", help="Domain for execution.")
+@click.option("--deliver", default="local", help="Delivery target (local, telegram, slack).")
+def run_cmd(prompt, session, domain, deliver):
+    """Run a prompt autonomously (used by scheduler)."""
+    init_config()
+    _run_chat(
+        message=prompt,
+        session_name=session,
+        domain_override=domain,
+        model_override="",
+        no_compress=False,
+        no_think=False,
+        no_research=False,
+        no_memory=False,
+        quick=False,
+        _auto_exec=True,
+        deliver=deliver
+    )
+
+
+@cli.command("dashboard")
+@click.option("--port", default=8080, help="Port to run the dashboard on.")
+def dashboard(port):
+    """Start the DSEC Web Dashboard (Visual UI)."""
+    from dsec.ui.server import run_dashboard
+    import webbrowser
+    import threading
+    import time
+    
+    print_info(f"Starting DSEC Dashboard on http://localhost:{port}")
+    
+    def open_browser():
+        time.sleep(1)
+        webbrowser.open(f"http://localhost:{port}")
+        
+    threading.Thread(target=open_browser, daemon=True).start()
+    run_dashboard(port=port)
 
 
 if __name__ == "__main__":

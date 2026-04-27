@@ -366,6 +366,140 @@ class MCPManager:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Zenoh Pub/Sub Bridge for Remote MCP Tools
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ZenohMCPBridge:
+    """
+    Wraps MCP tool calls over Zenoh pub/sub for remote tool access.
+
+    When enabled, tool calls are published to a Zenoh topic and responses
+    are received via subscription.  This allows connecting to MCP tools
+    running on remote machines across the network.
+
+    Requires: pip install eclipse-zenoh
+
+    Config (in ~/.dsec/config.json):
+        "zenoh": {
+            "enabled": true,
+            "connect": ["tcp/192.168.1.100:7447"],
+            "prefix": "dsec/mcp"
+        }
+    """
+
+    def __init__(self, connect: Optional[list] = None, prefix: str = "dsec/mcp") -> None:
+        self._session = None
+        self._connect = connect or []
+        self._prefix = prefix
+        self._available = False
+
+        try:
+            import zenoh  # type: ignore
+            self._zenoh = zenoh
+            self._available = True
+        except ImportError:
+            self._zenoh = None
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    def open(self) -> bool:
+        """Open a Zenoh session."""
+        if not self._available:
+            return False
+        if self._session is not None:
+            return True
+        try:
+            config = self._zenoh.Config()
+            if self._connect:
+                config.insert_json5("connect/endpoints", json.dumps(self._connect))
+            self._session = self._zenoh.open(config)
+            return True
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        if self._session:
+            try:
+                self._session.close()
+            except Exception:
+                pass
+            self._session = None
+
+    def publish_tool_call(self, server: str, tool: str, params: Dict[str, Any]) -> Optional[Any]:
+        """
+        Publish a tool call request and wait for the response.
+        Uses Zenoh's get() (query/reply) pattern for RPC-style calls.
+        """
+        if not self._session:
+            if not self.open():
+                return None
+
+        topic = f"{self._prefix}/{server}/{tool}"
+        payload = json.dumps({"params": params})
+
+        try:
+            replies = self._session.get(
+                topic,
+                payload=payload.encode(),
+                timeout=30.0,
+            )
+            for reply in replies:
+                if reply.ok:
+                    return json.loads(reply.ok.payload.to_string())
+            return None
+        except Exception:
+            return None
+
+    def list_remote_tools(self) -> List[Dict[str, str]]:
+        """Discover remote tools by querying the Zenoh key space."""
+        if not self._session:
+            if not self.open():
+                return []
+
+        try:
+            replies = self._session.get(
+                f"{self._prefix}/*/list_tools",
+                timeout=5.0,
+            )
+            tools = []
+            for reply in replies:
+                if reply.ok:
+                    data = json.loads(reply.ok.payload.to_string())
+                    if isinstance(data, list):
+                        tools.extend(data)
+            return tools
+        except Exception:
+            return []
+
+
+_zenoh_bridge: Optional[ZenohMCPBridge] = None
+
+
+def get_zenoh_bridge() -> Optional[ZenohMCPBridge]:
+    """Return the Zenoh bridge singleton, initializing from config if needed."""
+    global _zenoh_bridge
+    if _zenoh_bridge is not None:
+        return _zenoh_bridge
+
+    try:
+        raw = json.loads(CONFIG_PATH.read_text())
+        zenoh_cfg = raw.get("zenoh", {})
+    except Exception:
+        return None
+
+    if not zenoh_cfg.get("enabled", False):
+        return None
+
+    _zenoh_bridge = ZenohMCPBridge(
+        connect=zenoh_cfg.get("connect", []),
+        prefix=zenoh_cfg.get("prefix", "dsec/mcp"),
+    )
+    return _zenoh_bridge
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Singleton
 # ─────────────────────────────────────────────────────────────────────────────
 

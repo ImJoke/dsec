@@ -16,10 +16,19 @@ from .config import load_config
 # Helpers
 # ---------------------------------------------------------------------------
 
+_cached_sessions_dir: Path | None = None
+_session_cache: Dict[str, Dict[str, Any]] = {}
+_session_cache_mtime: Dict[str, float] = {}
+
+
 def _sessions_dir() -> Path:
+    global _cached_sessions_dir
+    if _cached_sessions_dir is not None and _cached_sessions_dir.is_dir():
+        return _cached_sessions_dir
     config = load_config()
     path = Path(config["sessions_dir"]).expanduser()
     path.mkdir(parents=True, exist_ok=True)
+    _cached_sessions_dir = path
     return path
 
 
@@ -36,13 +45,23 @@ def _now_iso() -> str:
 # ---------------------------------------------------------------------------
 
 def load_session(name: str) -> Optional[Dict[str, Any]]:
-    """Return session dict or None if not found."""
+    """Return session dict or None if not found. Uses mtime-based cache."""
     path = _session_path(name)
     if not path.exists():
+        _session_cache.pop(name, None)
+        _session_cache_mtime.pop(name, None)
         return None
     try:
+        mtime = path.stat().st_mtime
+        if name in _session_cache and _session_cache_mtime.get(name) == mtime:
+            import copy
+            return copy.deepcopy(_session_cache[name])
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        _session_cache[name] = data
+        _session_cache_mtime[name] = mtime
+        import copy
+        return copy.deepcopy(data)
     except (json.JSONDecodeError, IOError):
         return None
 
@@ -57,12 +76,15 @@ def save_session(name: str, data: Dict[str, Any]) -> None:
     path = _session_path(name)
     dir_ = path.parent
     dir_.mkdir(parents=True, exist_ok=True)
-    # Write to a sibling temp file, then rename into place atomically.
     fd, tmp = tempfile.mkstemp(dir=dir_, prefix=".tmp_", suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         os.replace(tmp, path)
+        # Update cache with what we just wrote
+        import copy
+        _session_cache[name] = copy.deepcopy(data)
+        _session_cache_mtime[name] = path.stat().st_mtime
     except Exception:
         try:
             os.unlink(tmp)
@@ -156,10 +178,14 @@ def create_session(name: str, domain: str, model: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def update_conversation_id(name: str, conversation_id: str) -> bool:
-    """Backward-compatible helper: set conversation_id and increment turns."""
-    if not set_conversation_id(name, conversation_id):
+    """Set conversation_id and increment turn count in a single write."""
+    data = load_session(name)
+    if not data:
         return False
-    return increment_message_count(name)
+    data["conversation_id"] = conversation_id
+    data["message_count"] = data.get("message_count", 0) + 1
+    save_session(name, data)
+    return True
 
 
 def set_conversation_id(name: str, conversation_id: str) -> bool:

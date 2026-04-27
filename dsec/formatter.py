@@ -1,14 +1,20 @@
 """
 DSEC Terminal Formatter
 Rich-based terminal output for streaming responses, tables, and notices.
+
+Split-pane TUI: during streaming, the terminal shows two distinct panels —
+a collapsible Thinking pane (top) and a Response pane (bottom), inspired by
+OpenCode and Claude Code's split-view experience.
 """
 from datetime import datetime, timezone
 from typing import Any, Dict, Generator, List, Optional, Tuple
+import time
 
 import sys
 from rich import box
 from rich.columns import Columns
 from rich.console import Console, Group
+from rich.layout import Layout
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -76,22 +82,64 @@ def _model_short(model: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Response Panel Builder
+# Split-Pane Layout Builder (OpenCode / Claude Code inspired)
 # ---------------------------------------------------------------------------
 
-def _build_panel(
+_THINKING_MAX_LINES = 20  # Show last N lines of thinking in the pane
+
+
+def _build_thinking_panel(
+    thinking: str,
+    domain: str,
+    elapsed: float,
+    is_streaming: bool,
+) -> Panel:
+    """Build the top pane: collapsible thinking block with live word count."""
+    pal = _get_palette(domain)
+    p = pal["primary"]
+
+    word_count = len(thinking.split()) if thinking else 0
+    lines = thinking.splitlines() if thinking else []
+
+    # Show only last N lines to keep pane compact
+    if len(lines) > _THINKING_MAX_LINES:
+        display_lines = lines[-_THINKING_MAX_LINES:]
+        display = f"… ({len(lines) - _THINKING_MAX_LINES} lines above)\n" + "\n".join(display_lines)
+    else:
+        display = "\n".join(lines) if lines else ""
+
+    if not display and is_streaming:
+        display = "⏳ Waiting for reasoning…"
+
+    body = Text(display, style="italic #888888")
+    status = "streaming" if is_streaming else "done"
+    elapsed_str = f"{elapsed:.1f}s"
+
+    return Panel(
+        body,
+        title=f"[{p}]💭 Thinking[/{p}]  [#666666]{word_count} words · {elapsed_str}[/]",
+        title_align="left",
+        subtitle=f"[#555555]{status}[/]",
+        subtitle_align="right",
+        border_style="#555555",
+        box=box.ROUNDED,
+        padding=(0, 1),
+        height=min(max(4, len(display.splitlines()) + 2), _THINKING_MAX_LINES + 4),
+    )
+
+
+def _build_response_panel(
+    content: str,
     domain: str,
     session_name: str,
     model: str,
-    thinking: str,
-    content: str,
-    show_thinking: bool,
     turn: int,
     compression_info: Optional[Dict],
     research_sources: Optional[List[str]],
     memory_count: int,
     is_streaming: bool,
 ) -> Panel:
+    """Build the bottom pane: rendered AI response with metadata subtitle."""
     domain_cfg = get_domain(domain)
     color = domain_cfg.get("color", "white")
     domain_display = domain_cfg.get("display", domain.upper())
@@ -100,34 +148,25 @@ def _build_panel(
     # ---- Title ----
     title_parts = [f"[bold {color}]{domain_display}[/bold {color}]"]
     if session_name and session_name != "none":
-        title_parts.append(f"[#888888]SESSION:[/] [bold]{session_name}[/bold]")
-    title_parts.append(f"[#888888]MODEL:[/] [#888888]{model_s}[/]")
+        title_parts.append(f"[#888888]{session_name}[/]")
+    title_parts.append(f"[#666666]{model_s}[/]")
     title = "  ".join(title_parts)
 
     # ---- Body ----
-    body_parts: List[Any] = []
-
-    if thinking and show_thinking:
-        think_text = Text()
-        think_text.append("💭 Thinking...\n", style=f"bold {color} #888888")
-        think_text.append("┄" * 68 + "\n", style="#888888")
-        display_thinking = thinking if len(thinking) <= 2000 else thinking[:2000] + "\n…[truncated]"
-        think_text.append(display_thinking, style="italic #888888")
-        body_parts.append(think_text)
-        body_parts.append(Text(""))
-
     if content:
         if is_streaming:
-            body_parts.append(Text(content))
+            # During streaming, show raw text (faster rendering)
+            body: Any = Text(content)
         else:
+            # After completion, render as Markdown
             try:
-                body_parts.append(Markdown(content))
+                body = Markdown(content)
             except Exception:
-                body_parts.append(Text(content))
-    elif is_streaming and not thinking:
-        body_parts.append(Text("⏳ Generating response…", style="#888888"))
-
-    body = Group(*body_parts) if len(body_parts) > 1 else (body_parts[0] if body_parts else Text(""))
+                body = Text(content)
+    elif is_streaming:
+        body = Text("⏳ Generating response…", style="#888888")
+    else:
+        body = Text("")
 
     # ---- Footer (subtitle) ----
     footer_parts: List[str] = []
@@ -135,13 +174,12 @@ def _build_panel(
         footer_parts.append(f"[#888888]turn {turn}[/]")
     if compression_info:
         ratio = compression_info.get("compression_ratio", "")
-        tool = compression_info.get("tool_detected", "")
-        footer_parts.append(f"[{color} #888888]compressed {ratio}[/{color} #888888]")
+        footer_parts.append(f"[{color}]⚡{ratio}[/{color}]")
     if research_sources:
         src_str = "+".join(s[:3].upper() for s in research_sources[:5])
-        footer_parts.append(f"[cyan #888888]research:{src_str}[/cyan #888888]")
+        footer_parts.append(f"[cyan]🔬{src_str}[/cyan]")
     if memory_count > 0:
-        footer_parts.append(f"[blue #888888]memory:{memory_count}[/blue #888888]")
+        footer_parts.append(f"[blue]🧠{memory_count}[/blue]")
 
     subtitle = "  ".join(footer_parts) if footer_parts else None
 
@@ -152,13 +190,72 @@ def _build_panel(
         subtitle=subtitle,
         subtitle_align="left",
         border_style=color,
-        box=box.MINIMAL,
+        box=box.ROUNDED,
         padding=(0, 2),
     )
 
 
+def _build_inline_layout(
+    thinking: str,
+    content: str,
+    domain: str,
+    session_name: str,
+    model: str,
+    turn: int,
+    compression_info: Optional[Dict],
+    research_sources: Optional[List[str]],
+    memory_count: int,
+    is_streaming: bool,
+    show_thinking: bool,
+    elapsed: float,
+) -> Any:
+    """Build the inline layout (natural scroll, Claude Code style)."""
+    domain_cfg = get_domain(domain)
+    color = domain_cfg.get("color", "white")
+
+    # ---- Thinking Block (Collapsible style) ----
+    thinking_renderable = None
+    if show_thinking and thinking:
+        lines = thinking.splitlines()
+        word_count = len(thinking.split())
+        elapsed_str = f"{elapsed:.1f}s"
+        
+        if is_streaming and not content:
+            # Show a compact live view of thinking
+            last_line = lines[-1] if lines else ""
+            if len(last_line) > 80:
+                last_line = last_line[:80] + "…"
+            thinking_renderable = Text(f"💭 Thinking... {last_line}", style="italic #888888")
+        else:
+            # Finished thinking, show summary
+            thinking_renderable = Text(f"▶ Thinking ({word_count} words, {elapsed_str})", style="italic #666666")
+
+    # ---- Response Block ----
+    if content:
+        if is_streaming:
+            body: Any = Text(content)
+        else:
+            try:
+                body = Markdown(content)
+            except Exception:
+                body = Text(content)
+    elif is_streaming and not thinking:
+        body = Text("⏳ Generating response…", style="#888888")
+    else:
+        body = Text("")
+
+    # ---- Assembly ----
+    renderables = []
+    if thinking_renderable:
+        renderables.append(thinking_renderable)
+    if body and str(body):
+        renderables.append(body)
+
+    return Group(*renderables)
+
+
 # ---------------------------------------------------------------------------
-# Main Stream Renderer
+# Main Stream Renderer (Split-Pane TUI)
 # ---------------------------------------------------------------------------
 
 def stream_response(
@@ -173,61 +270,54 @@ def stream_response(
     show_thinking: bool = True,
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    Stream response from generator to the terminal using Rich Live.
+    Stream response from generator to the terminal using Rich Live with
+    a split-pane layout: Thinking (top) + Response (bottom).
+
     Returns (thinking, content, conversation_id) or (None, None, None) on error.
     """
     thinking_parts: List[str] = []
     content_parts: List[str] = []
     conv_id: Optional[str] = None
+    start_time = time.time()
 
     cancelled = False
 
+    def _render(streaming: bool) -> Any:
+        elapsed = time.time() - start_time
+        return _build_inline_layout(
+            "".join(thinking_parts), "".join(content_parts),
+            domain, session_name, model, turn,
+            compression_info, research_sources, memory_count,
+            streaming, show_thinking, elapsed,
+        )
+
     try:
-        with Live(console=console, refresh_per_second=12, transient=False) as live:
+        with Live(console=console, refresh_per_second=12, transient=True) as live:
             for chunk in generator:
                 ctype = chunk.get("type")
 
                 if ctype == "thinking":
                     thinking_parts.append(chunk["text"])
-                    live.update(
-                        _build_panel(
-                            domain, session_name, model,
-                            "".join(thinking_parts), "".join(content_parts),
-                            show_thinking, turn, compression_info,
-                            research_sources, memory_count, True,
-                        )
-                    )
+                    live.update(_render(True))
 
                 elif ctype == "content":
                     content_parts.append(chunk["text"])
-                    live.update(
-                        _build_panel(
-                            domain, session_name, model,
-                            "".join(thinking_parts), "".join(content_parts),
-                            show_thinking, turn, compression_info,
-                            research_sources, memory_count, True,
-                        )
-                    )
+                    live.update(_render(True))
 
                 elif ctype == "done":
                     conv_id = chunk.get("conversation_id")
-                    live.update(
-                        _build_panel(
-                            domain, session_name, model,
-                            "".join(thinking_parts), "".join(content_parts),
-                            show_thinking, turn, compression_info,
-                            research_sources, memory_count, False,
-                        )
-                    )
+                    live.update(_render(False))
 
                 elif ctype == "error":
-                    live.update(
-                        Panel(
-                            Text(f"❌  {chunk['text']}", style="bold red"),
-                            title="[red]ERROR[/red]",
-                            border_style="red",
-                        )
+                    error_panel = Panel(
+                        Text(f"❌  {chunk['text']}", style="bold red"),
+                        title="[red]ERROR[/red]",
+                        border_style="red",
+                        box=box.HEAVY,
                     )
+                    live.update(error_panel)
+                    live.stop()
+                    console.print(error_panel)
                     return None, None, None
 
     except KeyboardInterrupt:
@@ -238,22 +328,24 @@ def stream_response(
         except Exception:
             pass
 
+    # Print final output persistently
+    partial_content = "".join(content_parts)
+    partial_thinking = "".join(thinking_parts)
     if cancelled:
-        partial_content = "".join(content_parts)
-        partial_thinking = "".join(thinking_parts)
-        # Render a final panel with a cancellation marker appended
-        cancel_suffix = "\n\n[bold red]✖ Response cancelled.[/bold red]"
-        console.print(
-            _build_panel(
-                domain, session_name, model,
-                partial_thinking,
-                partial_content + cancel_suffix if partial_content else cancel_suffix,
-                show_thinking, turn, compression_info,
-                research_sources, memory_count, False,
-            )
+        cancel_suffix = "\n\n✖ Response cancelled."
+        partial_content = partial_content + cancel_suffix if partial_content else cancel_suffix
+    
+    elapsed = time.time() - start_time
+    console.print(
+        _build_inline_layout(
+            partial_thinking,
+            partial_content,
+            domain, session_name, model, turn,
+            compression_info, research_sources, memory_count,
+            False, show_thinking, elapsed,
         )
-        # Return partial content so the session history still captures it,
-        # but flag it so _persist_successful_turn knows it's incomplete.
+    )
+    if cancelled:
         return partial_thinking or None, partial_content or None, conv_id
 
     return "".join(thinking_parts), "".join(content_parts), conv_id
@@ -499,3 +591,187 @@ def print_error(msg: str) -> None:
 
 def print_warning(msg: str) -> None:
     console.print(f"[bold yellow]⚠[/bold yellow] {msg}", highlight=False)
+
+# ---------------------------------------------------------------------------
+# Shell UI & Agentic Loop Formatting (Hermes/OpenCode inspired)
+# ---------------------------------------------------------------------------
+
+# Domain color palette — richer than single-word colors
+_DOMAIN_PALETTE = {
+    "htb":       {"primary": "#00ff41", "accent": "#39ff14", "dim": "#0a3d0a"},
+    "bugbounty": {"primary": "#ffaf00", "accent": "#ffd700", "dim": "#4a3800"},
+    "ctf":       {"primary": "#00d4ff", "accent": "#00bfff", "dim": "#003d4d"},
+    "research":  {"primary": "#ff69b4", "accent": "#ff1493", "dim": "#4a0028"},
+    "programmer":{"primary": "#6c9eff", "accent": "#4169e1", "dim": "#1a2d5a"},
+    "osint":     {"primary": "#ff8c00", "accent": "#ff6600", "dim": "#4a2800"},
+}
+
+def _get_palette(domain: str) -> Dict[str, str]:
+    return _DOMAIN_PALETTE.get(domain, _DOMAIN_PALETTE["htb"])
+
+
+def print_banner(domain: str, version: str = "v3.0.0 (Agentic)") -> None:
+    pal = _get_palette(domain)
+    p, a = pal["primary"], pal["accent"]
+    dom_cfg = get_domain(domain)
+    dom_display = dom_cfg.get("display", domain.upper())
+
+    # ASCII Art with fixed width (37 chars)
+    art_text = Text.from_markup(f"[{a} bold]"
+        " ██████╗  ███████╗ ███████╗  ██████╗ \n"
+        " ██╔══██╗ ██╔════╝ ██╔════╝ ██╔════╝ \n"
+        " ██║  ██║ ███████╗ █████╗   ██║      \n"
+        " ██║  ██║ ╚════██║ ██╔══╝   ██║      \n"
+        " ██████╔╝ ███████║ ███████╗ ╚██████╗ \n"
+        " ╚═════╝  ╚══════╝ ╚══════╝  ╚═════╝ [/]"
+    )
+    
+    from rich.align import Align
+    content = Group(
+        Text(""),
+        Align.center(art_text),
+        Text(""),
+        Align.center(Text.from_markup(f"[bold white]DSEC Autonomous Security Agent[/]  [#888888]{version}[/]")),
+        Align.center(Text.from_markup(f"[{p}]▸ Domain:[/] [bold]{dom_display}[/]")),
+        Text(""),
+    )
+
+    banner_panel = Panel(
+        content,
+        box=box.HEAVY,
+        border_style=p,
+        width=64,
+        padding=(0, 2),
+    )
+    
+    console.print()
+    console.print(banner_panel)
+    console.print()
+
+
+def print_thinking_block(thinking: str, domain: str = "htb", collapsed: bool = True) -> None:
+    """Render a collapsible thinking block (OpenCode style)."""
+    pal = _get_palette(domain)
+    p = pal["primary"]
+    word_count = len(thinking.split())
+
+    if collapsed and len(thinking) > 500:
+        display = thinking[:500].rstrip() + "…"
+        suffix = f"  [#666666]({word_count} words — showing first 500 chars)[/]"
+    else:
+        display = thinking
+        suffix = f"  [#666666]({word_count} words)[/]"
+
+    header = f"[{p}]▼ Thinking[/{p}]{suffix}"
+    console.print(header)
+    console.print(f"  [{p}]┃[/{p}] [italic #888888]{display}[/italic #888888]")
+    console.print(f"  [{p}]┗{'━' * 60}[/{p}]")
+
+
+class ToolSpinner:
+    """Animated spinner for API/tool calls."""
+    def __init__(self, message: str = "Working..."):
+        self.message = message
+        self._live = None
+
+    def __enter__(self):
+        from rich.spinner import Spinner
+        self._live = Live(
+            Spinner("dots", text=Text(self.message, style="cyan")),
+            console=console, refresh_per_second=12, transient=True,
+        )
+        self._live.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._live:
+            self._live.__exit__(exc_type, exc_val, exc_tb)
+
+
+def print_tool_header(tool_name: str, index: int, total: int, domain: str = "htb") -> None:
+    """Print a tool execution header like hermes-agent."""
+    pal = _get_palette(domain)
+    p = pal["primary"]
+    console.print(f"\n  [{p}]⚡[/{p}] [bold]Tool {index}/{total}[/bold]  [{p}]{tool_name}[/{p}]")
+
+
+def print_tool_panel(tool_name: str, args: Dict[str, Any], domain: str = "htb") -> None:
+    """Render a polished tool execution panel with arguments."""
+    import json
+    pal = _get_palette(domain)
+    p = pal["primary"]
+
+    lines = []
+    for k, v in args.items():
+        if isinstance(v, str) and len(v) > 200:
+            v_display = v[:200] + "…"
+        elif isinstance(v, (dict, list)):
+            v_display = json.dumps(v, indent=2, ensure_ascii=False)
+        else:
+            v_display = str(v)
+        lines.append(f"  [bold]{k}:[/bold] {v_display}")
+
+    body = "\n".join(lines) if lines else "  (no arguments)"
+    console.print(
+        Panel(
+            body,
+            title=f"[{p}]⚙[/{p}] [bold]{tool_name}[/bold]",
+            title_align="left",
+            subtitle=f"[#666666]awaiting execution[/]",
+            subtitle_align="right",
+            border_style=p,
+            padding=(0, 1),
+            box=box.ROUNDED,
+        )
+    )
+
+
+def print_tool_result(tool_name: str, success: bool, elapsed: float = 0.0, domain: str = "htb") -> None:
+    """Print a tool result summary line."""
+    pal = _get_palette(domain)
+    if success:
+        icon = "[bold green]✓[/bold green]"
+    else:
+        icon = "[bold red]✗[/bold red]"
+    elapsed_str = f"[#666666]{elapsed:.1f}s[/]" if elapsed > 0 else ""
+    console.print(f"  {icon} [bold]{tool_name}[/bold]  {elapsed_str}")
+
+
+def print_iteration_header(iteration: int, max_iter: int, domain: str = "htb") -> None:
+    """Print an iteration progress line for the agentic loop."""
+    pal = _get_palette(domain)
+    p = pal["primary"]
+    
+    if max_iter > 50:
+        # Autonomous Mode indicator
+        console.print(f"\n  [{p}]∞[/{p}] [bold]Autonomous Mode[/bold] (Step [{p}]{iteration}[/{p}])")
+    else:
+        bar_width = 20
+        filled = int((iteration / max_iter) * bar_width) if max_iter > 0 else 0
+        empty = bar_width - filled
+        bar = f"[{p}]{'█' * filled}[/{p}][#333333]{'░' * empty}[/]"
+        console.print(f"\n  [{p}]◆[/{p}] [bold]Agent Loop[/bold] [{p}]{iteration}[/{p}]/{max_iter}  {bar}")
+
+
+def print_context_bar(usage_summary: str) -> None:
+    """Print context usage as a right-aligned status bar."""
+    console.print(f"  [#555555]{'─' * 60}[/]")
+    console.print(f"  {usage_summary}", highlight=False)
+
+
+def print_install_warning(cmd: str) -> None:
+    """Warn when the agent tries to install something."""
+    console.print(
+        Panel(
+            f"[bold yellow]⚠ The agent wants to install software:[/bold yellow]\n\n"
+            f"  [bold]{cmd}[/bold]\n\n"
+            f"[#888888]Installation commands require explicit approval.\n"
+            f"Press [bold]y[/bold] to allow or [bold]n[/bold] to skip.[/]",
+            title="[bold yellow]🔒 Install Permission Required[/bold yellow]",
+            title_align="left",
+            border_style="yellow",
+            box=box.HEAVY,
+            padding=(1, 2),
+        )
+    )
+

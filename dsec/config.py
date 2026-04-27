@@ -7,6 +7,7 @@ Known keys are type-safe; invalid persisted values are reset to defaults.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
@@ -163,6 +164,17 @@ VALIDATORS: Dict[str, ConfigValidator] = {
     "current_token_index": lambda value: _coerce_int(value, minimum=0),
 }
 
+# ── In-memory config cache (avoids re-reading disk on every call) ────────
+_config_cache: Dict[str, Any] | None = None
+_config_cache_mtime: float = 0.0
+_token_index_override: int | None = None
+
+
+def _invalidate_cache() -> None:
+    global _config_cache, _config_cache_mtime
+    _config_cache = None
+    _config_cache_mtime = 0.0
+
 
 def _normalise_config(raw: Dict[str, Any], *, strict: bool = False) -> Tuple[Dict[str, Any], bool]:
     config: Dict[str, Any] = {}
@@ -207,13 +219,24 @@ def init_config() -> None:
 
 
 def load_config() -> Dict[str, Any]:
-    """Load, validate, and normalize config from disk."""
+    """Load, validate, and normalize config from disk. Uses mtime-based cache."""
+    global _config_cache, _config_cache_mtime
+
     _ensure_base_dirs()
 
     if not CONFIG_FILE.exists():
         _write_config(DEFAULT_CONFIG)
         _ensure_runtime_dirs(DEFAULT_CONFIG)
+        _config_cache = dict(DEFAULT_CONFIG)
         return dict(DEFAULT_CONFIG)
+
+    try:
+        current_mtime = os.path.getmtime(CONFIG_FILE)
+    except OSError:
+        current_mtime = 0.0
+
+    if _config_cache is not None and current_mtime == _config_cache_mtime:
+        return dict(_config_cache)
 
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as handle:
@@ -226,13 +249,15 @@ def load_config() -> Dict[str, Any]:
 
     config, changed = _normalise_config(raw)
     if changed:
-        # Merge extra keys (e.g. mcp_servers) back so they are not silently
-        # dropped when the config is rewritten due to a value correction.
-        # NOTE: _read_extra_keys() re-reads the file; we use the already-parsed
-        # `raw` dict here instead to avoid a second disk read.
         extras = {k: raw[k] for k in raw if k not in DEFAULT_CONFIG}
         _write_config({**extras, **config})
+        try:
+            current_mtime = os.path.getmtime(CONFIG_FILE)
+        except OSError:
+            current_mtime = 0.0
     _ensure_runtime_dirs(config)
+    _config_cache = dict(config)
+    _config_cache_mtime = current_mtime
     return config
 
 
@@ -241,12 +266,13 @@ def save_config(key: str, value: Any) -> Dict[str, Any]:
     if key not in DEFAULT_CONFIG:
         raise ConfigError(f"unknown config key: {key}")
 
+    _invalidate_cache()
     config = load_config()
     config[key] = VALIDATORS[key](value)
     config, _ = _normalise_config(config)
-    # Preserve unknown extra keys (e.g. mcp_servers) that survive in the file.
     extras = _read_extra_keys()
     _write_config({**extras, **config})
+    _invalidate_cache()
     _ensure_runtime_dirs(config)
     return config
 
@@ -275,21 +301,38 @@ def add_tokens(token_string: str) -> int:
 
 
 def get_next_token() -> str | None:
-    """Return the next token in round-robin order, if any exist."""
+    """Return the next token in round-robin order, if any exist.
+
+    Keeps the rotating index in memory to avoid a disk write per call.
+    The index is persisted when save_config or add_tokens is called.
+    """
+    global _token_index_override
+
     config = load_config()
     tokens: List[str] = list(config.get("tokens", []))
     if not tokens:
-        if config.get("current_token_index", 0) != 0:
-            config["current_token_index"] = 0
-            extras = _read_extra_keys()
-            _write_config({**extras, **config})
+        _token_index_override = None
         return None
 
-    index = int(config.get("current_token_index", 0)) % len(tokens)
-    config["current_token_index"] = (index + 1) % len(tokens)
-    extras = _read_extra_keys()
-    _write_config({**extras, **config})
+    if _token_index_override is not None:
+        index = _token_index_override % len(tokens)
+    else:
+        index = int(config.get("current_token_index", 0)) % len(tokens)
+
+    _token_index_override = (index + 1) % len(tokens)
     return tokens[index]
+
+
+def flush_token_index() -> None:
+    """Persist the in-memory token index to disk. Call on shutdown."""
+    global _token_index_override
+    if _token_index_override is not None:
+        _invalidate_cache()
+        config = load_config()
+        config["current_token_index"] = _token_index_override
+        extras = _read_extra_keys()
+        _write_config({**extras, **config})
+        _invalidate_cache()
 
 
 def list_tokens() -> List[str]:

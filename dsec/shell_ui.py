@@ -51,11 +51,17 @@ _SLASH_COMMANDS: List[str] = [
     "/domain",
     "/model",
     "/mcp",
+    "/tools",
+    "/skill",
+    "/new",
+    "/mode",
+    "/personality",
+    "/scope",
     "/exit",
     "/quit",
 ]
 
-_DOMAIN_CHOICES: List[str] = ["htb", "bugbounty", "ctf", "research"]
+_DOMAIN_CHOICES: List[str] = ["htb", "bugbounty", "ctf", "research", "programmer"]
 
 _KNOWN_MODELS: List[str] = [
     "deepseek-expert-r1-search",
@@ -137,6 +143,46 @@ if _PROMPT_TOOLKIT_AVAILABLE:
                 if word.startswith("/"):
                     word = ""
                 yield from _completions_for(_DOMAIN_CHOICES, word)
+                return
+
+            if text.lstrip().startswith("/skill"):
+                parts = text.split()
+                from dsec.skills.loader import list_skills
+                skills = [s["name"] for s in list_skills()]
+                if len(parts) == 1 and not text.endswith(" "):
+                    for c in skills:
+                        yield Completion(" " + c, start_position=0)
+                    return
+                word = parts[-1] if len(parts) > 1 and not text.endswith(" ") else ""
+                if word.startswith("/"):
+                    word = ""
+                yield from _completions_for(skills, word)
+                return
+
+            if text.lstrip().startswith("/mode"):
+                parts = text.split()
+                modes = ["architect", "recon", "exploit", "ask", "auto"]
+                if len(parts) == 1 and not text.endswith(" "):
+                    for c in modes:
+                        yield Completion(" " + c, start_position=0)
+                    return
+                word = parts[-1] if len(parts) > 1 and not text.endswith(" ") else ""
+                if word.startswith("/"):
+                    word = ""
+                yield from _completions_for(modes, word)
+                return
+
+            if text.lstrip().startswith("/personality"):
+                parts = text.split()
+                pers = ["professional", "hacker", "teacher"]
+                if len(parts) == 1 and not text.endswith(" "):
+                    for c in pers:
+                        yield Completion(" " + c, start_position=0)
+                    return
+                word = parts[-1] if len(parts) > 1 and not text.endswith(" ") else ""
+                if word.startswith("/"):
+                    word = ""
+                yield from _completions_for(pers, word)
                 return
 
             if text.lstrip().startswith("/model"):
@@ -305,22 +351,31 @@ def build_prompt_session(state: Dict[str, Any]) -> Optional["PromptSession"]:  #
     def _toolbar() -> "HTML":
         session = state.get("session_name", "none")
         domain  = state.get("domain_override") or "auto"
-        model   = state.get("model_override")  or "default"
+        
+        # Context usage
+        try:
+            from dsec.context_manager import ContextManager
+            from dsec.session import load_session
+            cm = ContextManager(domain=domain)
+            session_data = load_session(session)
+            if session_data and "history" in session_data:
+                for t in session_data["history"]:
+                    cm.add_turn(t["role"], t.get("content", ""), t.get("thinking", ""))
+            usage = cm.usage_summary().split("·")[0].strip()
+        except Exception:
+            usage = "🟢 Context: --"
+            
         ae      = "⚡auto" if state.get("auto_exec") else ""
         ae_part = f"  <tb.sep>│</tb.sep>  <tb.domain>{ae}</tb.domain>" if ae else ""
         sudo_part = "  <tb.sep>│</tb.sep>  <tb.domain>🔑</tb.domain>" if state.get("sudo_password") else ""
         return HTML(
             f"<bottom-toolbar>"
-            f"  <tb.sep>│</tb.sep>"
-            f"  <tb.session> {session} </tb.session>"
-            f"  <tb.sep>│</tb.sep>"
-            f"  <tb.domain> {domain} </tb.domain>"
-            f"  <tb.sep>│</tb.sep>"
-            f"  <tb.model> {model} </tb.model>"
+            f"  <tb.sep>ℹ</tb.sep>  {usage}  "
+            f"  <tb.sep>│</tb.sep>  <tb.session> {session} </tb.session>"
+            f"  <tb.sep>│</tb.sep>  <tb.domain> {domain} </tb.domain>"
             f"{ae_part}"
             f"{sudo_part}"
-            f"  <tb.sep>│</tb.sep>"
-            f"  <tb.sep> ↑↓ history  Tab complete  → accept suggestion </tb.sep>"
+            f"  <tb.sep>│</tb.sep>  ↑↓ history  Tab complete  Ctrl-R search  Ctrl-C cancel  Ctrl-D exit"
             f"</bottom-toolbar>"
         )
 
@@ -350,10 +405,16 @@ def prompt_available() -> bool:
     return _PROMPT_TOOLKIT_AVAILABLE
 
 
-def format_prompt(session_name: str) -> "HTML | str":  # type: ignore[return]
+def format_prompt(session_name: str, domain: str = "htb") -> "HTML | str":  # type: ignore[return]
     if _PROMPT_TOOLKIT_AVAILABLE:
+        from dsec.domain import get_domain
+        color = get_domain(domain).get("color", "white")
+        # prompt_toolkit HTML expects recognized names or specific formatting.
+        # It handles 'green', 'yellow', etc. well in standard tags if defined,
+        # but inline styles via <style color="{}"> or <span fg="{}"> is best done via standard tags
+        # We can just use the color name as the tag if it's one of the basics, or use style="color: {color}"
         return HTML(
             f"<session>{session_name}</session>"
-            f"<arrow> ❯ </arrow>"
+            f" <{color}>❯</{color}> "
         )
     return f"{session_name} ❯ "
