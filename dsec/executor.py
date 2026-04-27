@@ -7,9 +7,7 @@ from __future__ import annotations
 import os
 import re as _re
 import shlex
-import stat
 import subprocess
-import tempfile
 import threading
 from typing import Callable, Optional
 
@@ -18,34 +16,44 @@ from typing import Callable, Optional
 # Sudo helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SUDO_RE = _re.compile(r'\bsudo\b')
+# Match 'sudo' only when it is actually the command being run, not inside
+# a quoted argument (e.g. nxc -X "sudo cmd").  We consider sudo "leading"
+# when it appears at the very start of the string or right after a shell
+# separator (&&, ||, ;, |, backtick, or opening paren/brace).
+_LEADING_SUDO_RE = _re.compile(
+    r'(?:^|(?<=&&)|(?<=\|\|)|(?<=;)|(?<=\|)|(?<=`)|(?<=\())(\s*)sudo\b'
+)
 
 
 def _has_sudo(cmd: "str | list[str]") -> bool:
     if isinstance(cmd, list):
         return bool(cmd) and cmd[0] == "sudo"
-    return bool(_SUDO_RE.search(cmd))
+    return bool(_LEADING_SUDO_RE.search(cmd))
 
 
-def _inject_sudo_A(cmd: "str | list[str]") -> "str | list[str]":
-    """Replace first sudo with sudo -A (use SUDO_ASKPASS helper)."""
-    if isinstance(cmd, list):
-        if cmd and cmd[0] == "sudo" and "-A" not in cmd:
-            return ["sudo", "-A"] + cmd[1:]
+def _inject_sudo_password_inline(cmd: str, password: str) -> str:
+    """
+    Insert a printf pipe directly before the first leading sudo so that
+    sudo -S reads the password from stdin.  Inserting at the sudo site
+    (not at string start) keeps compound commands like 'A && sudo B'
+    working correctly:
+
+        A && printf '%s\\n' 'PASS' | sudo -S -p "" B
+
+    Bash parses | before &&, so printf's stdout goes to sudo, not A.
+
+    -S  → read password from stdin
+    -p "" → suppress the 'Password:' prompt
+    """
+    first_match = _LEADING_SUDO_RE.search(cmd)
+    if not first_match:
         return cmd
-    return _SUDO_RE.sub("sudo -A", cmd, count=1)
-
-
-def _create_askpass(password: str) -> str:
-    """Write a temp chmod-700 shell script that prints the sudo password."""
-    fd, path = tempfile.mkstemp(prefix=".dsec_ap_", suffix=".sh")
-    try:
-        script = f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(password)}\n"
-        os.write(fd, script.encode())
-        os.fchmod(fd, stat.S_IRWXU)
-    finally:
-        os.close(fd)
-    return path
+    start, end = first_match.span()
+    leading_space = first_match.group(1)
+    pw_quoted = shlex.quote(password)
+    prefix = f"printf '%s\\n' {pw_quoted} | "
+    # Insert: [before match][leading_space][prefix][sudo -S -p ""][rest]
+    return cmd[:start] + leading_space + prefix + 'sudo -S -p ""' + cmd[end:]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -172,18 +180,19 @@ class CommandRunner:
                 return CommandResult(command, "", "Empty command.", 1)
             # shutil.which would be ideal but let the OS raise FileNotFoundError
 
-        # Prepare sudo password injection via SUDO_ASKPASS (no stdin race condition)
-        _sudo_inject = bool(sudo_password and _has_sudo(argv))
-        _askpass_path: Optional[str] = None
-        if _sudo_inject:
-            argv = _inject_sudo_A(argv)  # type: ignore[assignment]
-            _askpass_path = _create_askpass(sudo_password)
+        # Inject sudo password inline: printf 'PASS' | sudo -S -p "" cmd
+        # Works regardless of TTY, env_reset, or macOS sandbox restrictions.
+        if sudo_password and _has_sudo(argv):
+            if isinstance(argv, str):
+                argv = _inject_sudo_password_inline(argv, sudo_password)
+            # list form: convert to shell string so we can use the pipe trick
+            elif isinstance(argv, list) and argv and argv[0] == "sudo":
+                argv = _inject_sudo_password_inline(shlex.join(argv), sudo_password)
+                shell = True  # now a shell string
 
         try:
             env = os.environ.copy()
             env.pop("DSEC_SUDO_PASS", None)  # don't leak into child env
-            if _askpass_path:
-                env["SUDO_ASKPASS"] = _askpass_path
             with self._lock:
                 self._proc = subprocess.Popen(
                     argv,
@@ -249,11 +258,6 @@ class CommandRunner:
         finally:
             with self._lock:
                 self._proc = None
-            if _askpass_path:
-                try:
-                    os.unlink(_askpass_path)
-                except OSError:
-                    pass
 
         return CommandResult(
             command=command,
