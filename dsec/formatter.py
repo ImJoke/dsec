@@ -21,10 +21,44 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+import re as _re
+
 from .domain import get_domain
 
 # Optimized for macOS Terminal and general stability
 console = Console()
+
+# Strip <tool_call>...</tool_call> blocks and bare native-tool one-liners
+# from the displayed response so only human-readable prose is shown.
+_TOOL_CALL_STRIP_RE = _re.compile(
+    r'<tool_call>.*?</tool_call>', _re.DOTALL | _re.IGNORECASE
+)
+_BARE_TOOL_LINE_RE = _re.compile(
+    r'^\s*(?:bash\s+)?([a-z][a-z0-9_]*)\s*(\{[^}]*\})?\s*$'
+)
+# Known native tool prefixes (avoid stripping normal prose lines)
+_NATIVE_TOOL_PREFIXES = frozenset([
+    "pty_", "bash", "core_memory", "graph_memory", "browser_", "web_",
+    "http_", "file_", "programmer_", "gtfobins", "osint_", "save_skill",
+])
+
+
+def _clean_display_content(text: str) -> str:
+    """Remove tool call blocks and bare tool-name lines from display text."""
+    # Strip XML tool call blocks
+    text = _TOOL_CALL_STRIP_RE.sub("", text)
+    # Strip bare tool-name lines (e.g. "bash pty_list_panes", "pty_create_pane")
+    lines = []
+    for line in text.splitlines():
+        m = _BARE_TOOL_LINE_RE.match(line)
+        if m:
+            name = m.group(1)
+            if any(name.startswith(p) or name == p.rstrip("_") for p in _NATIVE_TOOL_PREFIXES):
+                continue
+        lines.append(line)
+    # Collapse triple+ blank lines to double
+    result = _re.sub(r'\n{3,}', '\n\n', "\n".join(lines))
+    return result.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -232,13 +266,14 @@ def _build_inline_layout(
 
     # ---- Response Block ----
     if content:
+        display_content = content if is_streaming else _clean_display_content(content)
         if is_streaming:
-            body: Any = Text(content)
+            body: Any = Text(display_content)
         else:
             try:
-                body = Markdown(content)
+                body = Markdown(display_content) if display_content else Text("")
             except Exception:
-                body = Text(content)
+                body = Text(display_content)
     elif is_streaming and not thinking:
         body = Text("⏳ Generating response…", style="#888888")
     else:

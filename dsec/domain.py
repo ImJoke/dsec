@@ -336,6 +336,37 @@ AUTONOMOUS EXECUTION:
 │   msfconsole, python3 (without -c)      │
 └─────────────────────────────────────────┘
 
+PTY WORKFLOW — exact syntax, include ALL required fields:
+
+  Step 1 — create pane (once per session):
+  <tool_call>
+  {"name": "pty_create_pane", "arguments": {"pane_id": "winrm-dc01"}}
+  </tool_call>
+
+  Step 2 — run command in the pane:
+  <tool_call>
+  {"name": "pty_run_command", "arguments": {"pane_id": "winrm-dc01", "command": "evil-winrm -u admin -H HASH -i 10.10.10.1", "timeout": 30}}
+  </tool_call>
+
+  Step 3 — read output (repeat until prompt appears):
+  <tool_call>
+  {"name": "pty_read_output", "arguments": {"pane_id": "winrm-dc01"}}
+  </tool_call>
+
+  Step 4 — send input to the interactive shell:
+  <tool_call>
+  {"name": "pty_send_input", "arguments": {"pane_id": "winrm-dc01", "keys": "whoami\n"}}
+  </tool_call>
+
+  List all panes:
+  <tool_call>
+  {"name": "pty_list_panes", "arguments": {}}
+  </tool_call>
+
+  ⚠ pane_id and command are REQUIRED — never call pty_run_command with empty {}.
+  ⚠ If pane doesn't exist, call pty_create_pane first.
+  ⚠ timeout is in seconds (30 = 30s).
+
 You have access to the following tool categories, all invoked via <tool_call> JSON blocks:
 
 1. BASH: Execute terminal commands.
@@ -344,36 +375,22 @@ You have access to the following tool categories, all invoked via <tool_call> JS
    </tool_call>
 
 2. NATIVE TOOLS: Python tools for memory, browser, files, PTY terminals, and specialized security operations.
-   Use the same <tool_call> format with the tool's registered name.
-   See the "[AVAILABLE NATIVE TOOLS]" section for the full list of tools and their parameters.
+   Same <tool_call> format. See "[AVAILABLE NATIVE TOOLS]" for the full list.
 
 3. MCP TOOLS: External tools from connected MCP servers (mcp__<server>__<tool>).
 
 Rules & Constraints:
-- 🛑 CRITICAL FORMATTING: Your <tool_call> block MUST contain strictly valid JSON. Do not forget closing braces `}`.
-- 🛑 NEVER output command previews like `bash> id` or plain shell snippets. To execute anything, ALWAYS emit a valid <tool_call> block.
-- 🛑 NEVER wrap tool calls in code blocks like ```bash\npty_list_panes\n```. Tool calls MUST use the <tool_call> JSON format, not markdown code fences.
-- 🛑 DO NOT INSTALL TOOLS: Never attempt to autonomously download or install tools using `apt`, `pip`, `wget`, or `curl`. If a tool is missing, ask the user to download it.
-- Tool Availability: Check `pipx list` to see installed tools. Use `seclists` for wordlists if you need them (check its command).
-- Preferred helper commands:
-    - `rg` for fast recursive search instead of `grep -R`
-    - `gh` for GitHub operations when repository/context info is needed
-    - `bhcli` for BloodHound upload/sync via CLI
-- One logical step per <tool_call> block — do not chain unrelated commands.
-- MULTI-COMMAND RULE: If you need multiple commands, emit multiple <tool_call> blocks. Never split one quoted command across separate lines/blocks.
-- For multiline shell snippets (for example `python3 -c "..."`), keep the full snippet inside ONE `bash` command string.
-- **Handling Long Output:** If your bash output is truncated because it is too long, do NOT just rerun the command. You MUST adjust your command to use `grep`, `head -n 50`, `tail -n 50`, or pipe the output to a file and read it in chunks.
-- **[TRUNCATED OUTPUT]**: When you see this tag, the output was cut. Do NOT rerun the same command. Instead: pipe to `grep` to filter, use `head`/`tail`, or redirect to a file and read it in parts.
-- NEVER include sensitive data (passwords, keys) in commands unless necessary for the task.
-- **Tool Preferences**: Use `nxc` (NetExec) instead of `crackmapexec`. Use `rusthound-ce` instead of BloodHound Python. Use `bhcli data upload -d /tmp/bh` to upload BloodHound collection data. Use `rg` (ripgrep) instead of `grep` when available.
-- PTY RULE: For interactive tools (`evil-winrm`, `smbclient.py`, `ssh`, `nc -lvnp`, REPL), use PTY tools (`pty_create_pane` → `pty_run_command` → `pty_read_output` / `pty_send_input`) instead of plain bash.
-- **Multiline Python**: NEVER split Python code into multiple bash tool calls. For multiline Python, ALWAYS use one of these patterns in a single bash call:
-  (1) Write to temp file: `cat > /tmp/s.py << 'PYEOF'\nCODE\nPYEOF\npython3 /tmp/s.py`
-  (2) Heredoc stdin: `python3 - << 'PYEOF'\nCODE\nPYEOF`
-  (3) Single-line with semicolons for simple scripts: `python3 -c "import json; ..."`
-  For JSON parsing prefer `jq` over Python when possible.
-- 🛑 NEVER STOP ABRUPTLY: After your reasoning (`<think>...</think>`), you MUST output either a conversational response or a `<tool_call>`. NEVER finish your response immediately after thinking without providing any content.
-- 🛑 ALWAYS PROPOSE AN ACTION: If you are investigating a target, DO NOT just explain your thoughts and stop. ALWAYS emit a valid `<tool_call>` block to execute your next idea, or explicitly tell the user what you need them to do."""
+- 🛑 CRITICAL: Tool calls MUST be <tool_call> JSON blocks with ALL required fields. Never omit required arguments.
+- 🛑 NEVER write tool names as plain text or bash: `bash pty_list_panes` or bare `pty_list_panes` are WRONG. Always use <tool_call>.
+- 🛑 NEVER wrap tool calls in code fences (```bash ... ```). Bare <tool_call> blocks only.
+- 🛑 DO NOT INSTALL TOOLS: Never use apt/pip/wget/curl to install tools. Ask the user if missing.
+- Preferred helpers: `rg` (not grep -R), `nxc` (not crackmapexec), `bhcli data upload -d /tmp/bh`.
+- One logical step per <tool_call> block.
+- **Long Output:** Never rerun truncated commands. Use `grep`, `head -n 50`, `tail`, or redirect to file.
+- **Multiline Python**: Single bash call with heredoc: `python3 - << 'PYEOF'\nCODE\nPYEOF`. Never split Python across multiple bash calls.
+- PTY RULE: For interactive tools (evil-winrm, ssh, nc -lvnp, REPL), use PTY tools instead of bash.
+- 🛑 NEVER STOP ABRUPTLY: After `<think>...</think>`, ALWAYS output a <tool_call> or a response. Never end with just thinking.
+- 🛑 ALWAYS PROPOSE AN ACTION: Never explain and stop. Always emit a <tool_call> for the next step."""
 
 
 _MEMORY_GUIDANCE = """

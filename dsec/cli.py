@@ -1146,6 +1146,25 @@ def _run_agentic_loop(
                                     padding=(0, 1)
                                 )
                             )
+                    except TypeError as native_exc:
+                        # Likely missing required arguments — build a helpful hint
+                        import inspect as _inspect
+                        fn = registry_get_tool(tool_name)
+                        if fn:
+                            try:
+                                sig = _inspect.signature(fn)
+                                required = [
+                                    f'"{p}"' for p, v in sig.parameters.items()
+                                    if v.default is _inspect.Parameter.empty
+                                ]
+                                hint = f"Required args: {', '.join(required)}. Got: {arguments}. Correct format: {{\"name\": \"{tool_name}\", \"arguments\": {{{', '.join(f'\"{p}\": \"...\"' for p in [x.strip('\"') for x in required])}}}}}."
+                            except Exception:
+                                hint = str(native_exc)
+                        else:
+                            hint = str(native_exc)
+                        print_warning(f"Native tool {tool_name} failed: {hint}")
+                        tool_responses.append({"name": tool_name, "result": f"[error: {hint}]"})
+                        console.print(f"  [bold red]✖ {tool_name}[/bold red] [#888888]{args_str}[/]")
                     except Exception as native_exc:
                         print_warning(f"Native tool {tool_name} failed: {native_exc}")
                         tool_responses.append({"name": tool_name, "result": f"[error: {native_exc}]"})
