@@ -174,7 +174,9 @@ def pty_run_command(pane_id: str, command: str, timeout: float = 1.0) -> str:
 )
 def pty_read_output(pane_id: str) -> str:
     if pane_id not in _PANES:
-        return f"Error: pane '{pane_id}' does not exist."
+        existing = list(_PANES.keys())
+        hint = f" Active panes: {existing}. Use pty_list_panes to list all panes, or pty_create_pane to create a new one." if existing else " No active panes exist. Use pty_create_pane to create one."
+        return f"Error: pane '{pane_id}' does not exist.{hint}"
 
     raw_output = _PANES[pane_id].read(timeout=0.3)
     if not raw_output:
@@ -188,7 +190,9 @@ def pty_read_output(pane_id: str) -> str:
 )
 def pty_send_input(pane_id: str, keys: str) -> str:
     if pane_id not in _PANES:
-        return f"Error: pane '{pane_id}' does not exist."
+        existing = list(_PANES.keys())
+        hint = f" Active panes: {existing}." if existing else " No active panes exist."
+        return f"Error: pane '{pane_id}' does not exist.{hint}"
 
     # Interpret common escape sequences
     processed = keys.replace("\\x03", "\x03").replace("\\x04", "\x04").replace("\\x1a", "\x1a").replace("\\n", "\n")
