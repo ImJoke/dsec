@@ -30,9 +30,14 @@ console = Console()
 
 # Strip <tool_call>...</tool_call> blocks and bare native-tool one-liners
 # from the displayed response so only human-readable prose is shown.
+# Matches both attribute-form (<tool_call name="bash" arguments="...">...</tool_call>)
+# and plain form (<tool_call>...</tool_call>) and self-closing form (<tool_call .../>).
 _TOOL_CALL_STRIP_RE = _re.compile(
-    r'<tool_call>.*?</tool_call>', _re.DOTALL | _re.IGNORECASE
+    r'<tool_call(?:\s[^>]*)?/>|<tool_call(?:\s[^>]*)?>.*?</tool_call>',
+    _re.DOTALL | _re.IGNORECASE,
 )
+# Orphaned closing tags left after block stripping
+_TOOL_CALL_CLOSE_RE = _re.compile(r'</tool_call>', _re.IGNORECASE)
 _BARE_TOOL_LINE_RE = _re.compile(
     r'^\s*(?:bash\s+)?([a-z][a-z0-9_]*)\s*(\{[^}]*\})?\s*$'
 )
@@ -43,10 +48,16 @@ _NATIVE_TOOL_PREFIXES = frozenset([
 ])
 
 
-def _clean_display_content(text: str) -> str:
+def _clean_display_content(text: str, *, streaming: bool = False) -> str:
     """Remove tool call blocks and bare tool-name lines from display text."""
-    # Strip XML tool call blocks
+    # Strip XML tool call blocks (attribute-form and plain form)
     text = _TOOL_CALL_STRIP_RE.sub("", text)
+    # Strip any orphaned </tool_call> closing tags
+    text = _TOOL_CALL_CLOSE_RE.sub("", text)
+    if streaming:
+        # During streaming skip the heavier line-by-line analysis; just collapse blank lines
+        result = _re.sub(r'\n{3,}', '\n\n', text)
+        return result.strip()
     # Strip bare tool-name lines (e.g. "bash pty_list_panes", "pty_create_pane")
     lines = []
     for line in text.splitlines():
@@ -253,20 +264,24 @@ def _build_inline_layout(
         lines = thinking.splitlines()
         word_count = len(thinking.split())
         elapsed_str = f"{elapsed:.1f}s"
-        
+
         if is_streaming and not content:
-            # Show a compact live view of thinking
+            # Thinking still in progress – show compact live view of last line
             last_line = lines[-1] if lines else ""
             if len(last_line) > 80:
                 last_line = last_line[:80] + "…"
             thinking_renderable = Text(f"💭 Thinking... {last_line}", style="italic #888888")
-        else:
-            # Finished thinking, show summary
+        elif not is_streaming:
+            # Stream finished – show collapsed summary
             thinking_renderable = Text(f"▶ Thinking ({word_count} words, {elapsed_str})", style="italic #666666")
+        # else: content is streaming (thinking already done) – hide indicator,
+        # focus display on the arriving response text
 
     # ---- Response Block ----
     if content:
-        display_content = content if is_streaming else _clean_display_content(content)
+        # Always strip tool-call XML from what the user sees; during streaming use
+        # the lightweight path (skip bare-tool-name heuristics for speed).
+        display_content = _clean_display_content(content, streaming=is_streaming)
         if is_streaming:
             body: Any = Text(display_content)
         else:
