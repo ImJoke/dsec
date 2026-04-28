@@ -162,7 +162,7 @@ def pty_run_command(pane_id: str, command: str, timeout: float = 1.0) -> str:
         return f"Error: pane '{pane_id}' process has exited (return code: {pane.process.returncode})."
 
     pane.write(command + "\n")
-    raw_output = pane.read(timeout=max(0.2, min(timeout, 10.0)))
+    raw_output = pane.read(timeout=max(0.2, min(timeout, 30.0)))
     return strip_ansi(raw_output)
 
 

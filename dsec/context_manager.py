@@ -4,7 +4,7 @@ DSEC Context Manager — Hermes-inspired context window management.
 Tracks estimated token usage per turn, auto-compresses older turns when
 nearing the context budget, and provides context usage stats for the UI.
 """
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 

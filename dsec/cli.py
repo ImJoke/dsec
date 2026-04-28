@@ -696,8 +696,8 @@ def _run_agentic_loop(
             # ── bash tool ─────────────────────────────────────────────────────
             if tool_name == "bash":
                 cmd = arguments.get("command", "").strip()
-                # Sanitize: remove newlines/tabs that AI sometimes adds for formatting
-                cmd = " ".join(cmd.splitlines()).replace("\t", " ").strip()
+                # Preserve internal newlines — they are valid in heredocs and multiline
+                # python3 -c "..." commands. Only strip leading/trailing whitespace.
                 
                 if not cmd:
                     tool_responses.append({"name": tool_name, "result": "[error: empty command]"})
