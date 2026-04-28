@@ -47,6 +47,8 @@ class ZenohMCPTransport:
     def call_tool(self, server_name: str, tool_name: str, arguments: Dict[str, Any], timeout: float = 10.0) -> Any:
         if not self.session:
             self.connect()
+        if not self.session:
+            raise RuntimeError("Zenoh transport is not connected")
             
         msg_id = str(uuid.uuid4())
         req = {

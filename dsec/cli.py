@@ -425,9 +425,121 @@ _TOOL_CALL_RE = _re.compile(r"<tool_call(?:[^>]*)>\s*(.*?)\s*</tool_call>", _re.
 _TOOL_CALL_FALLBACK_RE = _re.compile(r"<tool_call(?:[^>]*)>\s*(\{.*?\})\s*(?:</tool_call|$)", _re.DOTALL | _re.IGNORECASE)
 # Fallback for when AI puts JSON inside the HTML attributes
 _TOOL_CALL_ATTRS_RE = _re.compile(r'<tool_call\s+name=["\']?([^"\'\s]+)["\']?\s+arguments=["\']?(.*?)(?:["\']?\s*>\s*</tool_call>|["\']?\s*/>|["\']?\s*>)', _re.DOTALL | _re.IGNORECASE)
+_BROKEN_TOOL_CALL_LINE_RE = _re.compile(r"^\s*<?tool_call>\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s+(.+?)\s*(?:</tool_call>)?\s*$", _re.IGNORECASE)
 _LEGACY_BASH_LINE_RE = _re.compile(r"(?im)^\s*(?:bash|sh|shell)\s*>\s*(.+?)\s*$")
 _NAME_FIELD_RE = _re.compile(r'"(?:name|tool)"\s*:\s*"([^"]+)"', _re.IGNORECASE)
 _COMMAND_FIELD_RE = _re.compile(r'"command"\s*:\s*"((?:\\\\.|[^"\\\\])*)"', _re.DOTALL | _re.IGNORECASE)
+_PLAIN_COMMAND_LINE_RE = _re.compile(r"^\s*(?:\$\s*)?([a-zA-Z0-9_./-][^`]*)$")
+_NATIVE_TOOL_CALL_LINE_RE = _re.compile(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+(\{.*\})\s*$")
+
+_SHELL_CMD_STARTERS = {
+    "ls", "cat", "grep", "rg", "find", "awk", "sed", "head", "tail", "wc",
+    "nmap", "rustscan", "nxc", "ffuf", "feroxbuster", "nikto", "sqlmap", "curl", "wget",
+    "python", "python3", "pip", "pip3", "smbclient.py", "impacket-smbclient", "evil-winrm",
+    "ssh", "nc", "netcat", "id", "whoami", "env", "export", "echo", "cp", "mv", "rm",
+    "mkdir", "chmod", "chown", "bhcli", "gh", "bash", "sh", "zsh",
+}
+
+_PROSE_STOPWORDS = {
+    "adalah", "benar", "harus", "sepertinya", "aku", "kamu", "yang", "untuk", "dengan",
+    "this", "that", "should", "must", "now", "then", "because", "please", "interactive",
+}
+
+
+def _looks_like_shell_command(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+
+    if stripped.startswith(("#", "-", "*", ">", "[", "```", "|", "🔍", "▶", "💻", "ℹ")):
+        return False
+
+    first = stripped.split(maxsplit=1)[0]
+    first_lower = first.lower()
+
+    # Env assignment prefix, e.g. KRB5CCNAME=/tmp/x.ccache cmd ...
+    if _re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", first):
+        return True
+
+    if first_lower in _SHELL_CMD_STARTERS:
+        # Reject obvious prose lines masquerading as commands, e.g.
+        # "Evil-WinRM adalah ..." from model explanation text.
+        tail_words = [w.strip(".,:;()[]{}\"").lower() for w in stripped.split()[1:6]]
+        if any(w in _PROSE_STOPWORDS for w in tail_words if w):
+            return False
+        return True
+
+    if first_lower.endswith(".py") or "/" in first or first.startswith("./"):
+        return True
+
+    return False
+
+
+def _unbalanced_quotes(text: str) -> bool:
+    # Crude but effective for detecting multiline command strings.
+    escaped = False
+    single = 0
+    double = 0
+    for ch in text:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == "'":
+            single ^= 1
+        elif ch == '"':
+            double ^= 1
+    return bool(single or double)
+
+
+def _extract_plain_bash_commands(text: str, limit: int = 8) -> list[str]:
+    commands: list[str] = []
+    current: list[str] = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+
+        if not stripped:
+            if current and not _unbalanced_quotes("\n".join(current)):
+                commands.append("\n".join(current).strip())
+                current = []
+            continue
+
+        if not current:
+            if not _looks_like_shell_command(stripped):
+                continue
+            current = [stripped]
+        else:
+            current.append(stripped)
+
+        # Continue buffering if the command still has open quotes or line continuation.
+        if stripped.endswith("\\") or _unbalanced_quotes("\n".join(current)):
+            continue
+
+        commands.append("\n".join(current).strip())
+        current = []
+        if len(commands) >= limit:
+            break
+
+    if current and len(commands) < limit:
+        commands.append("\n".join(current).strip())
+
+    # Remove obvious non-commands that can appear in prose/code output.
+    filtered: list[str] = []
+    for cmd in commands:
+        c = cmd.strip()
+        if c.lower().startswith(("import ", "for ", "if ", "print(")):
+            continue
+        # Skip sentence-like prose with many words and no shell syntax hints.
+        tokens = c.split()
+        has_shell_hints = any(sym in c for sym in ("|", "&&", ";", ">", "<", "=", "./", "/"))
+        if len(tokens) >= 7 and not has_shell_hints:
+            continue
+        filtered.append(c)
+    return filtered[:limit]
 
 def _repair_json(raw: str) -> str:
     """Import the robust repair logic from core."""
@@ -475,6 +587,51 @@ def _extract_tool_calls(text: str) -> list[dict]:
         else:
             # Add it anyway and hope the dispatcher can deal with it or error out
             calls.append({"name": name, "arguments": {"raw": args_str}})
+
+    if calls:
+        return calls
+
+    # 0b. Recover malformed one-liner tool calls such as:
+    # tool_call> shell evil-winrm -u user -H hash -i host 15000 </tool_call>
+    for raw_line in text.splitlines():
+        broken = _BROKEN_TOOL_CALL_LINE_RE.match(raw_line.strip())
+        if not broken:
+            continue
+
+        broken_name = broken.group(1).strip().lower()
+        broken_payload = broken.group(2).strip()
+
+        if broken_name in {"shell", "terminal", "pty"}:
+            timeout = 15.0
+            cmd = broken_payload
+            timeout_match = _re.match(r"^(.*\S)\s+(\d{3,6})$", broken_payload)
+            if timeout_match:
+                cmd = timeout_match.group(1).strip()
+                raw_timeout = timeout_match.group(2)
+                try:
+                    timeout_val = int(raw_timeout)
+                    timeout = timeout_val / 1000.0 if timeout_val >= 1000 else float(timeout_val)
+                except ValueError:
+                    timeout = 15.0
+
+            calls.append({
+                "name": "pty_run_command",
+                "arguments": {"pane_id": "shell", "command": cmd, "timeout": max(0.2, min(timeout, 60.0))},
+            })
+            continue
+
+        if broken_name in {"bash", "sh"}:
+            calls.append({"name": "bash", "arguments": {"command": broken_payload}})
+            continue
+
+        # Try JSON payload for native tools.
+        try:
+            parsed_args = _json.loads(broken_payload)
+        except Exception:
+            parsed_args = None
+
+        if isinstance(parsed_args, dict):
+            calls.append({"name": broken_name, "arguments": parsed_args})
 
     if calls:
         return calls
@@ -581,7 +738,76 @@ def _extract_tool_calls(text: str) -> list[dict]:
             if cmd:
                 calls.append({"name": "bash", "arguments": {"command": cmd}})
                 
-    # 4. Agentic Feedback Loop for unrecoverable syntax
+    # 4. Native-tool one-liner fallback, e.g.:
+    # pty_run_command {"pane_id": "shell", "command": "evil-winrm ..."}
+    if not calls:
+        from .core.registry import get_tool as registry_get_tool
+        for raw_line in text.splitlines():
+            native_match = _NATIVE_TOOL_CALL_LINE_RE.match(raw_line.strip())
+            if not native_match:
+                continue
+            tool_name = native_match.group(1)
+            args_blob = native_match.group(2)
+            if not registry_get_tool(tool_name):
+                continue
+            try:
+                args = _json.loads(args_blob)
+            except Exception:
+                try:
+                    args = _json.loads(_repair_json(args_blob))
+                except Exception:
+                    continue
+            if isinstance(args, dict):
+                calls.append({"name": tool_name, "arguments": args})
+
+    # 4b. Bare native-tool detection: catches patterns like:
+    #   pty_list_panes              (no args, forgot wrapper)
+    #   bash pty_list_panes         (AI confused tool as bash command)
+    #   pty_run_command {...}       (no <tool_call> but has JSON)
+    if not calls:
+        from .core.registry import get_tool as _reg_get_tool
+        for raw_line in text.splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith(("#", "-", "*", ">")):
+                continue
+            parts = stripped.split(None, 1)
+            candidate = parts[0]
+            rest = parts[1] if len(parts) > 1 else ""
+
+            # Direct bare native tool name (e.g. "pty_list_panes")
+            if _reg_get_tool(candidate):
+                try:
+                    args = _json.loads(rest) if rest else {}
+                except Exception:
+                    args = {}
+                if isinstance(args, dict):
+                    calls.append({"name": candidate, "arguments": args})
+                    break
+
+            # "bash <native_tool>" misrouting
+            if candidate.lower() in ("bash", "sh") and rest:
+                native_parts = rest.split(None, 1)
+                native_candidate = native_parts[0]
+                if _reg_get_tool(native_candidate):
+                    extra = native_parts[1] if len(native_parts) > 1 else ""
+                    try:
+                        args = _json.loads(extra) if extra else {}
+                    except Exception:
+                        args = {}
+                    if isinstance(args, dict):
+                        calls.append({"name": native_candidate, "arguments": args})
+                        break
+
+    # 5. Plain command fallback: recover when model emits raw commands without
+    # <tool_call> wrappers (common with long reasoning outputs).
+    if not calls:
+        command_candidates = _extract_plain_bash_commands(text)
+
+        if len(command_candidates) >= 1:
+            for cmd in command_candidates[:8]:
+                calls.append({"name": "bash", "arguments": {"command": cmd}})
+
+    # 6. Agentic Feedback Loop for unrecoverable syntax
     if not calls and ("<tool_call" in text.lower() or "bash>" in text.lower() or (potential_json_blocks and '"name"' in text)):
         calls.append({
             "name": "__syntax_error__",
@@ -685,6 +911,15 @@ def _run_agentic_loop(
         for idx, call in sequential_calls:
             tool_name: str = call["name"]
             arguments: Dict[str, Any] = call.get("arguments", {})
+
+            # Backward compatibility: some model outputs still use "shell" alias.
+            if tool_name == "shell":
+                tool_name = "pty_run_command"
+                arguments = {
+                    "pane_id": arguments.get("pane_id", "shell"),
+                    "command": arguments.get("command", ""),
+                    "timeout": arguments.get("timeout", 15.0),
+                }
             
             # Syntax Error Feedback Loop
             if tool_name == "__syntax_error__":
@@ -696,8 +931,8 @@ def _run_agentic_loop(
             # ── bash tool ─────────────────────────────────────────────────────
             if tool_name == "bash":
                 cmd = arguments.get("command", "").strip()
-                # Preserve internal newlines — they are valid in heredocs and multiline
-                # python3 -c "..." commands. Only strip leading/trailing whitespace.
+                # Preserve internal newlines — heredocs and python3 -c "..." multiline
+                # scripts need them. Only normalize tabs and strip edges.
                 
                 if not cmd:
                     tool_responses.append({"name": tool_name, "result": "[error: empty command]"})
@@ -986,8 +1221,9 @@ def _run_agentic_loop(
 
         if new_content is None:
             break
+        assert new_content is not None
             
-        if new_content.strip() == "" and thinking.strip() != "":
+        if (new_content or "").strip() == "" and (thinking or "").strip() != "":
             print_warning("The model generated reasoning but no content (possible API cutoff). Auto-prompting to continue...")
             new_content = '<tool_call> {"name": "__syntax_error__", "arguments": {"message": "CRITICAL: Your previous generation was cut off or you stopped abruptly. You produced reasoning but NO content or tool call. You MUST immediately emit a valid tool call or message to continue."}} </tool_call>'
 
@@ -1072,6 +1308,8 @@ def _print_shell_help() -> None:
                 "[bold cyan]── Run Commands Yourself ────────────────────────[/bold cyan]\n"
                 "[bold]!<cmd>[/bold]            run a command live (e.g. [#888888]!nmap -sV 10.0.0.1[/])\n"
                 "                  streams output; choose to send to AI or discard.\n\n"
+                "                  [#888888]Tip:[/] [bold]!bhcli[/bold] to upload BloodHound JSON/ZIP data to your BH server.\n"
+                "                  [#888888]Tip:[/] [bold]!rg[/bold] for fast recursive text search in files.\n\n"
 
                 "[bold cyan]── Agent Modes & Personality ────────────────────[/bold cyan]\n"
                 "[bold]/mode <name>[/bold]      set agent behavior mode:\n"
@@ -1186,7 +1424,9 @@ def _handle_sudo_command(arg: str, state: Dict[str, Any]) -> None:
         return
     if arg:
         state["sudo_password"] = arg
+        set_sudo_password(arg)
         print_success("Sudo password set [#888888](🔑 auto-injecting for sudo commands)[/]")
+        print_info("Sudo password saved to [bold]~/.dsec/config.json[/bold].")
         return
     # No argument: hidden prompt via getpass
     import getpass
@@ -1198,7 +1438,9 @@ def _handle_sudo_command(arg: str, state: Dict[str, Any]) -> None:
         return
     if pw:
         state["sudo_password"] = pw
+        set_sudo_password(pw)
         print_success("Sudo password set [#888888](🔑 auto-injecting for sudo commands)[/]")
+        print_info("Sudo password saved to [bold]~/.dsec/config.json[/bold].")
     else:
         print_info("No password entered.")
 
@@ -1231,7 +1473,8 @@ def _handle_shell_command(raw: str, state: Dict[str, Any]) -> bool:
         from .session import create_session
         new_name = arg if arg else _generate_shell_session_name()
         dom = state["domain_override"] or "htb"
-        create_session(new_name, dom)
+        model_name = state.get("model_override") or load_config().get("default_model", "deepseek-expert-r1-search")
+        create_session(new_name, dom, model_name)
         state["session_name"] = new_name
         
         # Clear context and history for the new session
@@ -1610,15 +1853,15 @@ def _handle_mcp_command(arg: str, state: Dict[str, Any]) -> None:
             print_error(f"Server '{name}' was not connected.")
 
     elif sub == "tools":
-        name = sub_parts[1] if len(sub_parts) > 1 else None
-        tools = mgr.list_tools(name)
+        server_filter = sub_parts[1] if len(sub_parts) > 1 else None
+        tools = mgr.list_tools(server_filter)
         if not tools:
-            hint = f" on '{name}'" if name else ""
+            hint = f" on '{server_filter}'" if server_filter else ""
             print_info(f"No tools available{hint}. Make sure the server is connected.")
             return
         from rich.table import Table
         from rich import box
-        table = Table(title=f"MCP Tools{' – ' + name if name else ''}", title_justify="left", border_style="#888888", box=box.SIMPLE)
+        table = Table(title=f"MCP Tools{' – ' + server_filter if server_filter else ''}", title_justify="left", border_style="#888888", box=box.SIMPLE)
         table.add_column("Server", style="#888888")
         table.add_column("Tool", style="bold")
         table.add_column("Description", overflow="fold")
@@ -1708,8 +1951,8 @@ def _launch_shell(
                 console.print(
                     rf"[#888888]Last session:[/] [bold]{last}[/bold] "
                     rf"[#888888]({msgs} messages)[/]  "
-                    rf"[bold cyan][[r]][/bold cyan][#888888]esume  [/]"
-                    rf"[bold cyan][[n]][/bold cyan][#888888]ew[/]"
+                    rf"[bold cyan](r)[/bold cyan][#888888]esume  [/]"
+                    rf"[bold cyan](n)[/bold cyan][#888888]ew[/]"
                 )
                 choice = console.input("> ").strip().lower()
             except (EOFError, KeyboardInterrupt):
@@ -1736,7 +1979,7 @@ def _launch_shell(
         "no_research": no_research,
         "no_memory": no_memory,
         "quick": quick,
-        "auto_exec": True,   # /autoexec toggle
+        "auto_exec": False,   # /autoexec toggle (default OFF)
         "mode": "auto",
         "personality": "professional",
         "sudo_password": _initial_sudo,

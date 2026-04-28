@@ -23,3 +23,6 @@ wallace*
 *.log
 cron_test.txt
 fixed_test.txt
+CLAUDE.md
+note.txt
+pytest.ini

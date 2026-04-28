@@ -177,7 +177,11 @@ async def _fetch_one(query_info: Dict[str, Any], max_results: int) -> Optional[D
     for sk, result in zip(source_keys, gathered):
         if isinstance(result, Exception):
             continue
+        if not isinstance(result, list):
+            continue
         for r in result:
+            if not isinstance(r, dict):
+                continue
             r["_source"] = sk
             r["_source_display"] = SOURCE_DISPLAY.get(sk, sk)
         all_results.extend(result)

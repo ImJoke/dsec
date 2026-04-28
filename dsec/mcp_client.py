@@ -435,6 +435,8 @@ class ZenohMCPBridge:
         if not self._session:
             if not self.open():
                 return None
+        if not self._session:
+            return None
 
         topic = f"{self._prefix}/{server}/{tool}"
         payload = json.dumps({"params": params})
@@ -457,6 +459,8 @@ class ZenohMCPBridge:
         if not self._session:
             if not self.open():
                 return []
+        if not self._session:
+            return []
 
         try:
             replies = self._session.get(
@@ -485,9 +489,16 @@ def get_zenoh_bridge() -> Optional[ZenohMCPBridge]:
 
     try:
         raw = json.loads(CONFIG_PATH.read_text())
-        zenoh_cfg = raw.get("zenoh", {})
     except Exception:
         return None
+
+    if not isinstance(raw, dict):
+        return None
+
+    zenoh_cfg_raw = raw.get("zenoh", {})
+    if not isinstance(zenoh_cfg_raw, dict):
+        return None
+    zenoh_cfg: Dict[str, Any] = zenoh_cfg_raw
 
     if not zenoh_cfg.get("enabled", False):
         return None

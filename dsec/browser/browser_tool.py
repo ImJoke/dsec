@@ -278,7 +278,7 @@ class BrowserManager:
         try:
             await self.page.goto(url, wait_until="networkidle", timeout=20000)
             results = await self.page.query_selector_all(".result")
-            items = []
+            items: list[str] = []
             for r in results[:10]:
                 title_el = await r.query_selector(".result__a")
                 snippet_el = await r.query_selector(".result__snippet")

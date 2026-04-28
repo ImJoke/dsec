@@ -1,5 +1,5 @@
 import logging
-import requests
+import requests  # type: ignore[import-untyped]
 import os
 from typing import Optional
 

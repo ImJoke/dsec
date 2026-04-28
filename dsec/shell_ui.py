@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional, cast
 
 # ─────────────────────────────────────────────────────────────────────────────
 # prompt_toolkit imports (soft-optional)
@@ -408,7 +408,7 @@ def build_prompt_session(state: Dict[str, Any]) -> Optional["PromptSession"]:  #
         # multiline=True lets pasted content with \n stay in the buffer
         # instead of being split across multiple submissions
         multiline=True,
-        prompt_continuation=_continuation,
+        prompt_continuation=cast(Any, _continuation),
         complete_while_typing=False,  # only on explicit Tab
         enable_history_search=False,  # plain ↑↓ cycles history in order
         mouse_support=False,

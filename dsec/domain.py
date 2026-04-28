@@ -354,11 +354,18 @@ Rules & Constraints:
 - 🛑 NEVER output command previews like `bash> id` or plain shell snippets. To execute anything, ALWAYS emit a valid <tool_call> block.
 - 🛑 DO NOT INSTALL TOOLS: Never attempt to autonomously download or install tools using `apt`, `pip`, `wget`, or `curl`. If a tool is missing, ask the user to download it.
 - Tool Availability: Check `pipx list` to see installed tools. Use `seclists` for wordlists if you need them (check its command).
+- Preferred helper commands:
+    - `rg` for fast recursive search instead of `grep -R`
+    - `gh` for GitHub operations when repository/context info is needed
+    - `bhcli` for BloodHound upload/sync via CLI
 - One logical step per <tool_call> block — do not chain unrelated commands.
+- MULTI-COMMAND RULE: If you need multiple commands, emit multiple <tool_call> blocks. Never split one quoted command across separate lines/blocks.
+- For multiline shell snippets (for example `python3 -c "..."`), keep the full snippet inside ONE `bash` command string.
 - **Handling Long Output:** If your bash output is truncated because it is too long, do NOT just rerun the command. You MUST adjust your command to use `grep`, `head -n 50`, `tail -n 50`, or pipe the output to a file and read it in chunks.
 - **[TRUNCATED OUTPUT]**: When you see this tag, the output was cut. Do NOT rerun the same command. Instead: pipe to `grep` to filter, use `head`/`tail`, or redirect to a file and read it in parts.
 - NEVER include sensitive data (passwords, keys) in commands unless necessary for the task.
 - **Tool Preferences**: Use `nxc` (NetExec) instead of `crackmapexec`. Use `rusthound-ce` instead of BloodHound Python. Use `bhcli data upload -d /tmp/bh` to upload BloodHound collection data. Use `rg` (ripgrep) instead of `grep` when available.
+- PTY RULE: For interactive tools (`evil-winrm`, `smbclient.py`, `ssh`, `nc -lvnp`, REPL), use PTY tools (`pty_create_pane` → `pty_run_command` → `pty_read_output` / `pty_send_input`) instead of plain bash.
 - **Multiline Python**: NEVER split Python code into multiple bash tool calls. For multiline Python, ALWAYS use one of these patterns in a single bash call:
   (1) Write to temp file: `cat > /tmp/s.py << 'PYEOF'\nCODE\nPYEOF\npython3 /tmp/s.py`
   (2) Heredoc stdin: `python3 - << 'PYEOF'\nCODE\nPYEOF`

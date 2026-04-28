@@ -50,7 +50,7 @@ def _result(
 
 async def fetch_nvd(query: str, max_results: int = 5) -> List[Dict]:
     url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-    params = {"keywordSearch": query, "resultsPerPage": min(max_results, 10)}
+    params: Dict[str, str | int] = {"keywordSearch": query, "resultsPerPage": min(max_results, 10)}
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT, headers=HEADERS) as client:
             resp = await client.get(url, params=params)
@@ -175,7 +175,7 @@ def _parse_exploitdb_html(html: str, max_results: int) -> List[Dict]:
 
 async def fetch_github_advisories(query: str, max_results: int = 5) -> List[Dict]:
     url = "https://api.github.com/advisories"
-    params = {"query": query, "per_page": min(max_results, 10)}
+    params: Dict[str, str | int] = {"query": query, "per_page": min(max_results, 10)}
     gh_headers = {**HEADERS, "Accept": "application/vnd.github+json",
                   "X-GitHub-Api-Version": "2022-11-28"}
     try:
@@ -298,7 +298,7 @@ async def fetch_gtfobins(binary: str, max_results: int = 5) -> List[Dict]:
                 return []
             content = resp.text
 
-        techniques: List[str] = []
+        techniques: List[tuple[str, str]] = []
         current_section = ""
         section_lines: List[str] = []
 
@@ -351,7 +351,10 @@ async def fetch_portswigger(query: str, max_results: int = 5) -> List[Dict]:
             soup = BeautifulSoup(html, "html.parser")
             links = soup.find_all("a", href=True)
             for link in links:
-                href = link["href"]
+                href_raw = link.get("href")
+                if not isinstance(href_raw, str):
+                    continue
+                href = href_raw
                 text = link.get_text(strip=True)
                 if not text or not href:
                     continue
@@ -419,7 +422,10 @@ async def fetch_packetstorm(query: str, max_results: int = 5) -> List[Dict]:
                 if not a:
                     continue
                 title = a.get_text(strip=True)
-                href = a["href"]
+                href_raw = a.get("href")
+                if not isinstance(href_raw, str):
+                    continue
+                href = href_raw
                 full_url = href if href.startswith("http") else "https://packetstormsecurity.com" + href
                 desc = dd.get_text(strip=True)[:200] if dd else ""
                 results.append(
@@ -462,7 +468,10 @@ async def fetch_ctftime_writeups(query: str, max_results: int = 5) -> List[Dict]
             from bs4 import BeautifulSoup  # type: ignore
             soup = BeautifulSoup(html, "html.parser")
             for a in soup.select("a[href*='/writeup/']")[:max_results]:
-                href = a["href"]
+                href_raw = a.get("href")
+                if not isinstance(href_raw, str):
+                    continue
+                href = href_raw
                 title = a.get_text(strip=True)
                 if not title:
                     continue
@@ -502,8 +511,8 @@ async def fetch_ctftime_writeups(query: str, max_results: int = 5) -> List[Dict]
 
 async def fetch_github_ctf(query: str, max_results: int = 5) -> List[Dict]:
     url = "https://api.github.com/search/repositories"
-    params = {"q": f"ctf writeup {query}", "sort": "stars", "order": "desc",
-              "per_page": min(max_results, 10)}
+    params: Dict[str, str | int] = {"q": f"ctf writeup {query}", "sort": "stars", "order": "desc",
+                                    "per_page": min(max_results, 10)}
     gh_headers = {**HEADERS, "Accept": "application/vnd.github+json",
                   "X-GitHub-Api-Version": "2022-11-28"}
     try:

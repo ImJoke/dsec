@@ -155,11 +155,13 @@ def pty_create_pane(pane_id: str) -> str:
 )
 def pty_run_command(pane_id: str, command: str, timeout: float = 1.0) -> str:
     if pane_id not in _PANES:
-        return f"Error: pane '{pane_id}' does not exist. Use pty_create_pane first."
+        _PANES[pane_id] = Pane(pane_id)
 
     pane = _PANES[pane_id]
     if not pane.alive:
-        return f"Error: pane '{pane_id}' process has exited (return code: {pane.process.returncode})."
+        pane.close()
+        _PANES[pane_id] = Pane(pane_id)
+        pane = _PANES[pane_id]
 
     pane.write(command + "\n")
     raw_output = pane.read(timeout=max(0.2, min(timeout, 30.0)))
@@ -193,6 +195,14 @@ def pty_send_input(pane_id: str, keys: str) -> str:
     _PANES[pane_id].write(processed)
     raw_output = _PANES[pane_id].read(timeout=0.3)
     return strip_ansi(raw_output)
+
+
+@register(
+    "pty_send_keys",
+    "Alias for pty_send_input. Sends raw keystrokes to a pane (supports \\x03/\\x04/\\n escapes).",
+)
+def pty_send_keys(pane_id: str, keys: str) -> str:
+    return pty_send_input(pane_id=pane_id, keys=keys)
 
 
 @register(

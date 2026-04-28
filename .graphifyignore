@@ -11,3 +11,6 @@ dsec_clone
 services.txt
 sql_port.txt
 wallace*
+CLAUDE.md
+note.txt
+pytest.ini
