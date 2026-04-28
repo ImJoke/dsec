@@ -26,3 +26,5 @@ fixed_test.txt
 CLAUDE.md
 note.txt
 pytest.ini
+.mypy_cache
+.ruff_cache
