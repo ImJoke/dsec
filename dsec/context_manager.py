@@ -273,6 +273,10 @@ class ContextManager:
             
         return messages
 
+    def get_summary_text(self) -> str:
+        """Return the most recently generated compressed/summary block."""
+        return self._compressed_block
+
     def usage_dict(self) -> Dict[str, Any]:
         """Return usage stats as a dictionary."""
         return {

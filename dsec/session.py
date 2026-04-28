@@ -168,6 +168,7 @@ def create_session(name: str, domain: str, model: str) -> Dict[str, Any]:
         "tags": [],
         "notes": [],
         "history": [],
+        "cumulative_summary": "",  # accumulates all pruned-context summaries across resumes
     }
     save_session(name, data)
     return data
