@@ -33,7 +33,7 @@ def strip_ansi(text: str) -> str:
 class Pane:
     """A single persistent PTY pane with a bash shell and proper controlling terminal."""
 
-    def __init__(self, pane_id: str):
+    def __init__(self, pane_id: str, init_timeout: float = 5.0):
         self.pane_id = pane_id
         self.master_fd, self.slave_fd = pty.openpty()
         
@@ -70,9 +70,18 @@ class Pane:
         fl = fcntl.fcntl(self.master_fd, fcntl.F_GETFL)
         fcntl.fcntl(self.master_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
-        # Read the initial prompt (with a bit more patience)
+        # Read the initial prompt (with a bit more patience). If the shell
+        # takes too long to initialize (slow .bashrc, network mounts, etc.),
+        # fail fast and clean up.
         time.sleep(0.3)
-        self.read()
+        try:
+            self.read(timeout=init_timeout)
+        except Exception:
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise RuntimeError(f"PTY shell initialization failed for pane '{pane_id}'")
 
     @property
     def alive(self) -> bool:

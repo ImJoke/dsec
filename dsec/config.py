@@ -361,8 +361,19 @@ def check_tokens() -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_sudo_password() -> str:
-    """Return the persisted sudo password, or empty string if not set."""
+    """Return the persisted sudo password, or empty string if not set.
+
+    Prefers the system keyring when available, falls back to config file.
+    """
     try:
+        try:
+            import keyring
+            pw = keyring.get_password("dsec", "sudo_password")
+            if pw:
+                return pw
+        except Exception:
+            pass
+
         if CONFIG_FILE.exists():
             with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
                 raw = json.load(fh)
@@ -374,7 +385,20 @@ def get_sudo_password() -> str:
 
 
 def set_sudo_password(password: str) -> None:
-    """Persist the sudo password in config (stored as an extra key)."""
+    """Persist the sudo password.
+
+    Attempt to store in the system keyring; fall back to config file if unavailable.
+    """
+    try:
+        import keyring
+        try:
+            keyring.set_password("dsec", "sudo_password", password)
+            return
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     config = load_config()
     extras = _read_extra_keys()
     extras["sudo_password"] = password
@@ -382,7 +406,16 @@ def set_sudo_password(password: str) -> None:
 
 
 def clear_sudo_password() -> None:
-    """Remove the sudo password from config."""
+    """Remove the sudo password from system keyring and config file."""
+    try:
+        import keyring
+        try:
+            keyring.delete_password("dsec", "sudo_password")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     config = load_config()
     extras = _read_extra_keys()
     extras.pop("sudo_password", None)

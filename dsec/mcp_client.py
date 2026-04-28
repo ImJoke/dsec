@@ -23,10 +23,12 @@ Usage::
 from __future__ import annotations
 
 import json
+import sys
 import os
 import subprocess
 import threading
 import time
+import select
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -67,11 +69,45 @@ def _read_response(proc: subprocess.Popen, req_id: int, timeout: float = 10.0) -
     """Block until we receive the JSON-RPC response for *req_id* or time out."""
     assert proc.stdout is not None
     deadline = time.monotonic() + timeout
+    fd = None
+    try:
+        fd = proc.stdout.fileno()
+    except Exception:
+        # Fallback to simple readline if fileno unavailable
+        fd = None
+
     while time.monotonic() < deadline:
-        line = proc.stdout.readline()
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            if fd is not None:
+                # Wait up to min(0.5, remaining) seconds for data
+                r, _, _ = select.select([fd], [], [], min(0.5, remaining))
+                if not r:
+                    continue
+                line = proc.stdout.readline()
+            else:
+                # Older fallback: non-blocking readline with small sleeps
+                line = proc.stdout.readline()
+                if not line:
+                    time.sleep(0.05)
+                    continue
+        except (ValueError, OSError):
+            # stdout closed or fileno invalid
+            # Try to capture stderr for hints
+            try:
+                if proc.stderr:
+                    err = proc.stderr.read()
+                    if err:
+                        # best-effort logging to stderr
+                        print(f"MCP stderr: {err}", file=sys.stderr)
+            except Exception:
+                pass
+            return None
+
         if not line:
-            time.sleep(0.05)
-            continue
+            # EOF
+            return None
+
         line = line.strip()
         if not line:
             continue

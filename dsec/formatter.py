@@ -43,6 +43,8 @@ _XML_INVOKE_STRIP_RE = _re.compile(
     r'<tool_calls\b[^>]*>.*?</tool_calls>|<invoke\b[^>]*>.*?</invoke>',
     _re.DOTALL | _re.IGNORECASE,
 )
+# Strip malformed tool-call lines such as `tool_call name="bash"> ...`.
+_BROKEN_TOOL_CALL_LINE_RE = _re.compile(r'^\s*<?tool_call\b[^>]*name\s*=.*$', _re.IGNORECASE)
 _BARE_TOOL_LINE_RE = _re.compile(
     r'^\s*(?:bash\s+)?([a-z][a-z0-9_]*)\s*(\{[^}]*\})?\s*$'
 )
@@ -61,6 +63,8 @@ def _clean_display_content(text: str, *, streaming: bool = False) -> str:
     text = _TOOL_CALL_CLOSE_RE.sub("", text)
     # Strip Claude/Anthropic XML invoke format blocks
     text = _XML_INVOKE_STRIP_RE.sub("", text)
+    # Strip malformed tool-call openers that are not valid display content.
+    text = _BROKEN_TOOL_CALL_LINE_RE.sub("", text)
     if streaming:
         # During streaming skip the heavier line-by-line analysis; just collapse blank lines
         result = _re.sub(r'\n{3,}', '\n\n', text)
@@ -376,6 +380,10 @@ def stream_response(
                     live.update(error_panel)
                     live.stop()
                     console.print(error_panel)
+                    partial_thinking = "".join(thinking_parts)
+                    partial_content = "".join(content_parts)
+                    if partial_thinking or partial_content:
+                        return partial_thinking or None, partial_content or None, conv_id
                     return None, None, None
 
     except KeyboardInterrupt:

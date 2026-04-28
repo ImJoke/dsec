@@ -207,6 +207,8 @@ class CommandRunner:
                 )
             proc = self._proc  # local ref for thread closures
 
+            exception_holder = {"out": None, "err": None}
+
             def _read_stdout() -> None:
                 assert proc.stdout is not None
                 try:
@@ -214,8 +216,8 @@ class CommandRunner:
                         stdout_parts.append(line)
                         if on_stdout:
                             on_stdout(line)
-                except (OSError, ValueError):
-                    pass
+                except (OSError, ValueError) as e:
+                    exception_holder["out"] = e
 
             def _read_stderr() -> None:
                 assert proc.stderr is not None
@@ -224,11 +226,11 @@ class CommandRunner:
                         stderr_parts.append(line)
                         if on_stderr:
                             on_stderr(line)
-                except (OSError, ValueError):
-                    pass
+                except (OSError, ValueError) as e:
+                    exception_holder["err"] = e
 
-            t_out = threading.Thread(target=_read_stdout, daemon=True)
-            t_err = threading.Thread(target=_read_stderr, daemon=True)
+            t_out = threading.Thread(target=_read_stdout, daemon=False)
+            t_err = threading.Thread(target=_read_stderr, daemon=False)
             t_out.start()
             t_err.start()
 
@@ -245,6 +247,20 @@ class CommandRunner:
 
             t_out.join(timeout=10)
             t_err.join(timeout=10)
+
+            # Report reader thread exceptions (they would otherwise be lost)
+            if exception_holder.get("out"):
+                try:
+                    import sys as _sys
+                    print(f"Stdout reader thread error: {exception_holder['out']}", file=_sys.stderr)
+                except Exception:
+                    pass
+            if exception_holder.get("err"):
+                try:
+                    import sys as _sys
+                    print(f"Stderr reader thread error: {exception_holder['err']}", file=_sys.stderr)
+                except Exception:
+                    pass
 
             returncode = proc.returncode if proc.returncode is not None else 0
 

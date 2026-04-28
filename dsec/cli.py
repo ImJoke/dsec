@@ -133,6 +133,11 @@ def _safe_input(prompt: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", raw).strip()
 
 
+def _print_tool_line(line: str, *, stderr: bool = False) -> None:
+    text = Text(line, style="#888888" if stderr else None)
+    console.print(text, end="", highlight=False)
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Core chat pipeline helpers
 # ────────────────────────────────────────────────────────────────────────────
@@ -425,6 +430,8 @@ _TOOL_CALL_RE = _re.compile(r"<tool_call(?:[^>]*)>\s*(.*?)\s*</tool_call>", _re.
 _TOOL_CALL_FALLBACK_RE = _re.compile(r"<tool_call(?:[^>]*)>\s*(\{.*?\})\s*(?:</tool_call|$)", _re.DOTALL | _re.IGNORECASE)
 # Fallback for when AI puts JSON inside the HTML attributes
 _TOOL_CALL_ATTRS_RE = _re.compile(r'<tool_call\s+name=["\']?([^"\'\s]+)["\']?\s+arguments=["\']?(.*?)(?:["\']?\s*>\s*</tool_call>|["\']?\s*/>|["\']?\s*>)', _re.DOTALL | _re.IGNORECASE)
+# Whole-block parser for `tool_call name="bash"><parameter ...>...</tool_call>`.
+_TOOL_CALL_PARAMETER_BLOCK_RE = _re.compile(r'<tool_call\s+name=["\']?([^"\'\s]+)["\']?[^>]*>(.*?)</tool_call>', _re.DOTALL | _re.IGNORECASE)
 # Claude/Anthropic XML format: <tool_calls><invoke name="bash"><parameter name="command">...</parameter></invoke></tool_calls>
 _XML_INVOKE_RE = _re.compile(r'<invoke\s+name=["\']?([^"\'\s>]+)["\']?>(.*?)</invoke>', _re.DOTALL | _re.IGNORECASE)
 _XML_PARAMETER_RE = _re.compile(r'<parameter\s+name=["\']?([^"\'\s>]+)["\']?[^>]*>(.*?)</parameter>', _re.DOTALL | _re.IGNORECASE)
@@ -434,6 +441,22 @@ _NAME_FIELD_RE = _re.compile(r'"(?:name|tool)"\s*:\s*"([^"]+)"', _re.IGNORECASE)
 _COMMAND_FIELD_RE = _re.compile(r'"command"\s*:\s*"((?:\\\\.|[^"\\\\])*)"', _re.DOTALL | _re.IGNORECASE)
 _PLAIN_COMMAND_LINE_RE = _re.compile(r"^\s*(?:\$\s*)?([a-zA-Z0-9_./-][^`]*)$")
 _NATIVE_TOOL_CALL_LINE_RE = _re.compile(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+(\{.*\})\s*$")
+
+_SERVER_ERR_PATTERNS = (
+    "服务暂时不可用",
+    "第三方响应错误",
+    "context length exceeded",
+    "token limit",
+)
+
+_AUTH_FAIL_PATTERNS = (
+    "KDC_ERR_PREAUTH_FAILED",
+    "Pre-authentication information was invalid",
+    "STATUS_LOGON_FAILURE",
+    "authentication failed",
+    "invalid credentials",
+    "wrong password",
+)
 
 _SHELL_CMD_STARTERS = {
     "ls", "cat", "grep", "rg", "find", "awk", "sed", "head", "tail", "wc",
@@ -624,6 +647,25 @@ def _extract_tool_calls(text: str) -> list[dict]:
                     continue
             except Exception:
                 pass
+
+        # If the tool wrapped XML <parameter> children inside <tool_call>,
+        # recover them as a normal argument dict.
+        if "<parameter" in args_str.lower():
+            args: dict[str, Any] = {}
+            for param_match in _XML_PARAMETER_RE.finditer(args_str):
+                param_name = param_match.group(1).strip()
+                param_val = param_match.group(2).strip()
+                try:
+                    args[param_name] = _json.loads(param_val)
+                except Exception:
+                    args[param_name] = param_val
+
+            if args:
+                if name == "bash" and "command" in args:
+                    calls.append({"name": "bash", "arguments": {"command": str(args["command"])} })
+                else:
+                    calls.append({"name": name, "arguments": args})
+                continue
                 
         # If JSON parsing failed but it's bash, just extract the command
         if name == "bash":
@@ -631,6 +673,29 @@ def _extract_tool_calls(text: str) -> list[dict]:
         else:
             # Add it anyway and hope the dispatcher can deal with it or error out
             calls.append({"name": name, "arguments": {"raw": args_str}})
+
+    # 0a. Parse `<tool_call name="..."> ... <parameter ...>` blocks directly.
+    if not calls:
+        for match in _TOOL_CALL_PARAMETER_BLOCK_RE.finditer(text):
+            name = match.group(1).strip()
+            body = match.group(2)
+            args: dict[str, Any] = {}
+            for param_match in _XML_PARAMETER_RE.finditer(body):
+                param_name = param_match.group(1).strip()
+                param_val = param_match.group(2).strip()
+                try:
+                    args[param_name] = _json.loads(param_val)
+                except Exception:
+                    args[param_name] = param_val
+
+            if args:
+                if name == "bash" and "command" in args:
+                    calls.append({"name": "bash", "arguments": {"command": str(args["command"])} })
+                else:
+                    calls.append({"name": name, "arguments": args})
+
+        if calls:
+            return calls
 
     if calls:
         return calls
@@ -703,23 +768,52 @@ def _extract_tool_calls(text: str) -> list[dict]:
         # Find the first { in the content
         brace_start = content.find("{")
         if brace_start == -1:
-            continue
+            brace_start = -1
         raw_json = content[brace_start:]
         
         # Try parsing as-is first, then with repair
-        for attempt_json in [raw_json, _repair_json(raw_json)]:
-            try:
-                call_data = _json.loads(attempt_json)
-                if isinstance(call_data, dict):
-                    # Normalize "tool" -> "name"
-                    if "tool" in call_data and "name" not in call_data:
-                        call_data["name"] = call_data["tool"]
-                    
-                    if "name" in call_data:
-                        calls.append(call_data)
-                        break
-            except Exception:
-                continue
+        if brace_start != -1:
+            for attempt_json in [raw_json, _repair_json(raw_json)]:
+                try:
+                    call_data = _json.loads(attempt_json)
+                    if isinstance(call_data, dict):
+                        # Normalize "tool" -> "name"
+                        if "tool" in call_data and "name" not in call_data:
+                            call_data["name"] = call_data["tool"]
+                        
+                        if "name" in call_data:
+                            calls.append(call_data)
+                            break
+                except Exception:
+                    continue
+
+        if calls:
+            break
+
+        # Recover XML `<parameter>` children inside a `<tool_call>` block.
+        if "<parameter" in content.lower():
+            attrs_end = content.find(">")
+            opener = content[:attrs_end] if attrs_end != -1 else content
+            body = content[attrs_end + 1 :] if attrs_end != -1 else content
+
+            tool_match = _re.search(r'\bname\s*=\s*["\']?([^"\'\s>]+)', opener, _re.IGNORECASE)
+            if tool_match:
+                tool_name = tool_match.group(1).strip()
+                args: dict[str, Any] = {}
+                for param_match in _XML_PARAMETER_RE.finditer(body):
+                    param_name = param_match.group(1).strip()
+                    param_val = param_match.group(2).strip()
+                    try:
+                        args[param_name] = _json.loads(param_val)
+                    except Exception:
+                        args[param_name] = param_val
+
+                if args:
+                    if tool_name == "bash" and "command" in args:
+                        calls.append({"name": "bash", "arguments": {"command": str(args["command"])} })
+                    else:
+                        calls.append({"name": tool_name, "arguments": args})
+                    continue
 
     # 2b. JSON-ish fallback: recover common malformed tool payloads where
     # the outer object is broken but name/command fields are still present.
@@ -773,6 +867,39 @@ def _extract_tool_calls(text: str) -> list[dict]:
 
             # Non-bash tool without command field: still recover the name.
             calls.append({"name": tool_name, "arguments": {}})
+
+    # 2c. Bare malformed tag fallback: `tool_call name="bash"> command`
+    # or similar lines that omitted the leading angle bracket.
+    if not calls:
+        for raw_line in text.splitlines():
+            stripped_line = raw_line.strip()
+            lowered = stripped_line.lower()
+            if not stripped_line or "tool_call" not in lowered or "name=" not in lowered:
+                continue
+
+            malformed = _re.match(
+                r'^<?tool_call\b(?P<attrs>[^>]*)>\s*(?P<body>.*)$',
+                stripped_line,
+                _re.IGNORECASE,
+            )
+            if not malformed:
+                continue
+
+            attrs = malformed.group("attrs") or ""
+            body = malformed.group("body").strip()
+            name_match = _re.search(r'\bname\s*=\s*["\']?([^"\'\s>]+)', attrs, _re.IGNORECASE)
+            if not name_match or not body:
+                continue
+
+            tool_name = name_match.group(1).strip()
+            if tool_name.lower() in {"bash", "sh"}:
+                calls.append({"name": "bash", "arguments": {"command": body}})
+                continue
+            if tool_name == "pty_run_command":
+                pane_match = _re.search(r'\bpane_id\s*=\s*["\']?([^"\'\s>]+)', attrs, _re.IGNORECASE)
+                pane_id = pane_match.group(1).strip() if pane_match else "shell"
+                calls.append({"name": "pty_run_command", "arguments": {"pane_id": pane_id, "command": body}})
+                continue
 
     # 3. Legacy fallback: convert `bash> cmd` lines into tool calls.
     # Keep this only as a rescue path when the model ignored the required format.
@@ -899,6 +1026,13 @@ def _detect_format_issues(text: str) -> Optional[str]:
             "  Always use <tool_call> JSON format instead."
         )
 
+    # 1b. `tool_call name="bash"> ...` without the leading `<`.
+    if _re.search(r'(?<!<)\btool_call\s+name\s*=', text, _re.IGNORECASE):
+        issues.append(
+            "WRONG FORMAT: You wrote `tool_call name=...` without the leading `<`.\n"
+            "  Use `<tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"...\"}}</tool_call>` instead."
+        )
+
     # 2. <parameter> with string="true" attribute (seen in the wild)
     if _FORMAT_WARN_STRING_ATTR.search(text):
         issues.append(
@@ -933,6 +1067,35 @@ def _detect_format_issues(text: str) -> Optional[str]:
     header = "⚠️  FORMAT WARNING — Your last response had formatting issues:\n\n"
     body = "\n\n".join(f"{i+1}. {msg}" for i, msg in enumerate(issues))
     return header + body + "\n\n" + _CORRECT_FORMAT_REMINDER
+
+
+def _has_server_overflow_error(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    return any(pattern in text for pattern in _SERVER_ERR_PATTERNS)
+
+
+def _has_auth_failure(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(pattern.lower() in lowered for pattern in _AUTH_FAIL_PATTERNS)
+
+
+def _should_abort_no_tool_loop(
+    *,
+    no_tool_streak: int,
+    no_tool_error_streak: int,
+    no_tool_repeat_streak: int,
+    streak_limit: int,
+    error_streak_limit: int,
+    repeat_limit: int,
+) -> bool:
+    return (
+        no_tool_error_streak >= error_streak_limit
+        or no_tool_repeat_streak >= repeat_limit
+        or no_tool_streak >= streak_limit
+    )
 
 
 def _run_agentic_loop(
@@ -974,11 +1137,193 @@ def _run_agentic_loop(
     # Stuck detection state
     _fail_history: Dict[str, int] = {}  # "tool_name:args_hash" -> fail_count
     _STUCK_THRESHOLD = 3
+    _no_tool_streak = 0
+    _no_tool_error_streak = 0
+    _no_tool_repeat_streak = 0
+    _last_no_tool_response = ""
+
+    _NO_TOOL_STREAK_LIMIT = 12
+    _NO_TOOL_ERROR_STREAK_LIMIT = 3
+    _NO_TOOL_REPEAT_LIMIT = 5
+
+    from .autopilot import AutopilotBugFinder
+
+    autopilot = AutopilotBugFinder(
+        session_name=session_name,
+        domain=domain,
+        model=model,
+    )
+
+    def _compact_loop_context(*, reason: str, force: bool = False) -> None:
+        nonlocal current_conv_id, _loop_pruned_history
+
+        if not session_name or no_memory:
+            return
+
+        from dsec.context_manager import ContextManager
+        from dsec.session import load_session, save_session
+
+        _cm = ContextManager(domain=domain, model=model)
+        _sd = load_session(session_name)
+        if not _sd or "history" not in _sd:
+            return
+
+        for _t in _sd["history"]:
+            _cm.add_turn(_t["role"], _t.get("content", ""), _t.get("thinking", ""))
+
+        if not force and _cm.usage_percent < 50:
+            return
+
+        _target = int(_cm.budget * 0.40)
+        _pruned = _cm.to_messages(limit=_target)
+        _kept = sum(1 for m in _pruned if m["role"] != "system")
+        _sd["history"] = _sd["history"][-_kept:] if _kept > 0 else []
+        save_session(session_name, _sd)
+
+        current_conv_id = None  # reset server-side context
+        _loop_pruned_history = _pruned  # pass to next chat_stream() so AI keeps context
+        print_info(
+            f"Context compacted ({reason}): {_cm.usage_percent}% → pruned to {_kept} turns."
+        )
 
     for iteration in range(1, max_iterations + 1):
         tool_calls = _extract_tool_calls(current_response)
         if not tool_calls:
+            if auto_exec:
+                raw_no_tool = (current_response or "").strip()
+                normalized_no_tool = _re.sub(r"\s+", " ", raw_no_tool)
+
+                _no_tool_streak += 1
+                if normalized_no_tool and normalized_no_tool == _last_no_tool_response:
+                    _no_tool_repeat_streak += 1
+                else:
+                    _no_tool_repeat_streak = 1 if normalized_no_tool else 0
+                _last_no_tool_response = normalized_no_tool
+
+                no_tool_server_error = _has_server_overflow_error(raw_no_tool)
+                if no_tool_server_error:
+                    _no_tool_error_streak += 1
+                    if _no_tool_error_streak == 1:
+                        print_warning(
+                            "Autonomous response looks like an upstream/server error without tool calls; force-compacting context before retry."
+                        )
+                    _compact_loop_context(reason="autonomous no-tool server error", force=True)
+                    # If we've seen multiple pure-error responses in a row, stop to prevent infinite retry
+                    if _no_tool_error_streak >= _NO_TOOL_ERROR_STREAK_LIMIT:
+                        stop_reason = (
+                            f"autonomous no-tool server error detected {_no_tool_error_streak} times; "
+                            "model cannot recover or produce tool calls despite retries"
+                        )
+                        print_warning(
+                            "Autonomous mode detected repeated server errors with no tool calls; "
+                            "stopping to prevent infinite retry loop."
+                        )
+                        autopilot.record_tool_result("__agentic_loop__", f"[error: {stop_reason}]")
+                        issue_path = autopilot.finalize(
+                            reason=stop_reason,
+                            had_tool_calls=True,
+                            loop_ended_normally=False,
+                            new_content=None,
+                        )
+                        if issue_path:
+                            print_warning(f"Autopilot bug finder wrote issue report to {issue_path}")
+                        break
+                # Don't reset error_streak here; keep accumulating until abort condition
+
+                if _should_abort_no_tool_loop(
+                    no_tool_streak=_no_tool_streak,
+                    no_tool_error_streak=_no_tool_error_streak,
+                    no_tool_repeat_streak=_no_tool_repeat_streak,
+                    streak_limit=_NO_TOOL_STREAK_LIMIT,
+                    error_streak_limit=_NO_TOOL_ERROR_STREAK_LIMIT,
+                    repeat_limit=_NO_TOOL_REPEAT_LIMIT,
+                ):
+                    stop_reason = (
+                        "autonomous no-tool spin detected "
+                        f"(streak={_no_tool_streak}, error_streak={_no_tool_error_streak}, repeat_streak={_no_tool_repeat_streak})"
+                    )
+                    print_warning(
+                        "Autonomous mode appears stuck in a no-tool loop; stopping this run to prevent infinite spinning."
+                    )
+                    autopilot.record_tool_result("__agentic_loop__", f"[error: {stop_reason}]")
+                    issue_path = autopilot.finalize(
+                        reason=stop_reason,
+                        had_tool_calls=True,
+                        loop_ended_normally=False,
+                        new_content=None,
+                    )
+                    if issue_path:
+                        print_warning(f"Autopilot bug finder wrote issue report to {issue_path}")
+                    break
+
+                print_info(
+                    f"No tool calls detected at agentic loop iteration {iteration} "
+                    f"(streak={_no_tool_streak}); continuing autonomous mode…"
+                )
+
+                if _no_tool_streak >= 2:
+                    continue_msg = (
+                        "Your previous response did not include any <tool_call> blocks. "
+                        "If work remains, you MUST emit at least one valid <tool_call> now. "
+                        "Only emit no tool calls if the task is truly complete, and include a brief completion statement."
+                    )
+                else:
+                    continue_msg = (
+                        "Continue your autonomous analysis from the previous turn. "
+                        "If the task is not finished, emit one or more <tool_call> blocks. "
+                        "If you believe the task is finished, briefly state that and then emit no tool calls only when you are truly done."
+                    )
+
+                try:
+                    gen = chat_stream(
+                        message=continue_msg,
+                        model=model,
+                        conversation_id=current_conv_id,
+                        base_url=config.get("base_url", "http://localhost:8000"),
+                        token=get_next_token(),
+                        history=_loop_pruned_history,
+                    )
+                    _loop_pruned_history = None
+                    thinking, new_content, new_conv_id = stream_response(
+                        generator=gen,
+                        session_name=session_name or "none",
+                        domain=domain,
+                        model=model,
+                        turn=turn + iteration,
+                        compression_info=None,
+                        research_sources=None,
+                        memory_count=0,
+                        show_thinking=config.get("show_thinking", True) and not no_think,
+                    )
+                except KeyboardInterrupt:
+                    console.print()
+                    print_warning("Agentic loop cancelled.")
+                    autopilot.note_user_interrupt()
+                    return current_conv_id
+
+                if new_conv_id:
+                    current_conv_id = new_conv_id
+
+                if new_content is None:
+                    issue_path = autopilot.finalize(
+                        reason="autonomous continuation produced no content",
+                        had_tool_calls=False,
+                        loop_ended_normally=False,
+                        new_content=new_content,
+                    )
+                    if issue_path:
+                        print_warning(f"Autopilot bug finder wrote issue report to {issue_path}")
+                    break
+
+                current_response = new_content
+                continue
+
             break
+
+        _no_tool_streak = 0
+        _no_tool_repeat_streak = 0
+        _last_no_tool_response = ""
+        # Note: error_streak is NOT reset here; it accumulates as long as we're in no-tool mode
 
         print_iteration_header(iteration, max_iterations, domain)
 
@@ -1013,24 +1358,37 @@ def _run_agentic_loop(
         # 1. Dispatch Parallel Calls
         if safe_parallel_calls:
             import concurrent.futures
+            overall_timeout = 60.0  # seconds to wait for all parallel tools
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 futures = {}
                 for idx, call in safe_parallel_calls:
                     t_name = call["name"]
                     t_args = call.get("arguments", {})
                     futures[executor.submit(registry_call_tool, t_name, t_args)] = (idx, t_name, t_args)
-                
-                for future in concurrent.futures.as_completed(futures):
+
+                # Wait for a bounded amount of time for all tools to complete.
+                done, not_done = concurrent.futures.wait(futures.keys(), timeout=overall_timeout)
+
+                # Process completed futures
+                for future in done:
                     idx, t_name, t_args = futures[future]
                     try:
-                        res = future.result()
+                        res = future.result(timeout=1)
                         res_text = str(res) if res is not None else "(no output)"
-                        if len(res_text) > 10000: res_text = res_text[:10000] + "\n... [truncated]"
+                        if len(res_text) > 10000:
+                            res_text = res_text[:10000] + "\n... [truncated]"
                         tool_responses.append({"name": t_name, "result": res_text})
                         console.print(f"  [bold cyan]⚡ {t_name}[/bold cyan] ([dim]{idx}/{len(tool_calls)}[/dim]) [bold green]✔[/bold green]")
                     except Exception as e:
                         print_warning(f"Parallel tool {t_name} failed: {e}")
                         tool_responses.append({"name": t_name, "result": f"[error: {e}]"})
+
+                # Cancel and record not completed futures
+                for future in not_done:
+                    idx, t_name, t_args = futures[future]
+                    future.cancel()
+                    print_warning(f"Parallel tool {t_name} cancelled after {overall_timeout}s timeout.")
+                    tool_responses.append({"name": t_name, "result": f"[error: cancelled after {overall_timeout}s]"})
 
         # 2. Dispatch Sequential Calls
         for idx, call in sequential_calls:
@@ -1114,9 +1472,10 @@ def _run_agentic_loop(
                 edited_cmd = cmd
                 approved = False
 
-                if is_install_cmd:
-                    # Always require manual approval for install commands
-                    # Even in auto_exec mode, installs are never auto-approved
+                if approve_all:
+                    approved = True
+                elif is_install_cmd:
+                    # Install commands stay interactive unless auto-exec is active.
                     print_install_warning(cmd)
                     try:
                         choice = _safe_input("> ").lower()
@@ -1169,8 +1528,8 @@ def _run_agentic_loop(
                 def _worker(c: str = edited_cmd) -> None:
                     result_holder[0] = runner.run(
                         c,
-                        on_stdout=lambda line: console.print(line, end="", highlight=False),
-                        on_stderr=lambda line: console.print(f"[#888888]{line}[/]", end="", highlight=False),
+                        on_stdout=lambda line: _print_tool_line(line),
+                        on_stderr=lambda line: _print_tool_line(line, stderr=True),
                         shell=True,
                         sudo_password=sudo_password,
                     )
@@ -1206,6 +1565,17 @@ def _run_agentic_loop(
                     if "sudo: no password was provided" in result_text or "sudo: a password is required" in result_text:
                         result_text += "\n\n[SYSTEM] Sudo requires a password. Run /sudo to set it, or redesign the command without sudo."
                         print_warning("Sudo password not set. Run /sudo to configure it.")
+
+                    # Authentication failure detection: stop the AI from retrying the same bad credential.
+                    if _has_auth_failure(result_text):
+                        auth_warn = (
+                            "Authentication failed. This credential is wrong or not accepted by the target. "
+                            "Do NOT retry the exact same username/password. Pivot to a different account, "
+                            "verify the secret source, or inspect the target for another path."
+                        )
+                        result_text += f"\n\n[SYSTEM] {auth_warn}"
+                        print_warning(auth_warn)
+                        _fail_history[f"auth:{cmd[:100]}"] = _STUCK_THRESHOLD
 
                     # Stuck detection for failed commands
                     if res.returncode != 0:
@@ -1298,6 +1668,14 @@ def _run_agentic_loop(
             else:
                 tool_responses.append({"name": tool_name, "result": f"[error: unknown tool '{tool_name}']"})
 
+        tool_response_chars = sum(len(str(tr.get("result", ""))) for tr in tool_responses)
+        large_tool_response = tool_response_chars >= 12000 or any(
+            len(str(tr.get("result", ""))) >= 8000 for tr in tool_responses
+        )
+
+        for tr in tool_responses:
+            autopilot.record_tool_result(tr["name"], str(tr["result"]))
+
         # ── build Hermes-style <tool_response> follow-up ──────────────────────
         response_blocks = []
         stuck_detected = False
@@ -1360,12 +1738,58 @@ def _run_agentic_loop(
         except KeyboardInterrupt:
             console.print()
             print_warning("Agentic loop cancelled.")
+            autopilot.note_user_interrupt()
             return current_conv_id
 
         if new_conv_id:
             current_conv_id = new_conv_id
 
+        if new_content is None or _has_server_overflow_error(new_content) or _has_server_overflow_error(thinking):
+            if new_content is not None:
+                print_warning("Server returned an error during the tool-follow-up step. Force-compacting and retrying…")
+            else:
+                print_warning("Tool-follow-up stopped early. Force-compacting and retrying…")
+            _compact_loop_context(reason="agentic loop overflow", force=True)
+
+            try:
+                gen = chat_stream(
+                    message=follow_up,
+                    model=model,
+                    conversation_id=current_conv_id,
+                    base_url=config.get("base_url", "http://localhost:8000"),
+                    token=get_next_token(),
+                    history=_loop_pruned_history,
+                )
+                _loop_pruned_history = None
+                thinking, new_content, new_conv_id = stream_response(
+                    generator=gen,
+                    session_name=session_name or "none",
+                    domain=domain,
+                    model=model,
+                    turn=turn + iteration,
+                    compression_info=None,
+                    research_sources=None,
+                    memory_count=0,
+                    show_thinking=config.get("show_thinking", True) and not no_think,
+                )
+            except KeyboardInterrupt:
+                console.print()
+                print_warning("Agentic loop cancelled.")
+                autopilot.note_user_interrupt()
+                return current_conv_id
+
+            if new_conv_id:
+                current_conv_id = new_conv_id
+
         if new_content is None:
+            issue_path = autopilot.finalize(
+                reason="model returned no content after tool execution",
+                had_tool_calls=bool(tool_calls),
+                loop_ended_normally=False,
+                new_content=new_content,
+            )
+            if issue_path:
+                print_warning(f"Autopilot bug finder wrote issue report to {issue_path}")
             break
         assert new_content is not None
             
@@ -1382,31 +1806,26 @@ def _run_agentic_loop(
                 thinking=thinking,
             )
 
-            # Auto-compact context inside the loop if approaching the budget
-            if iteration % 5 == 0:
-                from dsec.context_manager import ContextManager
-                from dsec.session import load_session
-                _cm = ContextManager(domain=domain, model=model)
-                _sd = load_session(session_name)
-                if _sd and "history" in _sd:
-                    for _t in _sd["history"]:
-                        _cm.add_turn(_t["role"], _t.get("content", ""), _t.get("thinking", ""))
-                if _cm.usage_percent >= 50:
-                    _target = int(_cm.budget * 0.40)
-                    _pruned = _cm.to_messages(limit=_target)
-                    _kept = sum(1 for m in _pruned if m["role"] != "system")
-                    if _sd and "history" in _sd:
-                        _sd["history"] = _sd["history"][-_kept:] if _kept > 0 else []
-                        from dsec.session import save_session
-                        save_session(session_name, _sd)
-                    current_conv_id = None  # reset server-side context
-                    _loop_pruned_history = _pruned  # pass to next chat_stream() so AI keeps context
-                    print_info(f"Context compacted at iteration {iteration} ({_cm.usage_percent}% → pruned to {_kept} turns).")
+            # Auto-compact context inside the loop if approaching the budget,
+            # or immediately after oversized tool output.
+            if iteration % 5 == 0 or large_tool_response:
+                _compact_loop_context(
+                    reason="large tool output" if large_tool_response else f"iteration {iteration}",
+                    force=large_tool_response,
+                )
 
         current_response = new_content
 
     else:
         print_warning(f"Agentic loop hit the {max_iterations}-iteration limit.")
+        issue_path = autopilot.finalize(
+            reason="agentic loop hit the iteration limit",
+            had_tool_calls=bool(_extract_tool_calls(current_response)),
+            loop_ended_normally=False,
+            new_content=None,
+        )
+        if issue_path:
+            print_warning(f"Autopilot bug finder wrote issue report to {issue_path}")
 
     return current_conv_id
 
@@ -1861,8 +2280,8 @@ def _shell_run_command(cmd: str, state: Dict[str, Any]) -> None:
     def _worker() -> None:
         result_holder[0] = runner.run(
             cmd,
-            on_stdout=lambda line: console.print(line, end="", highlight=False),
-            on_stderr=lambda line: console.print(f"[#888888]{line}[/]", end="", highlight=False),
+            on_stdout=lambda line: _print_tool_line(line),
+            on_stderr=lambda line: _print_tool_line(line, stderr=True),
             shell=True,  # shell=True for convenience in security ops
             sudo_password=state.get("sudo_password"),
         )
@@ -2142,9 +2561,22 @@ def _launch_shell(
 
     def _read_line() -> str:
         """Read one line – prompt_toolkit (with arrow keys) or Rich fallback."""
+        nonlocal pt_session
         p = format_prompt(state["session_name"])
         if pt_session:
-            return pt_session.prompt(p).strip()
+            try:
+                return pt_session.prompt(p).strip()
+            except Exception as exc:  # noqa: BLE001
+                message = str(exc).lower()
+                if "disposed" in message or "fetchedvalue" in message:
+                    print_warning(
+                        "Interactive prompt fallback enabled after prompt_toolkit disposal error."
+                    )
+                    pt_session = None
+                    return console.input(
+                        f"[#888888]{state['session_name']}[/] ❯ "
+                    ).strip()
+                raise
         return console.input(
             f"[#888888]{state['session_name']}[/] ❯ "
         ).strip()
@@ -2214,8 +2646,14 @@ def _collect_paste_buffer(pt_session: Any, state: Dict[str, Any]) -> str:
     def _read_paste_line(n: int) -> str:
         prefix = f"[#888888]{n:>3}│[/] "
         if pt_session:
-            from prompt_toolkit.formatted_text import HTML
-            return pt_session.prompt(HTML(f"<session>{n:>3}│</session> ")).strip("\n")
+            try:
+                from prompt_toolkit.formatted_text import HTML
+                return pt_session.prompt(HTML(f"<session>{n:>3}│</session> ")).strip("\n")
+            except Exception as exc:  # noqa: BLE001
+                message = str(exc).lower()
+                if "disposed" in message or "fetchedvalue" in message:
+                    return console.input(prefix)
+                raise
         return console.input(prefix)
 
     i = 1
@@ -2373,8 +2811,7 @@ def _run_chat(
         return
 
     # ── Server error auto-retry with forced compaction ────────────────────────
-    _SERVER_ERR_PATTERNS = ["服务暂时不可用", "第三方响应错误", "context length exceeded", "token limit"]
-    if any(p in (response_content or "") for p in _SERVER_ERR_PATTERNS):
+    if _has_server_overflow_error(response_content):
         print_warning("Server returned an error (likely context overflow). Force-compacting and retrying…")
         _force_target = int(cm.budget * 0.30)
         _pruned_history = cm.to_messages(limit=_force_target)
