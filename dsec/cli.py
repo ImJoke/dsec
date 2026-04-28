@@ -425,6 +425,9 @@ _TOOL_CALL_RE = _re.compile(r"<tool_call(?:[^>]*)>\s*(.*?)\s*</tool_call>", _re.
 _TOOL_CALL_FALLBACK_RE = _re.compile(r"<tool_call(?:[^>]*)>\s*(\{.*?\})\s*(?:</tool_call|$)", _re.DOTALL | _re.IGNORECASE)
 # Fallback for when AI puts JSON inside the HTML attributes
 _TOOL_CALL_ATTRS_RE = _re.compile(r'<tool_call\s+name=["\']?([^"\'\s]+)["\']?\s+arguments=["\']?(.*?)(?:["\']?\s*>\s*</tool_call>|["\']?\s*/>|["\']?\s*>)', _re.DOTALL | _re.IGNORECASE)
+# Claude/Anthropic XML format: <tool_calls><invoke name="bash"><parameter name="command">...</parameter></invoke></tool_calls>
+_XML_INVOKE_RE = _re.compile(r'<invoke\s+name=["\']?([^"\'\s>]+)["\']?>(.*?)</invoke>', _re.DOTALL | _re.IGNORECASE)
+_XML_PARAMETER_RE = _re.compile(r'<parameter\s+name=["\']?([^"\'\s>]+)["\']?[^>]*>(.*?)</parameter>', _re.DOTALL | _re.IGNORECASE)
 _BROKEN_TOOL_CALL_LINE_RE = _re.compile(r"^\s*<?tool_call>\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s+(.+?)\s*(?:</tool_call>)?\s*$", _re.IGNORECASE)
 _LEGACY_BASH_LINE_RE = _re.compile(r"(?im)^\s*(?:bash|sh|shell)\s*>\s*(.+?)\s*$")
 _NAME_FIELD_RE = _re.compile(r'"(?:name|tool)"\s*:\s*"([^"]+)"', _re.IGNORECASE)
@@ -454,8 +457,16 @@ def _looks_like_shell_command(line: str) -> bool:
     if stripped.startswith(("#", "-", "*", ">", "[", "```", "|", "🔍", "▶", "💻", "ℹ")):
         return False
 
+    # Reject XML/HTML tags — closing tags like </invoke> contain "/" but are not shell commands
+    if stripped.startswith("<") and (stripped.endswith(">") or stripped.startswith("</")):
+        return False
+
     first = stripped.split(maxsplit=1)[0]
     first_lower = first.lower()
+
+    # Reject XML closing/opening tags used as first token
+    if first.startswith("</") or (first.startswith("<") and first.endswith(">")):
+        return False
 
     # Env assignment prefix, e.g. KRB5CCNAME=/tmp/x.ccache cmd ...
     if _re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", first):
@@ -470,6 +481,9 @@ def _looks_like_shell_command(line: str) -> bool:
         return True
 
     if first_lower.endswith(".py") or "/" in first or first.startswith("./"):
+        # Extra guard: reject paths that look like XML tags
+        if first.startswith("</") or first.startswith("<"):
+            return False
         return True
 
     return False
@@ -559,6 +573,24 @@ def _extract_tool_calls(text: str) -> list[dict]:
     import json as _json
     calls = []
     
+    # 0c. Claude/Anthropic XML format: <tool_calls><invoke name="bash"><parameter name="command">...</parameter></invoke></tool_calls>
+    if "<invoke" in text.lower():
+        for invoke_match in _XML_INVOKE_RE.finditer(text):
+            tool_name = invoke_match.group(1).strip()
+            inner = invoke_match.group(2)
+            args: dict = {}
+            for param_match in _XML_PARAMETER_RE.finditer(inner):
+                param_name = param_match.group(1).strip()
+                param_val = param_match.group(2).strip()
+                # Try to parse as JSON, else keep as string
+                try:
+                    args[param_name] = _json.loads(param_val)
+                except Exception:
+                    args[param_name] = param_val
+            calls.append({"name": tool_name, "arguments": args})
+        if calls:
+            return calls
+
     # 0. Extract from XML attributes if the AI hallucinated HTML syntax
     for match in _TOOL_CALL_ATTRS_RE.finditer(text):
         name = match.group(1).strip()
@@ -1998,7 +2030,7 @@ def _launch_shell(
         "no_research": no_research,
         "no_memory": no_memory,
         "quick": quick,
-        "auto_exec": False,   # /autoexec toggle (default OFF)
+        "auto_exec": True,    # /autoexec toggle (default ON — use /autoexec off to enable manual approval)
         "mode": "auto",
         "personality": "professional",
         "sudo_password": _initial_sudo,
