@@ -38,6 +38,11 @@ _TOOL_CALL_STRIP_RE = _re.compile(
 )
 # Orphaned closing tags left after block stripping
 _TOOL_CALL_CLOSE_RE = _re.compile(r'</tool_call>', _re.IGNORECASE)
+# Strip Claude/Anthropic XML format: <tool_calls>...</tool_calls> and <invoke ...>...</invoke>
+_XML_INVOKE_STRIP_RE = _re.compile(
+    r'<tool_calls\b[^>]*>.*?</tool_calls>|<invoke\b[^>]*>.*?</invoke>',
+    _re.DOTALL | _re.IGNORECASE,
+)
 _BARE_TOOL_LINE_RE = _re.compile(
     r'^\s*(?:bash\s+)?([a-z][a-z0-9_]*)\s*(\{[^}]*\})?\s*$'
 )
@@ -54,6 +59,8 @@ def _clean_display_content(text: str, *, streaming: bool = False) -> str:
     text = _TOOL_CALL_STRIP_RE.sub("", text)
     # Strip any orphaned </tool_call> closing tags
     text = _TOOL_CALL_CLOSE_RE.sub("", text)
+    # Strip Claude/Anthropic XML invoke format blocks
+    text = _XML_INVOKE_STRIP_RE.sub("", text)
     if streaming:
         # During streaming skip the heavier line-by-line analysis; just collapse blank lines
         result = _re.sub(r'\n{3,}', '\n\n', text)
@@ -343,6 +350,7 @@ def stream_response(
 
     try:
         with Live(console=console, refresh_per_second=12, transient=True) as live:
+            live.update(_render(True))  # show ⏳ immediately, before first API byte
             for chunk in generator:
                 ctype = chunk.get("type")
 

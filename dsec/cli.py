@@ -437,10 +437,22 @@ _NATIVE_TOOL_CALL_LINE_RE = _re.compile(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+(\{.*\}
 
 _SHELL_CMD_STARTERS = {
     "ls", "cat", "grep", "rg", "find", "awk", "sed", "head", "tail", "wc",
-    "nmap", "rustscan", "nxc", "ffuf", "feroxbuster", "nikto", "sqlmap", "curl", "wget",
-    "python", "python3", "pip", "pip3", "smbclient.py", "impacket-smbclient", "evil-winrm",
-    "ssh", "nc", "netcat", "id", "whoami", "env", "export", "echo", "cp", "mv", "rm",
-    "mkdir", "chmod", "chown", "bhcli", "gh", "bash", "sh", "zsh",
+    "nmap", "rustscan", "masscan", "nxc", "netexec", "ffuf", "feroxbuster", "nikto", "sqlmap",
+    "curl", "wget", "curl", "httpx",
+    "python", "python3", "pip", "pip3",
+    "smbclient", "smbclient.py", "impacket-smbclient", "smbmap", "evil-winrm",
+    "ssh", "nc", "netcat", "socat", "id", "whoami", "env", "export", "echo",
+    "cp", "mv", "rm", "mkdir", "chmod", "chown",
+    "bhcli", "rusthound-ce", "bloodhound-python",
+    "certipy", "certipy-ad",
+    "GetNPUsers.py", "GetUserSPNs.py", "GetADUsers.py", "secretsdump.py",
+    "psexec.py", "wmiexec.py", "smbexec.py", "lookupsid.py", "addcomputer.py",
+    "atexec.py", "dcomexec.py",
+    "kerbrute",
+    "sntp",
+    "linpeas", "linpeas.sh", "winpeas", "winpeas.exe", "pspy", "pspy64",
+    "chisel", "ligolo-ng",
+    "gh", "bash", "sh", "zsh", "jq", "base64",
 }
 
 _PROSE_STOPWORDS = {
@@ -850,6 +862,79 @@ def _extract_tool_calls(text: str) -> list[dict]:
         
     return calls
 
+_FORMAT_WARN_INVOKE = _re.compile(r'<invoke\b', _re.IGNORECASE)
+_FORMAT_WARN_STRING_ATTR = _re.compile(r'<parameter\b[^>]*\bstring\s*=', _re.IGNORECASE)
+_FORMAT_WARN_UNCLOSED_INVOKE = _re.compile(r'<invoke\b', _re.IGNORECASE)
+_FORMAT_WARN_UNCLOSED_TOOL_CALLS = _re.compile(r'<tool_calls\b', _re.IGNORECASE)
+
+_CORRECT_FORMAT_REMINDER = """\
+CORRECT FORMAT (use this every time):
+  <tool_call>{"name": "bash", "arguments": {"command": "ls /tmp"}}</tool_call>
+  <tool_call>{"name": "pty_run_command", "arguments": {"pane_id": "shell", "command": "whoami", "timeout": 10}}</tool_call>
+
+DO NOT use:
+  ❌ <invoke name="bash"><parameter name="command">...</parameter></invoke>
+  ❌ <tool_call name="bash" arguments="...">
+  ❌ string="true" or any extra XML attributes on <parameter>
+  ❌ Bare tool names without <tool_call> wrapper"""
+
+
+def _detect_format_issues(text: str) -> Optional[str]:
+    """
+    Detect malformed AI tool-call format and return a detailed correction message,
+    or None if the format looks fine.
+
+    Called after every agentic-loop response; the result (if any) is prepended
+    to tool_responses so the AI self-corrects immediately.
+    """
+    issues = []
+
+    # 1. AI used <invoke>/<parameter> (Claude XML) instead of <tool_call> JSON
+    if _FORMAT_WARN_INVOKE.search(text):
+        has_unclosed = not _re.search(r'</invoke>', text, _re.IGNORECASE)
+        issues.append(
+            f"WRONG FORMAT: You used `<invoke name=\"...\">` / `<parameter>` XML format.\n"
+            f"  {'NOTE: The <invoke> tag was also not properly closed.' if has_unclosed else ''}\n"
+            "  This format is NOT supported — it was parsed but only as a fallback.\n"
+            "  Always use <tool_call> JSON format instead."
+        )
+
+    # 2. <parameter> with string="true" attribute (seen in the wild)
+    if _FORMAT_WARN_STRING_ATTR.search(text):
+        issues.append(
+            "WRONG FORMAT: `<parameter name=\"...\" string=\"true\">` — the `string=\"true\"` attribute is invalid.\n"
+            "  Use `<parameter name=\"command\">your command</parameter>` with no extra attributes,\n"
+            "  OR switch to <tool_call> JSON format entirely."
+        )
+
+    # 3. <tool_calls> wrapper without matching </tool_calls>
+    open_tc = len(_FORMAT_WARN_UNCLOSED_TOOL_CALLS.findall(text))
+    close_tc = len(_re.findall(r'</tool_calls>', text, _re.IGNORECASE))
+    if open_tc > close_tc:
+        issues.append(
+            "WRONG FORMAT: `<tool_calls>` opened but `</tool_calls>` is missing.\n"
+            "  Close your wrapper tags, or drop the wrapper and use <tool_call> directly."
+        )
+
+    # 4. Unclosed heredoc in bash command
+    heredoc_opens = _re.findall(r"<<\s*['\"]?(\w+)['\"]?", text)
+    for delim in heredoc_opens:
+        if not _re.search(rf'^{_re.escape(delim)}$', text, _re.MULTILINE):
+            issues.append(
+                f"WRONG FORMAT: Heredoc `<< '{delim}'` was opened but the closing `{delim}` "
+                "delimiter was never found on its own line.\n"
+                "  Ensure the closing delimiter is on a line by itself with no leading spaces."
+            )
+            break  # one heredoc warning is enough
+
+    if not issues:
+        return None
+
+    header = "⚠️  FORMAT WARNING — Your last response had formatting issues:\n\n"
+    body = "\n\n".join(f"{i+1}. {msg}" for i, msg in enumerate(issues))
+    return header + body + "\n\n" + _CORRECT_FORMAT_REMINDER
+
+
 def _run_agentic_loop(
     response_content: str,
     *,
@@ -884,6 +969,7 @@ def _run_agentic_loop(
     current_conv_id = conversation_id
     current_response = response_content
     runner = get_runner()
+    _loop_pruned_history: Optional[List] = None  # set when mid-loop compaction resets conv_id
 
     # Stuck detection state
     _fail_history: Dict[str, int] = {}  # "tool_name:args_hash" -> fail_count
@@ -898,6 +984,13 @@ def _run_agentic_loop(
 
         tool_responses: List[Dict[str, Any]] = []
         approve_all = auto_exec
+
+        # ── Format issue detection — warn AI about wrong format before dispatch ─
+        _fmt_warning = _detect_format_issues(current_response)
+        if _fmt_warning:
+            from dsec.formatter import print_warning as _pw
+            _pw("Format issue detected in AI output — injecting correction feedback.")
+            tool_responses.append({"name": "__format_warning__", "result": _fmt_warning})
 
         # ── Tool Call Grouping & Dispatch ──────────────────────────────────────
         # Parallelize safe tools, sequential for bash and unsafe tools
@@ -1250,7 +1343,9 @@ def _run_agentic_loop(
                 conversation_id=current_conv_id,
                 base_url=config.get("base_url", "http://localhost:8000"),
                 token=get_next_token(),
+                history=_loop_pruned_history,  # non-None only after mid-loop compaction
             )
+            _loop_pruned_history = None  # consumed — clear so next iteration uses conv_id
             thinking, new_content, new_conv_id = stream_response(
                 generator=gen,
                 session_name=session_name or "none",
@@ -1305,6 +1400,7 @@ def _run_agentic_loop(
                         from dsec.session import save_session
                         save_session(session_name, _sd)
                     current_conv_id = None  # reset server-side context
+                    _loop_pruned_history = _pruned  # pass to next chat_stream() so AI keeps context
                     print_info(f"Context compacted at iteration {iteration} ({_cm.usage_percent}% → pruned to {_kept} turns).")
 
         current_response = new_content
@@ -2221,19 +2317,33 @@ def _run_chat(
             cm.add_turn(t["role"], t.get("content", ""), t.get("thinking", ""))
     
     history = None
+    # Prepend cumulative summary from previous prunes so the AI remembers early context
+    _cumulative_summary = (session_data or {}).get("cumulative_summary", "")
+    if _cumulative_summary and not history:
+        history = [{"role": "system", "content": f"[CUMULATIVE SESSION HISTORY]\n{_cumulative_summary}\n[END HISTORY]"}]
+
     if cm.usage_percent >= 50:
         print_info(f"Context budget reached ({cm.usage_percent}%). Pruning oldest turns...")
         # Prune to fit within 40% of budget (conservative — char/token ratio is imprecise for code)
         target_tokens = int(cm.budget * 0.40)
         history = cm.to_messages(limit=target_tokens)
-        
+
+        # Merge new summary with previous cumulative summary for continuity on future resumes
+        new_summary = cm.get_summary_text()
+        if new_summary:
+            prev = (session_data or {}).get("cumulative_summary", "")
+            combined = f"{prev}\n\n[CONTINUED — TURN {turn}:]\n{new_summary}".strip()
+        else:
+            combined = _cumulative_summary
+
         # Permanently prune the session file so it doesn't just reload the full history on the next turn
         kept_count = sum(1 for m in history if m["role"] != "system")
         if session_data and "history" in session_data:
             session_data["history"] = session_data["history"][-kept_count:] if kept_count > 0 else []
+            session_data["cumulative_summary"] = combined
             from dsec.session import save_session
             save_session(session_name, session_data)
-            
+
         # Abandon server-side history to reset its counter
         conversation_id = None
 

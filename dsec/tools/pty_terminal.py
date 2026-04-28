@@ -8,6 +8,7 @@ background while continuing to interact with other panes.
 
 Inspired by: OpenInterpreter, tmux
 """
+import atexit
 import os
 import pty
 import select
@@ -56,7 +57,15 @@ class Pane:
             env=os.environ.copy(),
             preexec_fn=preexec,
         )
-        
+        # Close parent's copy of slave_fd — the child keeps it open.
+        # Keeping it open in the parent prevents EIO/EOF from being raised on
+        # master_fd when the child exits, which is the root cause of stuck reads.
+        try:
+            os.close(self.slave_fd)
+        except OSError:
+            pass
+        self.slave_fd = -1
+
         # Set master_fd to non-blocking
         fl = fcntl.fcntl(self.master_fd, fcntl.F_GETFL)
         fcntl.fcntl(self.master_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
@@ -111,18 +120,38 @@ class Pane:
                 self.process.wait(timeout=2)
             except (OSError, subprocess.TimeoutExpired):
                 self.process.kill()
-        try:
-            os.close(self.slave_fd)
-        except OSError:
-            pass
+                try:
+                    self.process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+        if self.slave_fd >= 0:
+            try:
+                os.close(self.slave_fd)
+            except OSError:
+                pass
+            self.slave_fd = -1
         try:
             os.close(self.master_fd)
         except OSError:
             pass
+        self.master_fd = -1
 
 
 _PANES: Dict[str, Pane] = {}
 _MAX_PANES = 8
+
+
+def _cleanup_all_panes():
+    """Kill all panes at process exit to prevent orphaned PTY processes."""
+    for pane in list(_PANES.values()):
+        try:
+            pane.close()
+        except Exception:
+            pass
+    _PANES.clear()
+
+
+atexit.register(_cleanup_all_panes)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -155,6 +184,11 @@ def pty_create_pane(pane_id: str) -> str:
 )
 def pty_run_command(pane_id: str, command: str, timeout: float = 1.0) -> str:
     if pane_id not in _PANES:
+        if len(_PANES) >= _MAX_PANES:
+            return (
+                f"Error: max {_MAX_PANES} panes reached; cannot auto-create '{pane_id}'. "
+                "Close an existing pane first with pty_close_pane."
+            )
         _PANES[pane_id] = Pane(pane_id)
 
     pane = _PANES[pane_id]
