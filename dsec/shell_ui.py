@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, cast
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
 # prompt_toolkit imports (soft-optional)
@@ -335,53 +335,35 @@ def build_prompt_session(state: Dict[str, Any]) -> Optional["PromptSession"]:  #
         else:
             raise KeyboardInterrupt
 
-    # ── Smart Enter ───────────────────────────────────────────────────────────
-    # • Buffer has NO newlines → submit immediately (normal single-line usage)
-    # • Buffer has newlines (multi-line paste) → pressing Enter on the very
-    #   last non-empty line adds a blank line; pressing Enter on a blank last
-    #   line submits (two-Enter pattern).
+    # ── Enter: always submit ──────────────────────────────────────────────────
+    # multiline=True was removed because it causes ghost prompt lines on terminal
+    # resize (SIGWINCH).  With multiline=False the prompt is always a single line,
+    # so prompt_toolkit's resize handler only needs to erase/redraw one line —
+    # cursor tracking stays correct even when the window is dragged continuously.
+    # Multi-line paste still works: bracketed paste mode inserts the pasted text
+    # as-is and this Enter binding just submits it.
     @kb.add("enter")
     def _smart_enter(event: Any) -> None:  # noqa: ANN001
-        buf = event.current_buffer
-        if "\n" not in buf.text:
-            # Single-line: submit
-            buf.validate_and_handle()
-        else:
-            lines = buf.text.split("\n")
-            if lines[-1].strip() == "":
-                # Already an empty trailing line → submit
-                buf.validate_and_handle()
-            else:
-                # Add a blank line; next Enter will submit
-                buf.insert_text("\n")
+        event.current_buffer.validate_and_handle()
 
-    # ── Ctrl+Enter / Alt+Enter: force-submit from anywhere ───────────────────
-    @kb.add("c-j")          # Ctrl+Enter in many terminals
-    @kb.add("escape", "enter")  # Alt+Enter / Meta+Enter
+    # ── Ctrl+Enter / Ctrl+J / Alt+Enter: explicit submit ─────────────────────
+    @kb.add("c-j")
+    @kb.add("escape", "enter")
     def _force_submit(event: Any) -> None:  # noqa: ANN001
         event.current_buffer.validate_and_handle()
 
-    # ── Continuation prompt for multi-line ───────────────────────────────────
-    def _continuation(width: int, line_number: int, is_soft_wrap: bool) -> Any:
-        return HTML(f"<continuation>{'·' * (width - 1)} </continuation>")
-
-    # NOTE: bottom_toolbar is intentionally omitted.
-    # prompt_toolkit manages the toolbar at the absolute bottom of the screen as
-    # a separate region.  On every SIGWINCH it must erase and redraw both the
-    # input area and the toolbar.  When the terminal is resized quickly (or
-    # continuously dragged) multiple resize events arrive before a redraw
-    # finishes, so old prompt lines are not erased and ghost prompt lines
-    # accumulate.  Removing the toolbar reduces the layout to a single line,
-    # which prompt_toolkit handles cleanly across all resize events.
-    # Session info is available via the startup banner and /status.
+    # NOTE: bottom_toolbar and multiline are both omitted intentionally.
+    # Both cause extra layout regions that prompt_toolkit must erase and redraw
+    # on every SIGWINCH.  When resize events arrive faster than redraws complete,
+    # stale prompt lines accumulate ("ghost enter" effect).  A single-line prompt
+    # with no toolbar resizes cleanly in all cases.
     return PromptSession(
         completer=DsecCompleter(),
         auto_suggest=DsecAutoSuggest(),
         history=FileHistory(str(HISTORY_FILE)),
         key_bindings=kb,
         style=_DSEC_STYLE,
-        multiline=True,
-        prompt_continuation=cast(Any, _continuation),
+        multiline=False,
         complete_while_typing=False,
         enable_history_search=False,
         mouse_support=False,
