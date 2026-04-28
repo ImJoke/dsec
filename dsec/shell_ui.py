@@ -361,56 +361,29 @@ def build_prompt_session(state: Dict[str, Any]) -> Optional["PromptSession"]:  #
     def _force_submit(event: Any) -> None:  # noqa: ANN001
         event.current_buffer.validate_and_handle()
 
-    # ── Toolbar ───────────────────────────────────────────────────────────────
-    def _toolbar() -> "HTML":
-        session = state.get("session_name", "none")
-        domain  = state.get("resolved_domain") or state.get("domain_override") or "htb"
-
-        # Context usage
-        try:
-            from dsec.context_manager import ContextManager
-            from dsec.session import load_session
-            model_override = state.get("resolved_model") or state.get("model_override") or ""
-            cm = ContextManager(domain=domain, model=model_override)
-            session_data = load_session(session)
-            if session_data and "history" in session_data:
-                for t in session_data["history"]:
-                    cm.add_turn(t["role"], t.get("content", ""), t.get("thinking", ""))
-            usage = cm.usage_summary().split("·")[0].strip()
-        except Exception:
-            usage = "🟢 Context: --"
-            
-        ae      = "⚡auto" if state.get("auto_exec") else ""
-        ae_part = f"  <tb.sep>│</tb.sep>  <tb.domain>{ae}</tb.domain>" if ae else ""
-        sudo_part = "  <tb.sep>│</tb.sep>  <tb.domain>🔑</tb.domain>" if state.get("sudo_password") else ""
-        return HTML(
-            f"<bottom-toolbar>"
-            f"  <tb.sep>ℹ</tb.sep>  {usage}  "
-            f"  <tb.sep>│</tb.sep>  <tb.session> {session} </tb.session>"
-            f"  <tb.sep>│</tb.sep>  <tb.domain> {domain} </tb.domain>"
-            f"{ae_part}"
-            f"{sudo_part}"
-            f"  <tb.sep>│</tb.sep>  ↑↓ history  Tab complete  Ctrl-R search  Ctrl-C cancel  Ctrl-D exit"
-            f"</bottom-toolbar>"
-        )
-
     # ── Continuation prompt for multi-line ───────────────────────────────────
     def _continuation(width: int, line_number: int, is_soft_wrap: bool) -> Any:
         return HTML(f"<continuation>{'·' * (width - 1)} </continuation>")
 
+    # NOTE: bottom_toolbar is intentionally omitted.
+    # prompt_toolkit manages the toolbar at the absolute bottom of the screen as
+    # a separate region.  On every SIGWINCH it must erase and redraw both the
+    # input area and the toolbar.  When the terminal is resized quickly (or
+    # continuously dragged) multiple resize events arrive before a redraw
+    # finishes, so old prompt lines are not erased and ghost prompt lines
+    # accumulate.  Removing the toolbar reduces the layout to a single line,
+    # which prompt_toolkit handles cleanly across all resize events.
+    # Session info is available via the startup banner and /status.
     return PromptSession(
-        completer=DsecCompleter(),  # Tab = completer
-        auto_suggest=DsecAutoSuggest(),                              # ghost text
+        completer=DsecCompleter(),
+        auto_suggest=DsecAutoSuggest(),
         history=FileHistory(str(HISTORY_FILE)),
         key_bindings=kb,
         style=_DSEC_STYLE,
-        bottom_toolbar=_toolbar,
-        # multiline=True lets pasted content with \n stay in the buffer
-        # instead of being split across multiple submissions
         multiline=True,
         prompt_continuation=cast(Any, _continuation),
-        complete_while_typing=False,  # only on explicit Tab
-        enable_history_search=False,  # plain ↑↓ cycles history in order
+        complete_while_typing=False,
+        enable_history_search=False,
         mouse_support=False,
         output=None,
     )
