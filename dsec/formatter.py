@@ -387,7 +387,10 @@ def stream_response(
                     return None, None, None
 
     except KeyboardInterrupt:
-        # Ctrl-C mid-stream: stop the generator, keep whatever arrived so far
+        # Ctrl-C mid-stream: stop the generator, keep whatever arrived so far,
+        # then re-raise so the caller's KeyboardInterrupt handler fires correctly.
+        # Previously this swallowed the exception — callers got "✖ Response cancelled."
+        # as content and kept looping, making Ctrl+C unable to stop the agentic loop.
         cancelled = True
         try:
             generator.close()  # type: ignore[union-attr]
@@ -400,7 +403,7 @@ def stream_response(
     if cancelled:
         cancel_suffix = "\n\n✖ Response cancelled."
         partial_content = partial_content + cancel_suffix if partial_content else cancel_suffix
-    
+
     elapsed = time.time() - start_time
     console.print(
         _build_inline_layout(
@@ -412,7 +415,9 @@ def stream_response(
         )
     )
     if cancelled:
-        return partial_thinking or None, partial_content or None, conv_id
+        # Re-raise so the outer except KeyboardInterrupt: block in the caller
+        # can perform proper cleanup (save turn, stop loop, etc.).
+        raise KeyboardInterrupt
 
     return "".join(thinking_parts), "".join(content_parts), conv_id
 

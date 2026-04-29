@@ -263,9 +263,13 @@ class ContextManager:
                 "content": f"[PREVIOUS SESSION SUMMARY]\n{summary_text}\n[END SUMMARY]",
             })
 
-        # Assemble eligible messages
+        # Assemble eligible messages, skipping degenerate turns that would
+        # confuse the model (e.g. turns that are only a Ctrl-C cancellation marker).
+        _SKIP_MARKERS = ("✖ Response cancelled.",)
         for turn in eligible_turns:
             content = turn.content
+            if content and content.strip() in _SKIP_MARKERS:
+                continue  # discard bare cancellation turns from context
             if turn.thinking and turn.role == "assistant":
                 if "<think>" not in content:
                     content = f"<think>\n{turn.thinking}\n</think>\n{content}"

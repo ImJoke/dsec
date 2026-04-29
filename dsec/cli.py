@@ -2957,8 +2957,41 @@ def _run_chat(
     )
 
     if response_content is None or response_content.strip() == "":
-        print_warning("Model returned an empty response. The session may have been compacted — try sending your message again.")
-        return
+        # Stale server-side conversation_id often causes empty responses after
+        # a session gap or machine reset. Clear it and retry once with explicit
+        # history so the model has context to respond to.
+        print_warning(
+            "Empty response from model — conversation_id may be stale. "
+            "Retrying with cleared context…"
+        )
+        if session_data:
+            session_data["conversation_id"] = None
+            from dsec.session import save_session
+            save_session(session_name, session_data)
+
+        _retry_history = cm.to_messages(limit=int(cm.budget * 0.40)) if cm.turns else None
+        generator = chat_stream(
+            message=final_prompt,
+            model=model,
+            conversation_id=None,  # fresh server-side context
+            base_url=config.get("base_url", "http://localhost:8000"),
+            token=get_next_token(),
+            history=_retry_history,
+        )
+        thinking, response_content, new_conv_id = stream_response(
+            generator=generator,
+            session_name=session_name or "none",
+            domain=domain,
+            model=model,
+            turn=turn,
+            compression_info=compression_info,
+            research_sources=research_sources_used,
+            memory_count=memory_count,
+            show_thinking=config.get("show_thinking", True) and not no_think,
+        )
+        if response_content is None or response_content.strip() == "":
+            print_warning("Model returned empty response again. Server may be unavailable — please try again in a moment.")
+            return
 
     # ── Server error auto-retry with forced compaction ────────────────────────
     if _has_server_overflow_error(response_content):
