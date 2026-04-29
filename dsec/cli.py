@@ -456,6 +456,37 @@ _COMMAND_FIELD_RE = _re.compile(r'"command"\s*:\s*"((?:\\\\.|[^"\\\\])*)"', _re.
 _PLAIN_COMMAND_LINE_RE = _re.compile(r"^\s*(?:\$\s*)?([a-zA-Z0-9_./-][^`]*)$")
 _NATIVE_TOOL_CALL_LINE_RE = _re.compile(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+(\{.*\})\s*$")
 
+def _deduplicate_lines(text: str, max_repeats: int = 3) -> str:
+    """Collapse runs of identical lines to at most max_repeats occurrences.
+
+    Prevents interactive-program-spam (e.g. mssqlclient echoing 'Could not find
+    stored procedure EOF' 50+ times when a heredoc delimiter is fed as SQL input)
+    from flooding terminal output and burning context window tokens.
+    """
+    lines = text.splitlines(keepends=True)
+    result: list[str] = []
+    prev_line: Optional[str] = None
+    repeat_count = 0
+    omitted = 0
+    for line in lines:
+        if line == prev_line:
+            repeat_count += 1
+            if repeat_count <= max_repeats:
+                result.append(line)
+            else:
+                omitted += 1
+        else:
+            if omitted > 0:
+                result.append(f"[... {omitted} identical line(s) omitted]\n")
+                omitted = 0
+            prev_line = line
+            repeat_count = 1
+            result.append(line)
+    if omitted > 0:
+        result.append(f"[... {omitted} identical line(s) omitted]\n")
+    return "".join(result)
+
+
 _SERVER_ERR_PATTERNS = (
     "服务暂时不可用",
     "第三方响应错误",
@@ -1590,6 +1621,27 @@ def _run_agentic_loop(
                     tool_responses.append({"name": tool_name, "result": f"[error: execution blocked by scope enforcement: {scope_warning.strip()}]"})
                     continue
 
+                # ── Heredoc-to-interactive-program detection ──────────────────
+                # Piping heredoc into interactive SQL/shell clients doesn't work:
+                # the client reads the EOF delimiter as a command and spams errors.
+                # Block it and tell the AI to write a temp script file instead.
+                _INTERACTIVE_CLIENTS = ("mssqlclient", "mysql", "psql", "sqlplus", "isql")
+                _has_heredoc = "<<" in cmd and ("'EOF'" in cmd or '"EOF"' in cmd or "<< EOF" in cmd)
+                _has_interactive = any(c in cmd for c in _INTERACTIVE_CLIENTS)
+                if _has_heredoc and _has_interactive:
+                    heredoc_warn = (
+                        "[error: heredoc input to interactive SQL client is not supported — "
+                        "the EOF delimiter gets sent as SQL and causes spam errors. "
+                        "Write commands to a temp file instead:\n"
+                        "  echo 'EXEC xp_cmdshell ...' > /tmp/q.sql\n"
+                        "  impacket-mssqlclient ... -file /tmp/q.sql\n"
+                        "or use -Q flag for a single inline query:\n"
+                        "  impacket-mssqlclient ... -Q 'EXEC xp_cmdshell ...'"
+                    )
+                    tool_responses.append({"name": tool_name, "result": heredoc_warn})
+                    print_warning("Blocked heredoc→SQL client (would spam 'EOF' errors). Told AI to use -Q or temp file.")
+                    continue
+
                 # ── Install command protection ────────────────────────────────
                 _INSTALL_PATTERNS = [
                     "apt install", "apt-get install", "apt -y install",
@@ -1713,7 +1765,8 @@ def _run_agentic_loop(
                     # Machine offline detection: target is unreachable, likely IP changed.
                     # Print a user-visible alert and inject guidance so AI asks the user
                     # instead of spending many turns trying to reconnect or spawn the machine.
-                    if _has_machine_offline(result_text) and domain == "htb":
+                    _offline_detected = _has_machine_offline(result_text) and domain == "htb"
+                    if _offline_detected:
                         offline_warn = (
                             "[SYSTEM] TARGET UNREACHABLE — the machine IP may have changed (HTB machines reset periodically). "
                             "STOP network commands. Ask the user: 'The target appears offline. "
@@ -1737,12 +1790,32 @@ def _run_agentic_loop(
                             )
                             print_warning(warn_msg)
                             result_text += f"\n\n[SYSTEM] {warn_msg}"
-                    
+
+                    # Collapse repeated identical lines (e.g. SQL client spamming the same error
+                    # when a heredoc EOF delimiter is fed as input to an interactive program).
+                    result_text = _deduplicate_lines(result_text, max_repeats=3)
+
                     # Truncate extremely long output to save context window
                     if len(result_text) > 15000:
                         result_text = result_text[:15000] + "\n\n[OUTPUT TRUNCATED: Output too long. Consider using grep, head, or piping to a file.]"
 
                 tool_responses.append({"name": tool_name, "result": result_text})
+
+                # Stop dispatching remaining tools in this batch when the target is offline.
+                # Without this, queued tool calls (e.g. KRB5 export after a failed SMB connect)
+                # keep running even though they will also fail, spamming the user and the AI.
+                if _offline_detected:
+                    _skipped = len(sequential_calls) - sequential_calls.index((idx, call)) - 1
+                    if _skipped > 0:
+                        console.print(
+                            f"[bold yellow]⚠ Skipping {_skipped} remaining tool call(s) — target offline.[/bold yellow]"
+                        )
+                        for _sidx, _scall in sequential_calls[sequential_calls.index((idx, call)) + 1:]:
+                            tool_responses.append({
+                                "name": _scall["name"],
+                                "result": "[skipped: target offline — waiting for new IP from user]",
+                            })
+                    break
 
             # ── MCP tool (mcp__server__toolname) ──────────────────────────────
             elif tool_name.startswith("mcp__"):
