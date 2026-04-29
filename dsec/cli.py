@@ -917,9 +917,18 @@ def _detect_format_issues(text: str) -> Optional[str]:
         )
 
     # 4. Unclosed heredoc in bash command
+    # NOTE: JSON-encoded tool calls use \n (two chars) not real newlines, so we must
+    # also check the JSON-escaped form: \nDELIM\n or \nDELIM" (at end of JSON string).
     heredoc_opens = _re.findall(r"<<\s*['\"]?(\w+)['\"]?", text)
     for delim in heredoc_opens:
-        if not _re.search(rf'^{_re.escape(delim)}$', text, _re.MULTILINE):
+        esc = _re.escape(delim)
+        closed = (
+            _re.search(rf'^{esc}$', text, _re.MULTILINE)  # real newlines (plain text)
+            or f'\\n{delim}\\n' in text   # JSON-escaped: \nDELIM\n
+            or f'\\n{delim}"' in text     # JSON-escaped at end of string: \nDELIM"
+            or f'\\n{delim}\\\\n' in text # rare double-escaped edge case
+        )
+        if not closed:
             issues.append(
                 f"WRONG FORMAT: Heredoc `<< '{delim}'` was opened but the closing `{delim}` "
                 "delimiter was never found on its own line.\n"
