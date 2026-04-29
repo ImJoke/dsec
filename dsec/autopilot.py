@@ -58,6 +58,9 @@ class AutopilotBugFinder:
     def record_tool_result(self, tool_name: str, result_text: str) -> None:
         """Record tool output and keep heuristics simple and conservative."""
         self._last_activity = datetime.now(timezone.utc)
+        # Ignore internal formatting/meta pseudo-tools to reduce noisy reports.
+        if tool_name.startswith("__") and tool_name != "__agentic_loop__":
+            return
         text = (result_text or "").lower()
         if not text:
             return

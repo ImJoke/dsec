@@ -157,6 +157,19 @@ def rename_session(old: str, new: str) -> bool:
 def create_session(name: str, domain: str, model: str) -> Dict[str, Any]:
     """Create a brand-new session and persist it."""
     now = _now_iso()
+    # Capture the initial system prompt and available tools snapshot so that
+    # newly-created sessions immediately carry the rule set and tool list
+    # (prevents resumed sessions from only having a minimal summary).
+    try:
+        from dsec.domain import get_system_prompt
+        from dsec.core.registry import build_tools_system_prompt
+
+        system_prompt = get_system_prompt(domain, exec_enabled=True, user_input="", mode="auto", personality="professional")
+        tools_snapshot = build_tools_system_prompt()
+    except Exception:
+        system_prompt = ""
+        tools_snapshot = ""
+
     data: Dict[str, Any] = {
         "name": name,
         "domain": domain,
@@ -169,6 +182,8 @@ def create_session(name: str, domain: str, model: str) -> Dict[str, Any]:
         "notes": [],
         "history": [],
         "cumulative_summary": "",  # accumulates all pruned-context summaries across resumes
+        "system_prompt": system_prompt,
+        "tools_snapshot": tools_snapshot,
     }
     save_session(name, data)
     return data

@@ -311,6 +311,7 @@ def _build_prompt(
     domain: str,
     conversation_id: Optional[str],
     quick: bool,
+    session_bootstrap: Optional[Dict[str, Any]] = None,
     memory_context: str,
     research_context: str,
     stdin_content: str,
@@ -327,6 +328,19 @@ def _build_prompt(
         # agar model (terutama R1) tidak "lupa" format <tool_call>
         system_prompt = get_system_prompt(domain, user_input=final_input, mode=mode, personality=personality)
         prompt_parts.append(f"[SYSTEM INSTRUCTIONS]\n{system_prompt}\n[END SYSTEM]")
+
+        # On a fresh session, restate the saved bootstrap snapshot so the model
+        # sees the session rules/tool inventory explicitly instead of only the summary.
+        if session_bootstrap and session_bootstrap.get("message_count", 0) == 0:
+            bootstrap_parts: List[str] = []
+            bootstrap_rules = session_bootstrap.get("system_prompt", "")
+            bootstrap_tools = session_bootstrap.get("tools_snapshot", "")
+            if bootstrap_rules:
+                bootstrap_parts.append(f"[SESSION RULES SNAPSHOT]\n{bootstrap_rules}\n[END SESSION RULES]")
+            if bootstrap_tools:
+                bootstrap_parts.append(f"[AVAILABLE TOOLS SNAPSHOT]\n{bootstrap_tools}\n[END AVAILABLE TOOLS]")
+            if bootstrap_parts:
+                prompt_parts.extend(bootstrap_parts)
         
         # Inject Core Memory (Letta-style)
         from dsec.tools.memory_tools import format_core_memory_context
@@ -604,9 +618,20 @@ def _extract_tool_calls(text: str) -> list[dict]:
     - "tool" instead of "name"
     - Missing <tool_call> tags
     - Legacy `bash> ...` lines
+    - DeepSeek format: <tool_calls>...<tool_call>...</tool_call>...</tool_calls>
     """
     import json as _json
     calls = []
+    
+    # 0b. DeepSeek format: <tool_calls> wrapper with nested <tool_call> or <invoke> tags.
+    # Extract the wrapper and recursively parse the inner content.
+    tool_calls_wrapper_match = _re.search(r'<tool_calls\b[^>]*>(.*?)</tool_calls>', text, _re.DOTALL | _re.IGNORECASE)
+    if tool_calls_wrapper_match:
+        inner_content = tool_calls_wrapper_match.group(1)
+        # Recursively extract from the inner content
+        inner_calls = _extract_tool_calls(inner_content)
+        if inner_calls:
+            return inner_calls
     
     # 0c. Claude/Anthropic XML format: <tool_calls><invoke name="bash"><parameter name="command">...</parameter></invoke></tool_calls>
     if "<invoke" in text.lower():
@@ -980,12 +1005,21 @@ def _extract_tool_calls(text: str) -> list[dict]:
 
     # 6. Agentic Feedback Loop for unrecoverable syntax
     if not calls and ("<tool_call" in text.lower() or "bash>" in text.lower() or (potential_json_blocks and '"name"' in text)):
-        calls.append({
-            "name": "__syntax_error__",
-            "arguments": {
-                "message": "CRITICAL SYNTAX ERROR: Your tool call was malformed and could not be parsed. You MUST use exactly this format: <tool_call> {\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}} </tool_call>. DO NOT use XML attributes like <tool_call name=...>. Re-emit your action using the correct JSON format."
-            }
-        })
+        # Check if tool_calls wrapper is empty
+        if _re.search(r'<tool_calls\s*>\s*</tool_calls>', text, _re.DOTALL | _re.IGNORECASE):
+            calls.append({
+                "name": "__syntax_error__",
+                "arguments": {
+                    "message": "EMPTY TOOL_CALLS: Your <tool_calls> wrapper is empty. You must include tool definitions inside. Format: <tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}</tool_call>"
+                }
+            })
+        else:
+            calls.append({
+                "name": "__syntax_error__",
+                "arguments": {
+                    "message": "CRITICAL SYNTAX ERROR: Your tool call was malformed and could not be parsed. You MUST use exactly this format: <tool_call> {\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}} </tool_call>. DO NOT use XML attributes like <tool_call name=...>. Re-emit your action using the correct JSON format."
+                }
+            })
         
     return calls
 
@@ -1051,9 +1085,18 @@ def _detect_format_issues(text: str) -> Optional[str]:
         )
 
     # 4. Unclosed heredoc in bash command
+    # NOTE: JSON-encoded tool calls use \n (two chars) not real newlines, so we must
+    # also check the JSON-escaped form: \nDELIM\n or \nDELIM" (at end of JSON string).
     heredoc_opens = _re.findall(r"<<\s*['\"]?(\w+)['\"]?", text)
     for delim in heredoc_opens:
-        if not _re.search(rf'^{_re.escape(delim)}$', text, _re.MULTILINE):
+        esc = _re.escape(delim)
+        closed = (
+            _re.search(rf'^{esc}$', text, _re.MULTILINE)  # real newlines (plain text)
+            or f'\\n{delim}\\n' in text   # JSON-escaped: \nDELIM\n
+            or f'\\n{delim}"' in text     # JSON-escaped at end of string: \nDELIM"
+            or f'\\n{delim}\\\\n' in text # rare double-escaped edge case
+        )
+        if not closed:
             issues.append(
                 f"WRONG FORMAT: Heredoc `<< '{delim}'` was opened but the closing `{delim}` "
                 "delimiter was never found on its own line.\n"
@@ -1145,6 +1188,7 @@ def _run_agentic_loop(
     _NO_TOOL_STREAK_LIMIT = 12
     _NO_TOOL_ERROR_STREAK_LIMIT = 3
     _NO_TOOL_REPEAT_LIMIT = 5
+    _hard_recovery_attempted = False
 
     from .autopilot import AutopilotBugFinder
 
@@ -1190,6 +1234,7 @@ def _run_agentic_loop(
         tool_calls = _extract_tool_calls(current_response)
         if not tool_calls:
             if auto_exec:
+                _force_toolcall_now = False
                 raw_no_tool = (current_response or "").strip()
                 normalized_no_tool = _re.sub(r"\s+", " ", raw_no_tool)
 
@@ -1208,29 +1253,38 @@ def _run_agentic_loop(
                             "Autonomous response looks like an upstream/server error without tool calls; force-compacting context before retry."
                         )
                     _compact_loop_context(reason="autonomous no-tool server error", force=True)
-                    # If we've seen multiple pure-error responses in a row, stop to prevent infinite retry
+                    # Allow one hard-recovery attempt before stopping.
                     if _no_tool_error_streak >= _NO_TOOL_ERROR_STREAK_LIMIT:
-                        stop_reason = (
-                            f"autonomous no-tool server error detected {_no_tool_error_streak} times; "
-                            "model cannot recover or produce tool calls despite retries"
-                        )
-                        print_warning(
-                            "Autonomous mode detected repeated server errors with no tool calls; "
-                            "stopping to prevent infinite retry loop."
-                        )
-                        autopilot.record_tool_result("__agentic_loop__", f"[error: {stop_reason}]")
-                        issue_path = autopilot.finalize(
-                            reason=stop_reason,
-                            had_tool_calls=True,
-                            loop_ended_normally=False,
-                            new_content=None,
-                        )
-                        if issue_path:
-                            print_warning(f"Autopilot bug finder wrote issue report to {issue_path}")
-                        break
+                        if not _hard_recovery_attempted:
+                            _hard_recovery_attempted = True
+                            _force_toolcall_now = True
+                            # Keep one more recovery turn available.
+                            _no_tool_error_streak = _NO_TOOL_ERROR_STREAK_LIMIT - 1
+                            print_warning(
+                                "Autonomous mode hit repeated server errors; forcing one strict recovery turn before aborting."
+                            )
+                        else:
+                            stop_reason = (
+                                f"autonomous no-tool server error detected {_no_tool_error_streak} times; "
+                                "model cannot recover or produce tool calls despite retries"
+                            )
+                            print_warning(
+                                "Autonomous mode detected repeated server errors with no tool calls; "
+                                "stopping to prevent infinite retry loop."
+                            )
+                            autopilot.record_tool_result("__agentic_loop__", f"[error: {stop_reason}]")
+                            issue_path = autopilot.finalize(
+                                reason=stop_reason,
+                                had_tool_calls=True,
+                                loop_ended_normally=False,
+                                new_content=None,
+                            )
+                            if issue_path:
+                                print_warning(f"Autopilot bug finder wrote issue report to {issue_path}")
+                            break
                 # Don't reset error_streak here; keep accumulating until abort condition
 
-                if _should_abort_no_tool_loop(
+                if (not _force_toolcall_now) and _should_abort_no_tool_loop(
                     no_tool_streak=_no_tool_streak,
                     no_tool_error_streak=_no_tool_error_streak,
                     no_tool_repeat_streak=_no_tool_repeat_streak,
@@ -1261,7 +1315,13 @@ def _run_agentic_loop(
                     f"(streak={_no_tool_streak}); continuing autonomous mode…"
                 )
 
-                if _no_tool_streak >= 2:
+                if _force_toolcall_now:
+                    continue_msg = (
+                        "RECOVERY MODE: Your last responses failed to produce usable tool calls due to upstream/server errors. "
+                        "You MUST emit exactly one valid <tool_call> now using JSON format inside the tag. "
+                        "Do not include prose, markdown, XML wrappers, or empty <tool_calls>."
+                    )
+                elif _no_tool_streak >= 2:
                     continue_msg = (
                         "Your previous response did not include any <tool_call> blocks. "
                         "If work remains, you MUST emit at least one valid <tool_call> now. "
@@ -1321,9 +1381,10 @@ def _run_agentic_loop(
             break
 
         _no_tool_streak = 0
+        _no_tool_error_streak = 0
         _no_tool_repeat_streak = 0
         _last_no_tool_response = ""
-        # Note: error_streak is NOT reset here; it accumulates as long as we're in no-tool mode
+        _hard_recovery_attempted = False
 
         print_iteration_header(iteration, max_iterations, domain)
 
@@ -2736,6 +2797,7 @@ def _run_chat(
         domain=domain,
         conversation_id=conversation_id,
         quick=quick,
+        session_bootstrap=session_data,
         memory_context=memory_context,
         research_context=research_context,
         stdin_content=stdin_content,
