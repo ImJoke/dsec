@@ -1198,7 +1198,7 @@ def _run_agentic_loop(
         model=model,
     )
 
-    def _compact_loop_context(*, reason: str, force: bool = False) -> None:
+    def _compact_loop_context(*, reason: str, force: bool = False, target_pct: float = 0.40) -> None:
         nonlocal current_conv_id, _loop_pruned_history
 
         if not session_name or no_memory:
@@ -1218,7 +1218,7 @@ def _run_agentic_loop(
         if not force and _cm.usage_percent < 50:
             return
 
-        _target = int(_cm.budget * 0.40)
+        _target = int(_cm.budget * target_pct)
         _pruned = _cm.to_messages(limit=_target)
         _kept = sum(1 for m in _pruned if m["role"] != "system")
         _sd["history"] = _sd["history"][-_kept:] if _kept > 0 else []
@@ -1227,7 +1227,8 @@ def _run_agentic_loop(
         current_conv_id = None  # reset server-side context
         _loop_pruned_history = _pruned  # pass to next chat_stream() so AI keeps context
         print_info(
-            f"Context compacted ({reason}): {_cm.usage_percent}% → pruned to {_kept} turns."
+            f"Context compacted ({reason}, target={int(target_pct*100)}%): "
+            f"{_cm.usage_percent}% → pruned to {_kept} turns."
         )
 
     for iteration in range(1, max_iterations + 1):
@@ -1248,11 +1249,22 @@ def _run_agentic_loop(
                 no_tool_server_error = _has_server_overflow_error(raw_no_tool)
                 if no_tool_server_error:
                     _no_tool_error_streak += 1
+                    # Progressive compaction: 40% → 20% → 10% on successive overflows.
+                    # Fixed 40% was failing repeatedly when context was still too large.
+                    _COMPACT_PCTS = (0.40, 0.20, 0.10)
+                    _compact_pct = _COMPACT_PCTS[min(_no_tool_error_streak - 1, len(_COMPACT_PCTS) - 1)]
                     if _no_tool_error_streak == 1:
                         print_warning(
                             "Autonomous response looks like an upstream/server error without tool calls; force-compacting context before retry."
                         )
-                    _compact_loop_context(reason="autonomous no-tool server error", force=True)
+                    else:
+                        print_warning(
+                            f"Server error streak={_no_tool_error_streak}; compacting to {int(_compact_pct*100)}% of budget."
+                        )
+                    _compact_loop_context(reason="autonomous no-tool server error", force=True, target_pct=_compact_pct)
+                    if _no_tool_error_streak > 1:
+                        import time as _time
+                        _time.sleep(1.5)  # brief pause before retry; transient overloads often clear quickly
                     # Allow one hard-recovery attempt before stopping.
                     if _no_tool_error_streak >= _NO_TOOL_ERROR_STREAK_LIMIT:
                         if not _hard_recovery_attempted:
