@@ -455,6 +455,17 @@ _NAME_FIELD_RE = _re.compile(r'"(?:name|tool)"\s*:\s*"([^"]+)"', _re.IGNORECASE)
 _COMMAND_FIELD_RE = _re.compile(r'"command"\s*:\s*"((?:\\\\.|[^"\\\\])*)"', _re.DOTALL | _re.IGNORECASE)
 _PLAIN_COMMAND_LINE_RE = _re.compile(r"^\s*(?:\$\s*)?([a-zA-Z0-9_./-][^`]*)$")
 _NATIVE_TOOL_CALL_LINE_RE = _re.compile(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+(\{.*\})\s*$")
+# <tool_call name="TOOL"> with name as XML attribute (not JSON body) — step 0d
+_TOOL_CALL_NAME_ATTR_RE = _re.compile(
+    r'<tool_call\s+name=["\']?([^"\'\s>]+)["\']?\s*>(.*?)</tool_call>',
+    _re.DOTALL | _re.IGNORECASE,
+)
+# Extracts value from hybrid malformed: {"parameter name="key"> VALUE </parameter>
+# Handles both "key"> and ": "key"> variants
+_HYBRID_PARAM_VALUE_RE = _re.compile(
+    r'\{[^>]{0,80}?["\']([^"\'>\s]+)["\']?\s*>(.*?)(?:</parameter>|$)',
+    _re.DOTALL | _re.IGNORECASE,
+)
 
 def _deduplicate_lines(text: str, max_repeats: int = 3) -> str:
     """Collapse runs of identical lines to at most max_repeats occurrences.
@@ -813,7 +824,39 @@ def _extract_tool_calls(text: str) -> list[dict]:
 
     if calls:
         return calls
-    
+
+    # 0d. Handle <tool_call name="TOOL"> blocks where name is an XML attribute
+    # and parameters are expressed in XML or hybrid format (not a JSON body).
+    # Seen when AI mixes XML attribute syntax with JSON: <tool_call name="bash">
+    #   {"parameter name="command">CMD</parameter>   ← hybrid (= or : as delimiter)
+    #   <parameter name="command">CMD</parameter>    ← standard XML
+    if not calls:
+        for tag_match in _TOOL_CALL_NAME_ATTR_RE.finditer(text):
+            tool_name = tag_match.group(1).strip()
+            inner = tag_match.group(2)
+            args: dict = {}
+            # Standard XML: <parameter name="key">value</parameter>
+            for pm in _XML_PARAMETER_RE.finditer(inner):
+                k = pm.group(1).strip()
+                v = pm.group(2).strip()
+                try:
+                    args[k] = _json.loads(v)
+                except Exception:
+                    args[k] = v
+            # Hybrid malformed: {"parameter name="key">value</parameter>
+            for hm in _HYBRID_PARAM_VALUE_RE.finditer(inner):
+                k = hm.group(1).strip()
+                v = hm.group(2).strip()
+                if k and k not in args:
+                    try:
+                        args[k] = _json.loads(v)
+                    except Exception:
+                        args[k] = v
+            if args:
+                calls.append({"name": tool_name, "arguments": args})
+        if calls:
+            return calls
+
     # 1. Extract from <tool_call> tags
     matches = list(_TOOL_CALL_RE.finditer(text))
     if not matches:
