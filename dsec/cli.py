@@ -472,6 +472,19 @@ _AUTH_FAIL_PATTERNS = (
     "wrong password",
 )
 
+# Patterns in bash tool output that indicate the HTB machine is down / IP changed
+_MACHINE_OFFLINE_PATTERNS = (
+    "Network is unreachable",
+    "No route to host",
+    "Connection timed out",
+    "Connection refused",
+    "Host is unreachable",
+    "EHOSTUNREACH",
+    "ETIMEDOUT",
+    "nc: connectx",          # netcat failed to connect
+    "connect failed",
+)
+
 _SHELL_CMD_STARTERS = {
     "ls", "cat", "grep", "rg", "find", "awk", "sed", "head", "tail", "wc",
     "nmap", "rustscan", "masscan", "nxc", "netexec", "ffuf", "feroxbuster", "nikto", "sqlmap",
@@ -1125,6 +1138,13 @@ def _has_auth_failure(text: Optional[str]) -> bool:
     return any(pattern.lower() in lowered for pattern in _AUTH_FAIL_PATTERNS)
 
 
+def _has_machine_offline(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(pattern.lower() in lowered for pattern in _MACHINE_OFFLINE_PATTERNS)
+
+
 def _should_abort_no_tool_loop(
     *,
     no_tool_streak: int,
@@ -1222,6 +1242,18 @@ def _run_agentic_loop(
         _pruned = _cm.to_messages(limit=_target)
         _kept = sum(1 for m in _pruned if m["role"] != "system")
         _sd["history"] = _sd["history"][-_kept:] if _kept > 0 else []
+
+        # Accumulate cumulative summary so AI remembers early context on future resumes.
+        # to_messages() generates an LLM summary of discarded turns and stores it in
+        # _compressed_block — persist that into the session file here.
+        _new_summary = _cm.get_summary_text()
+        if _new_summary:
+            _prev_summary = _sd.get("cumulative_summary", "")
+            _sd["cumulative_summary"] = (
+                f"{_prev_summary}\n\n[AGENTIC COMPACTION — {reason}:]\n{_new_summary}".strip()
+                if _prev_summary else _new_summary
+            )
+
         save_session(session_name, _sd)
 
         current_conv_id = None  # reset server-side context
@@ -1243,8 +1275,36 @@ def _run_agentic_loop(
                 if normalized_no_tool and normalized_no_tool == _last_no_tool_response:
                     _no_tool_repeat_streak += 1
                 else:
+                    # Reset repeat streak on any content change — AI may be
+                    # responding to a real state change (e.g. machine offline msg).
                     _no_tool_repeat_streak = 1 if normalized_no_tool else 0
                 _last_no_tool_response = normalized_no_tool
+
+                # If the AI is asking the user for a new IP (offline detection triggered),
+                # pause auto-exec and wait for user input rather than looping.
+                _asking_for_ip = (
+                    "provide the new ip" in (raw_no_tool or "").lower()
+                    or "new ip address" in (raw_no_tool or "").lower()
+                    or "target appears offline" in (raw_no_tool or "").lower()
+                )
+                if _asking_for_ip and auto_exec:
+                    console.print(
+                        "[bold yellow]⚠ AI is waiting for new target IP. "
+                        "Type the new IP and press Enter:[/bold yellow]"
+                    )
+                    try:
+                        new_ip = _safe_input("New IP > ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        new_ip = ""
+                    if new_ip:
+                        # Feed new IP back into the loop so AI can continue
+                        current_response = (
+                            f"<tool_response>\n"
+                            f'{{\"name\": \"user_input\", \"result\": \"New target IP: {new_ip}. '
+                            f'Update your target and continue the attack.\"}}\n'
+                            f"</tool_response>"
+                        )
+                        continue
 
                 no_tool_server_error = _has_server_overflow_error(raw_no_tool)
                 if no_tool_server_error:
@@ -1649,6 +1709,22 @@ def _run_agentic_loop(
                         result_text += f"\n\n[SYSTEM] {auth_warn}"
                         print_warning(auth_warn)
                         _fail_history[f"auth:{cmd[:100]}"] = _STUCK_THRESHOLD
+
+                    # Machine offline detection: target is unreachable, likely IP changed.
+                    # Print a user-visible alert and inject guidance so AI asks the user
+                    # instead of spending many turns trying to reconnect or spawn the machine.
+                    if _has_machine_offline(result_text) and domain == "htb":
+                        offline_warn = (
+                            "[SYSTEM] TARGET UNREACHABLE — the machine IP may have changed (HTB machines reset periodically). "
+                            "STOP network commands. Ask the user: 'The target appears offline. "
+                            "Please provide the new IP address.' Do NOT attempt VPN reconfiguration, "
+                            "API calls, or further network probes. Wait for the user to supply the new IP."
+                        )
+                        result_text += f"\n\n{offline_warn}"
+                        console.print(
+                            "[bold yellow]⚠ TARGET OFFLINE[/bold yellow] — machine may have reset. "
+                            "Prompting AI to ask you for the new IP."
+                        )
 
                     # Stuck detection for failed commands
                     if res.returncode != 0:
