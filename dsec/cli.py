@@ -514,17 +514,16 @@ _AUTH_FAIL_PATTERNS = (
     "wrong password",
 )
 
-# Patterns in bash tool output that indicate the HTB machine is down / IP changed
+# Patterns in bash tool output that indicate the HTB machine is NETWORK-LEVEL unreachable.
+# IMPORTANT: keep this list NARROW — only add patterns that confirm the IP is gone, not
+# just that a specific port/service is down.  "Connection refused" and "timed out" are
+# normal AD attack responses (e.g. WinRM off, LDAPS filtered) and must NOT appear here.
 _MACHINE_OFFLINE_PATTERNS = (
     "Network is unreachable",
     "No route to host",
-    "Connection timed out",
-    "Connection refused",
     "Host is unreachable",
     "EHOSTUNREACH",
-    "ETIMEDOUT",
-    "nc: connectx",          # netcat failed to connect
-    "connect failed",
+    "Destination Host Unreachable",  # ping output
 )
 
 _SHELL_CMD_STARTERS = {
@@ -1537,12 +1536,8 @@ def _run_agentic_loop(
         tool_responses: List[Dict[str, Any]] = []
         approve_all = auto_exec
 
-        # ── Format issue detection — warn AI about wrong format before dispatch ─
+        # ── Format issue detection — detect now, inject only if extraction fails ─
         _fmt_warning = _detect_format_issues(current_response)
-        if _fmt_warning:
-            from dsec.formatter import print_warning as _pw
-            _pw("Format issue detected in AI output — injecting correction feedback.")
-            tool_responses.append({"name": "__format_warning__", "result": _fmt_warning})
 
         # ── Tool Call Grouping & Dispatch ──────────────────────────────────────
         # Parallelize safe tools, sequential for bash and unsafe tools
@@ -1932,6 +1927,20 @@ def _run_agentic_loop(
                 continue # skip the old try-except block below since we included it here
             else:
                 tool_responses.append({"name": tool_name, "result": f"[error: unknown tool '{tool_name}']"})
+
+        # Inject format warning AFTER tool results so AI sees success before the reminder.
+        # Only omit if the sole issue is the benign <tool_calls> unclosed tag, which step 0d
+        # already handles transparently (tools ran fine despite the format quirk).
+        if _fmt_warning:
+            _only_unclosed = (
+                "tool_calls` opened but `</tool_calls>` is missing" in _fmt_warning
+                and "WRONG FORMAT: `<invoke" not in _fmt_warning
+                and "string=\"true\"" not in _fmt_warning
+            )
+            if not _only_unclosed:
+                from dsec.formatter import print_warning as _pw
+                _pw("Format issue detected in AI output — injecting correction feedback.")
+                tool_responses.append({"name": "__format_warning__", "result": _fmt_warning})
 
         tool_response_chars = sum(len(str(tr.get("result", ""))) for tr in tool_responses)
         large_tool_response = tool_response_chars >= 12000 or any(
