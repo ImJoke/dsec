@@ -1680,6 +1680,36 @@ def _run_agentic_loop(
                     print_warning("Blocked heredoc→SQL client (would spam 'EOF' errors). Told AI to use -Q or temp file.")
                     continue
 
+                # ── Self-kill protection ──────────────────────────────────────
+                # Block commands that would kill Python broadly (which kills dsec itself).
+                # The AI often tries `killall -9 Python` to clean up relay tools,
+                # but this also kills the dsec agent process.
+                _cmd_low = cmd.lower()
+                _SELF_KILL_PATTERNS = [
+                    ("killall", "python"),
+                    ("pkill", "python"),
+                ]
+                _is_self_kill = any(
+                    a in _cmd_low and b in _cmd_low
+                    for a, b in _SELF_KILL_PATTERNS
+                )
+                # Allow if a very specific -f flag with a non-dsec process is used
+                _is_specific = "-f " in cmd and not any(
+                    x in _cmd_low for x in ("python\n", "python ", "python3\n", "python3 ", "' python", '" python')
+                )
+                if _is_self_kill and not _is_specific:
+                    self_kill_msg = (
+                        "[error: blocked — `killall/pkill python` would kill the dsec agent itself. "
+                        "Use specific process targeting instead:\n"
+                        "  pkill -f ntlmrelayx    # kill only ntlmrelayx\n"
+                        "  pkill -f responder     # kill only responder\n"
+                        "  pkill -f petitpotam    # kill only petitpotam\n"
+                        "  kill <PID>             # kill by specific PID]"
+                    )
+                    tool_responses.append({"name": tool_name, "result": self_kill_msg})
+                    print_warning("Blocked killall/pkill python — would kill dsec itself. Told AI to use specific targeting.")
+                    continue
+
                 # ── Install command protection ────────────────────────────────
                 _INSTALL_PATTERNS = [
                     "apt install", "apt-get install", "apt -y install",
@@ -1932,10 +1962,15 @@ def _run_agentic_loop(
         # Only omit if the sole issue is the benign <tool_calls> unclosed tag, which step 0d
         # already handles transparently (tools ran fine despite the format quirk).
         if _fmt_warning:
+            # Suppress the benign "unclosed <tool_calls>" warning if it's the ONLY
+            # format issue (step-0d extracts the tools fine despite the tag mismatch).
+            # Count distinct WRONG FORMAT: bullets — if exactly 1 and it's the unclosed
+            # tag case, the tools ran successfully and the reminder is noise.
+            import re as _re_fmt
+            _wrong_format_count = len(_re_fmt.findall(r"WRONG FORMAT:", _fmt_warning))
             _only_unclosed = (
-                "tool_calls` opened but `</tool_calls>` is missing" in _fmt_warning
-                and "WRONG FORMAT: `<invoke" not in _fmt_warning
-                and "string=\"true\"" not in _fmt_warning
+                _wrong_format_count == 1
+                and "`<tool_calls>` opened but `</tool_calls>` is missing" in _fmt_warning
             )
             if not _only_unclosed:
                 from dsec.formatter import print_warning as _pw
