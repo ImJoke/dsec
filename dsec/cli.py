@@ -457,7 +457,7 @@ _PLAIN_COMMAND_LINE_RE = _re.compile(r"^\s*(?:\$\s*)?([a-zA-Z0-9_./-][^`]*)$")
 _NATIVE_TOOL_CALL_LINE_RE = _re.compile(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+(\{.*\})\s*$")
 # <tool_call name="TOOL"> with name as XML attribute (not JSON body) — step 0d
 _TOOL_CALL_NAME_ATTR_RE = _re.compile(
-    r'<tool_call\s+name=["\']?([^"\'\s>]+)["\']?\s*>(.*?)</tool_call>',
+    r'<tool_call\s+name=["\']?([^"\'\s>]+)["\']?\s*>(.*?)</tool_calls?>',
     _re.DOTALL | _re.IGNORECASE,
 )
 # Extracts value from hybrid malformed: {"parameter name="key"> VALUE </parameter>
@@ -851,6 +851,17 @@ def _extract_tool_calls(text: str) -> list[dict]:
                         args[k] = _json.loads(v)
                     except Exception:
                         args[k] = v
+            # Raw JSON body: <tool_call name="pty_create_pane"> {"pane_id":"x"} </tool_call>
+            if not args:
+                inner_stripped = inner.strip()
+                if inner_stripped.startswith("{"):
+                    try:
+                        args = _json.loads(inner_stripped)
+                    except Exception:
+                        try:
+                            args = _json.loads(_repair_json(inner_stripped))
+                        except Exception:
+                            pass
             if args:
                 calls.append({"name": tool_name, "arguments": args})
         if calls:
