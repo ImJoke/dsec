@@ -789,8 +789,8 @@ def _extract_tool_calls(text: str) -> list[dict]:
         broken_name = broken.group(1).strip().lower()
         broken_payload = broken.group(2).strip()
 
-        if broken_name in {"shell", "terminal", "pty"}:
-            timeout = 15.0
+        if broken_name in {"shell", "terminal", "pty", "pty_run_command", "pty_create_pane"}:
+            wait = 3.0
             cmd = broken_payload
             timeout_match = _re.match(r"^(.*\S)\s+(\d{3,6})$", broken_payload)
             if timeout_match:
@@ -798,13 +798,13 @@ def _extract_tool_calls(text: str) -> list[dict]:
                 raw_timeout = timeout_match.group(2)
                 try:
                     timeout_val = int(raw_timeout)
-                    timeout = timeout_val / 1000.0 if timeout_val >= 1000 else float(timeout_val)
+                    wait = timeout_val / 1000.0 if timeout_val >= 1000 else float(timeout_val)
                 except ValueError:
-                    timeout = 15.0
+                    wait = 3.0
 
             calls.append({
-                "name": "pty_run_command",
-                "arguments": {"pane_id": "shell", "command": cmd, "timeout": max(0.2, min(timeout, 60.0))},
+                "name": "background",
+                "arguments": {"action": "run", "job_id": "shell", "command": cmd, "wait": max(0.5, min(wait, 30.0))},
             })
             continue
 
@@ -1017,10 +1017,10 @@ def _extract_tool_calls(text: str) -> list[dict]:
             if tool_name.lower() in {"bash", "sh"}:
                 calls.append({"name": "bash", "arguments": {"command": body}})
                 continue
-            if tool_name == "pty_run_command":
+            if tool_name in {"pty_run_command", "pty_create_pane"}:
                 pane_match = _re.search(r'\bpane_id\s*=\s*["\']?([^"\'\s>]+)', attrs, _re.IGNORECASE)
-                pane_id = pane_match.group(1).strip() if pane_match else "shell"
-                calls.append({"name": "pty_run_command", "arguments": {"pane_id": pane_id, "command": body}})
+                job_id = pane_match.group(1).strip() if pane_match else "shell"
+                calls.append({"name": "background", "arguments": {"action": "run", "job_id": job_id, "command": body, "wait": 3.0}})
                 continue
 
     # 3. Legacy fallback: convert `bash> cmd` lines into tool calls.
@@ -1032,7 +1032,7 @@ def _extract_tool_calls(text: str) -> list[dict]:
                 calls.append({"name": "bash", "arguments": {"command": cmd}})
                 
     # 4. Native-tool one-liner fallback, e.g.:
-    # pty_run_command {"pane_id": "shell", "command": "evil-winrm ..."}
+    # background {"action": "run", "job_id": "relay", "command": "ntlmrelayx ..."}
     if not calls:
         from .core.registry import get_tool as registry_get_tool
         for raw_line in text.splitlines():
@@ -1128,7 +1128,7 @@ _FORMAT_WARN_UNCLOSED_TOOL_CALLS = _re.compile(r'<tool_calls\b', _re.IGNORECASE)
 _CORRECT_FORMAT_REMINDER = """\
 CORRECT FORMAT (use this every time):
   <tool_call>{"name": "bash", "arguments": {"command": "ls /tmp"}}</tool_call>
-  <tool_call>{"name": "pty_run_command", "arguments": {"pane_id": "shell", "command": "whoami", "timeout": 10}}</tool_call>
+  <tool_call>{"name": "background", "arguments": {"action": "run", "job_id": "relay", "command": "ntlmrelayx ...", "wait": 5}}</tool_call>
 
 DO NOT use:
   ❌ <invoke name="bash"><parameter name="command">...</parameter></invoke>
@@ -1608,14 +1608,38 @@ def _run_agentic_loop(
             tool_name: str = call["name"]
             arguments: Dict[str, Any] = call.get("arguments", {})
 
-            # Backward compatibility: some model outputs still use "shell" alias.
-            if tool_name == "shell":
-                tool_name = "pty_run_command"
-                arguments = {
-                    "pane_id": arguments.get("pane_id", "shell"),
-                    "command": arguments.get("command", ""),
-                    "timeout": arguments.get("timeout", 15.0),
-                }
+            # Backward compatibility: old tool names → new `background` tool.
+            if tool_name in {"shell", "terminal", "pty"}:
+                cmd = arguments.get("command", arguments.get("cmd", ""))
+                job = arguments.get("pane_id", arguments.get("job_id", "shell"))
+                tool_name = "background"
+                arguments = {"action": "run", "job_id": job, "command": cmd, "wait": arguments.get("timeout", 3.0)}
+            elif tool_name in {"pty_run_command"}:
+                cmd = arguments.get("command", "")
+                job = arguments.get("pane_id", "shell")
+                tool_name = "background"
+                arguments = {"action": "run", "job_id": job, "command": cmd, "wait": arguments.get("timeout", 3.0)}
+            elif tool_name in {"pty_create_pane"}:
+                # create-pane-only call: convert to a no-op run that just opens the shell
+                job = arguments.get("pane_id", "shell")
+                tool_name = "background"
+                arguments = {"action": "run", "job_id": job, "command": "echo pane-ready", "wait": 1.0}
+            elif tool_name in {"pty_read_output"}:
+                job = arguments.get("pane_id", "shell")
+                tool_name = "background"
+                arguments = {"action": "read", "job_id": job}
+            elif tool_name in {"pty_send_input", "pty_send_keys"}:
+                job = arguments.get("pane_id", "shell")
+                keys = arguments.get("keys", arguments.get("input", ""))
+                tool_name = "background"
+                arguments = {"action": "send", "job_id": job, "input": keys}
+            elif tool_name in {"pty_close_pane"}:
+                job = arguments.get("pane_id", "shell")
+                tool_name = "background"
+                arguments = {"action": "kill", "job_id": job}
+            elif tool_name in {"pty_list_panes", "pty_send_signal"}:
+                tool_name = "background"
+                arguments = {"action": "list"}
             
             # Syntax Error Feedback Loop
             if tool_name == "__syntax_error__":
