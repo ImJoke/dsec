@@ -1282,16 +1282,43 @@ def _run_agentic_loop(
     _loop_pruned_history: Optional[List] = None  # set when mid-loop compaction resets conv_id
 
     # Stuck detection state
-    _fail_history: Dict[str, int] = {}  # "tool_name:args_hash" -> fail_count
+    _fail_history: Dict[str, int] = {}  # "tool_name:cmd_prefix" -> fail_count
+    _technique_fail: Dict[str, int] = {}  # "technique_category" -> fail_count
     _STUCK_THRESHOLD = 3
+    _TECHNIQUE_THRESHOLD = 2  # abandon a technique after this many conceptual failures
     _no_tool_streak = 0
     _no_tool_error_streak = 0
     _no_tool_repeat_streak = 0
     _last_no_tool_response = ""
+    _checkpoint_every = 25   # inject progress-check every N iterations
+    _flags_found = False      # True once user.txt or root.txt obtained
 
     _NO_TOOL_STREAK_LIMIT = 12
     _NO_TOOL_ERROR_STREAK_LIMIT = 3
     _NO_TOOL_REPEAT_LIMIT = 5
+
+    # Patterns in tool output that indicate a technique conceptually failed
+    # even when exit code is 0. Maps output substring → technique category key.
+    _OUTPUT_FAIL_PATTERNS: List[tuple] = [
+        # ADCS / certipy
+        ("Got certificate, but couldn't get TGT", "adcs_cert_auth"),
+        ("[-] Got error", "adcs_req"),
+        ("upn = " , "adcs_upn_check"),  # handled specially below
+        ("insufficientAccessRights", "ldap_acl"),
+        ("LDAP modify failed", "ldap_modify"),
+        ("constraint violation", "ldap_constraint"),
+        # Kerberos
+        ("KRB_AP_ERR_SKEW", "krb_timeskew"),
+        ("KDC_ERR_PREAUTH_FAILED", "krb_preauth"),
+        ("KDC_ERR_S_PRINCIPAL_UNKNOWN", "krb_spn"),
+        # Relay / coercion
+        ("No targets", "relay_no_targets"),
+        ("Target is not vulnerable", "relay_not_vuln"),
+        # nxc / WinRM
+        ("[-] Could not connect", "winrm_connect"),
+        ("STATUS_ACCESS_DENIED", "smb_access_denied"),
+        ("STATUS_ACCOUNT_RESTRICTION", "smb_account"),
+    ]
     _hard_recovery_attempted = False
 
     from .autopilot import AutopilotBugFinder
@@ -1533,6 +1560,39 @@ def _run_agentic_loop(
         _hard_recovery_attempted = False
 
         print_iteration_header(iteration, max_iterations, domain)
+
+        # ── Periodic progress checkpoint ──────────────────────────────────────
+        # Every N iterations, inject a system message asking the AI to justify
+        # its current approach — prevents silent grinding on a dead-end path.
+        if iteration > 1 and iteration % _checkpoint_every == 0 and not _flags_found:
+            _techniques_tried = list(_technique_fail.keys())
+            _failed_cmds = [k.replace("bash:", "") for k, v in _fail_history.items() if v >= _STUCK_THRESHOLD]
+            _checkpoint_msg = (
+                f"[SYSTEM CHECKPOINT — iteration {iteration}]\n"
+                f"You have run {iteration} iterations without capturing a flag.\n"
+                f"Techniques that failed repeatedly: {_techniques_tried or 'none tracked'}\n"
+                f"Commands that failed {_STUCK_THRESHOLD}+ times: {_failed_cmds[:5] or 'none'}\n"
+                "\nBefore continuing, you MUST:\n"
+                "1. State what your CURRENT attack path is (1 sentence)\n"
+                "2. State WHY you believe it will work given results so far\n"
+                "3. If the current path has failed more than twice, PIVOT to a different technique\n"
+                "4. If you are unsure of the next step, run `whoami /priv` or enumerate what "
+                "privileges/access you currently have before doing anything else\n"
+                "DO NOT just repeat what you were doing. Reassess."
+            )
+            # Inject as an extra tool response so it appears as feedback
+            tool_calls_for_checkpoint = _extract_tool_calls(current_response)
+            if not tool_calls_for_checkpoint:
+                # No tools in current response — inject into the continue message path
+                current_response = (
+                    f"<tool_response>\n"
+                    f'{{"name": "checkpoint", "result": {_json.dumps(_checkpoint_msg)}}}\n'
+                    f"</tool_response>"
+                )
+            else:
+                # Append to existing tool responses after dispatch
+                pass  # handled below after dispatch
+            print_info(f"Progress checkpoint injected at iteration {iteration}.")
 
         tool_responses: List[Dict[str, Any]] = []
         approve_all = auto_exec
@@ -1874,17 +1934,65 @@ def _run_agentic_loop(
                             "AI will summarize findings and pause."
                         )
 
-                    # Stuck detection for failed commands
+                    # ── Stuck detection ──────────────────────────────────────
+                    # 1. Exit-code failures
                     if res.returncode != 0:
                         fail_key = f"bash:{cmd[:100]}"
                         _fail_history[fail_key] = _fail_history.get(fail_key, 0) + 1
                         if _fail_history[fail_key] >= _STUCK_THRESHOLD:
                             warn_msg = (
                                 f"Stuck detected: '{cmd[:60]}' failed {_STUCK_THRESHOLD} times. "
-                                "Consider switching approach or using /domain research."
+                                "STOP retrying this. Try a completely different approach."
                             )
                             print_warning(warn_msg)
                             result_text += f"\n\n[SYSTEM] {warn_msg}"
+
+                    # 2. Output-based conceptual failure detection (exit 0 but technique failed)
+                    _lower_result = result_text.lower()
+                    for _pattern, _tech_key in _OUTPUT_FAIL_PATTERNS:
+                        if _pattern.lower() in _lower_result:
+                            # Special case: certipy UPN check — warn if UPN != intended target
+                            if _tech_key == "adcs_upn_check":
+                                # Only flag if we were trying to impersonate someone
+                                _intended_upn_match = _re.search(r"-upn\s+(\S+)", cmd, _re.IGNORECASE)
+                                if _intended_upn_match:
+                                    _upn_in_result = _re.search(r"upn\s*=\s*(\S+)", result_text, _re.IGNORECASE)
+                                    if _upn_in_result:
+                                        _intended = _intended_upn_match.group(1).lower()
+                                        _got = _upn_in_result.group(1).lower().rstrip(",")
+                                        if _intended not in _got:
+                                            _tech_key = "adcs_upn_wrong"
+                                            _technique_fail[_tech_key] = _technique_fail.get(_tech_key, 0) + 1
+                                            if _technique_fail[_tech_key] >= _TECHNIQUE_THRESHOLD:
+                                                _tech_warn = (
+                                                    f"[SYSTEM] ESC6/UPN override failed {_technique_fail[_tech_key]} times "
+                                                    f"(requested UPN={_intended}, got UPN={_got}). "
+                                                    "This CA is NOT honoring the SAN override for this template. "
+                                                    "ABANDON this certipy template+UPN approach. "
+                                                    "Try: (1) a different enrollable template, "
+                                                    "(2) shadow credentials via certipy shadow auto if you have GenericWrite, "
+                                                    "(3) RBCD/S4U2Self if you have a computer account, "
+                                                    "(4) check privileges on the current shell (whoami /priv)."
+                                                )
+                                                result_text += f"\n\n{_tech_warn}"
+                                                print_warning(f"ESC6 UPN mismatch x{_technique_fail[_tech_key]} — injecting pivot guidance")
+                                continue
+                            # General pattern: increment and warn after threshold
+                            _technique_fail[_tech_key] = _technique_fail.get(_tech_key, 0) + 1
+                            if _technique_fail[_tech_key] >= _TECHNIQUE_THRESHOLD:
+                                _tech_warn = (
+                                    f"[SYSTEM] Technique '{_tech_key}' failed {_technique_fail[_tech_key]} times. "
+                                    "Do NOT retry the same approach. Switch to a different attack vector."
+                                )
+                                result_text += f"\n\n{_tech_warn}"
+                                print_warning(f"Technique '{_tech_key}' failed {_technique_fail[_tech_key]}x — injecting pivot warning")
+                            break
+
+                    # 3. Track flag acquisition
+                    if not _flags_found and _re.search(r"(user|root)\.txt", result_text, _re.IGNORECASE):
+                        _flag_like = _re.search(r"[0-9a-f]{32}", result_text)
+                        if _flag_like:
+                            _flags_found = True
 
                     # Collapse repeated identical lines (e.g. SQL client spamming the same error
                     # when a heredoc EOF delimiter is fed as input to an interactive program).
@@ -2003,6 +2111,20 @@ def _run_agentic_loop(
                 from dsec.formatter import print_warning as _pw
                 _pw("Format issue detected in AI output — injecting correction feedback.")
                 tool_responses.append({"name": "__format_warning__", "result": _fmt_warning})
+
+        # Append checkpoint as tool response if we had real tool calls this iteration
+        if iteration > 1 and iteration % _checkpoint_every == 0 and not _flags_found and tool_responses:
+            _techniques_tried = list(_technique_fail.keys())
+            _failed_cmds = [k.replace("bash:", "") for k, v in _fail_history.items() if v >= _STUCK_THRESHOLD]
+            _cp_msg = (
+                f"[SYSTEM CHECKPOINT — iteration {iteration}] "
+                f"You have run {iteration} iterations without a flag. "
+                f"Failed techniques: {_techniques_tried or 'none'}. "
+                f"Repeatedly failing commands: {_failed_cmds[:3] or 'none'}. "
+                "REASSESS: Is your current attack path still viable? "
+                "If not, enumerate your current privileges (whoami /priv) and pivot to a different technique."
+            )
+            tool_responses.append({"name": "checkpoint", "result": _cp_msg})
 
         tool_response_chars = sum(len(str(tr.get("result", ""))) for tr in tool_responses)
         large_tool_response = tool_response_chars >= 12000 or any(

