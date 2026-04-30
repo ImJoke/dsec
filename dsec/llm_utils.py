@@ -45,12 +45,24 @@ def llm_summarize(text: str, focus: str = "general") -> str:
     Generate a dense, information-rich summary of the provided text.
     """
     model = get_best_model()
-    prompt = f"""
-Summarize the following security conversation turns. 
-Focus on: {focus}.
-Be extremely concise but retain all technical details (IPs, credentials, found vulnerabilities, executed commands).
+    prompt = f"""You are summarizing a penetration testing session for context compression.
+The summary will be injected back as a system message so the AI can continue the attack seamlessly.
 
-CONVERSATION:
+CRITICAL: The summary MUST preserve ALL of the following (never omit):
+1. TARGET: IP address, hostname, domain name
+2. CREDENTIALS: every username, password, NTLM hash, Kerberos ticket found (exact values)
+3. ATTACK POSITION: current foothold, compromised accounts, gained shells/access
+4. COMPLETED STEPS: what was already tried and succeeded
+5. FAILED APPROACHES: what was tried and failed (so AI doesn't repeat them)
+6. NEXT STEP: the exact planned next action when the session continues
+
+Additional focus: {focus}
+
+Format your summary as structured bullet points under these headings.
+Be dense and technical — preserve exact IPs, exact hashes, exact command flags, exact error messages.
+Do NOT summarize away credential values or IP addresses.
+
+CONVERSATION TO SUMMARIZE:
 {text}
 """
     from dsec.config import get_next_token

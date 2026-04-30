@@ -171,7 +171,7 @@ class ContextManager:
         from dsec.llm_utils import llm_summarize
         
         raw_text = "\n".join([f"{t.role.upper()}: {t.content}" for t in old_turns])
-        summary = llm_summarize(raw_text, focus="recon progress and findings")
+        summary = llm_summarize(raw_text, focus="HTB attack progress: preserve all credentials/hashes, IPs, current foothold, exact next step")
         
         summary_lines = [
             "[SESSION SUMMARY — RECON & EXPLOIT PROGRESS (LLM Generated)]",
@@ -255,12 +255,12 @@ class ContextManager:
             raw_text = "\n".join(
                 f"{t.role.upper()}: {t.content[:800]}" for t in discarded_turns
             )
-            summary_text = llm_summarize(raw_text, focus="recon progress and findings")
+            summary_text = llm_summarize(raw_text, focus="HTB attack progress: preserve all credentials/hashes, IPs, current foothold, exact next step")
             self._compressed_block = summary_text
 
             messages.append({
                 "role": "system",
-                "content": f"[PREVIOUS SESSION SUMMARY]\n{summary_text}\n[END SUMMARY]",
+                "content": f"[PREVIOUS SESSION SUMMARY — ATTACK STATE]\n{summary_text}\n[END SUMMARY — Resume attack from exact position above]",
             })
 
         # Assemble eligible messages, skipping degenerate turns that would

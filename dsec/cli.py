@@ -1365,30 +1365,20 @@ def _run_agentic_loop(
                 _last_no_tool_response = normalized_no_tool
 
                 # If the AI is asking the user for a new IP (offline detection triggered),
-                # pause auto-exec and wait for user input rather than looping.
+                # break cleanly out of the agentic loop back to the shell prompt.
+                # The user can then type the new IP as their next message — no inline input().
                 _asking_for_ip = (
                     "provide the new ip" in (raw_no_tool or "").lower()
                     or "new ip address" in (raw_no_tool or "").lower()
                     or "target appears offline" in (raw_no_tool or "").lower()
+                    or "machine.*offline" in (raw_no_tool or "").lower()
                 )
                 if _asking_for_ip and auto_exec:
                     console.print(
-                        "[bold yellow]⚠ AI is waiting for new target IP. "
-                        "Type the new IP and press Enter:[/bold yellow]"
+                        "\n[bold yellow]⚠ Target offline — agentic loop paused.[/bold yellow] "
+                        "Provide the new IP as your next message and the AI will resume."
                     )
-                    try:
-                        new_ip = _safe_input("New IP > ").strip()
-                    except (EOFError, KeyboardInterrupt):
-                        new_ip = ""
-                    if new_ip:
-                        # Feed new IP back into the loop so AI can continue
-                        current_response = (
-                            f"<tool_response>\n"
-                            f'{{\"name\": \"user_input\", \"result\": \"New target IP: {new_ip}. '
-                            f'Update your target and continue the attack.\"}}\n'
-                            f"</tool_response>"
-                        )
-                        continue
+                    break
 
                 no_tool_server_error = _has_server_overflow_error(raw_no_tool)
                 if no_tool_server_error:
@@ -1871,15 +1861,17 @@ def _run_agentic_loop(
                     _offline_detected = _has_machine_offline(result_text) and domain == "htb"
                     if _offline_detected:
                         offline_warn = (
-                            "[SYSTEM] TARGET UNREACHABLE — the machine IP may have changed (HTB machines reset periodically). "
-                            "STOP network commands. Ask the user: 'The target appears offline. "
-                            "Please provide the new IP address.' Do NOT attempt VPN reconfiguration, "
-                            "API calls, or further network probes. Wait for the user to supply the new IP."
+                            "[SYSTEM] TARGET UNREACHABLE — HTB machine has likely reset and the IP changed. "
+                            "STOP all network commands immediately. "
+                            "Output a complete summary of: (1) all credentials/hashes found, "
+                            "(2) current attack position, (3) exact next step once the new IP is available. "
+                            "End with: 'Target appears offline. Please provide the new IP to continue.' "
+                            "Do NOT run any more tools."
                         )
                         result_text += f"\n\n{offline_warn}"
                         console.print(
-                            "[bold yellow]⚠ TARGET OFFLINE[/bold yellow] — machine may have reset. "
-                            "Prompting AI to ask you for the new IP."
+                            "\n[bold red]🔴 TARGET OFFLINE[/bold red] — machine reset detected. "
+                            "AI will summarize findings and pause."
                         )
 
                     # Stuck detection for failed commands
