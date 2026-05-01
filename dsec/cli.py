@@ -3227,15 +3227,17 @@ def _run_chat(
     # ── Context Pruning ────────────────────────────────────────────────────────
     from dsec.context_manager import ContextManager
     cm = ContextManager(domain=domain, model=model)
-    cm.set_system_prompt_tokens(final_prompt) # Base cost
+    _cumulative_summary = (session_data or {}).get("cumulative_summary", "")
+    # Include cumulative_summary in budget calculation — it's sent on every request
+    # and grows over time; ignoring it causes silent context overflow at the API level.
+    cm.set_system_prompt_tokens(final_prompt + _cumulative_summary)
     if session_data and "history" in session_data:
         for t in session_data["history"]:
             cm.add_turn(t["role"], t.get("content", ""), t.get("thinking", ""))
-    
+
     history = None
     # Prepend cumulative summary from previous prunes so the AI remembers early context
-    _cumulative_summary = (session_data or {}).get("cumulative_summary", "")
-    if _cumulative_summary and not history:
+    if _cumulative_summary:
         history = [{"role": "system", "content": f"[CUMULATIVE SESSION HISTORY]\n{_cumulative_summary}\n[END HISTORY]"}]
 
     if cm.usage_percent >= 50:
@@ -3244,13 +3246,17 @@ def _run_chat(
         target_tokens = int(cm.budget * 0.40)
         history = cm.to_messages(limit=target_tokens)
 
-        # Merge new summary with previous cumulative summary for continuity on future resumes
+        # Merge new summary with previous cumulative summary for continuity on future resumes.
+        # Cap total size to ~20K chars so it doesn't overflow the context budget over long sessions.
+        _SUMMARY_CAP = 20_000
         new_summary = cm.get_summary_text()
         if new_summary:
             prev = (session_data or {}).get("cumulative_summary", "")
             combined = f"{prev}\n\n[CONTINUED — TURN {turn}:]\n{new_summary}".strip()
+            if len(combined) > _SUMMARY_CAP:
+                combined = combined[-_SUMMARY_CAP:]  # keep the most recent portion
         else:
-            combined = _cumulative_summary
+            combined = _cumulative_summary[-_SUMMARY_CAP:] if len(_cumulative_summary) > _SUMMARY_CAP else _cumulative_summary
 
         # Permanently prune the session file so it doesn't just reload the full history on the next turn
         kept_count = sum(1 for m in history if m["role"] != "system")
