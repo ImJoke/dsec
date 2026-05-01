@@ -3273,7 +3273,18 @@ def _run_chat(
         # Always send explicit history when we have local turns.
         # conv_id loaded from disk may be hours/days stale; local session history
         # is always authoritative. Avoids stale-conv_id → empty-response on resume.
-        history = cm.to_messages()
+        # Limit to recent turns so long sessions don't overflow the API context.
+        _all_turns_msgs = cm.to_messages()
+        _max_history_chars = 80_000  # ~20K tokens; leaves plenty of room for overhead + response
+        _hist_chars = 0
+        _trimmed = []
+        for _m in reversed(_all_turns_msgs):
+            _c = len(_m.get("content") or "")
+            if _hist_chars + _c > _max_history_chars:
+                break
+            _trimmed.insert(0, _m)
+            _hist_chars += _c
+        history = _trimmed
         if _cumulative_summary:
             history = [
                 {"role": "system", "content": f"[CUMULATIVE SESSION HISTORY]\n{_cumulative_summary}\n[END HISTORY]"}
@@ -3302,55 +3313,64 @@ def _run_chat(
     )
 
     if response_content is None or response_content.strip() == "":
-        # Stale server-side conversation_id often causes empty responses after
-        # a session gap or machine reset. Clear it and retry once with explicit history.
-        print_warning(
-            "Empty response from model — conversation_id may be stale. "
-            "Retrying with cleared context…"
-        )
+        # Progressive retry: each attempt sends progressively less history to handle
+        # context overflow or stale conv_id. 3 attempts with shrinking windows.
         if session_data:
             session_data["conversation_id"] = None
             from dsec.session import save_session
             save_session(session_name, session_data)
 
-        # Build best available history for retry.
-        # Prefer actual turns over pre-built history which may be summary-only.
-        # Note: cm.to_messages() returns [] (falsy) when fully pruned — handle that too.
-        if cm.turns:
-            _retry_history = cm.to_messages()
+        def _build_history_capped(max_chars: int) -> Optional[List[Dict[str, str]]]:
+            """Build history from local turns, capped at max_chars total content."""
+            if not cm.turns and not _cumulative_summary:
+                return None
+            msgs: List[Dict[str, str]] = []
+            if cm.turns:
+                used = 0
+                for _m in reversed(cm.to_messages()):
+                    _c = len(_m.get("content") or "")
+                    if used + _c > max_chars:
+                        break
+                    msgs.insert(0, _m)
+                    used += _c
             if _cumulative_summary:
-                _retry_history = [{"role": "system", "content": f"[CUMULATIVE SESSION HISTORY]\n{_cumulative_summary}\n[END HISTORY]"}] + _retry_history
-        elif _cumulative_summary:
-            _retry_history = [{"role": "system", "content": f"[CUMULATIVE SESSION HISTORY]\n{_cumulative_summary}\n[END HISTORY]"}]
+                msgs = [{"role": "system", "content": f"[CUMULATIVE SESSION HISTORY]\n{_cumulative_summary}\n[END HISTORY]"}] + msgs
+            return msgs if msgs else None
+
+        _retry_caps = [40_000, 16_000, 0]  # chars: ~10K / ~4K / summary-only
+        _retry_labels = ["last ~10 turns", "last ~4 turns", "summary only"]
+        for _cap, _label in zip(_retry_caps, _retry_labels):
+            print_warning(f"Empty response — retrying with reduced context ({_label})…")
+            _retry_history = _build_history_capped(_cap)
+            generator = chat_stream(
+                message=final_prompt,
+                model=model,
+                conversation_id=None,
+                base_url=config.get("base_url", "http://localhost:8000"),
+                token=get_next_token(),
+                history=_retry_history,
+            )
+            thinking, response_content, new_conv_id = stream_response(
+                generator=generator,
+                session_name=session_name or "none",
+                domain=domain,
+                model=model,
+                turn=turn,
+                compression_info=compression_info,
+                research_sources=research_sources_used,
+                memory_count=memory_count,
+                show_thinking=config.get("show_thinking", True) and not no_think,
+            )
+            if response_content and response_content.strip():
+                break  # got a response, continue
         else:
-            _retry_history = None
-        generator = chat_stream(
-            message=final_prompt,
-            model=model,
-            conversation_id=None,  # fresh server-side context
-            base_url=config.get("base_url", "http://localhost:8000"),
-            token=get_next_token(),
-            history=_retry_history,
-        )
-        thinking, response_content, new_conv_id = stream_response(
-            generator=generator,
-            session_name=session_name or "none",
-            domain=domain,
-            model=model,
-            turn=turn,
-            compression_info=compression_info,
-            research_sources=research_sources_used,
-            memory_count=memory_count,
-            show_thinking=config.get("show_thinking", True) and not no_think,
-        )
-        if response_content is None or response_content.strip() == "":
             if not cm.turns and not _cumulative_summary:
                 print_warning(
                     "Session context is empty — local history and server state are both gone.\n"
                     "Start a fresh session with /new or re-run autopilot."
                 )
             else:
-                print_warning("Model returned empty response again. Server may be unavailable — please try again in a moment.")
+                print_warning("Model returned empty response on all retries. Server may be unavailable.")
             return
 
     # ── Server error auto-retry with forced compaction ────────────────────────
