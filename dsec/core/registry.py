@@ -86,6 +86,10 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
         "id": "job_id", "pane": "job_id", "pane_id": "job_id",
     }
     required = tool["schema"].get("required", [])
+    # Unwrap double-nested arguments: model sometimes outputs {"arguments": {...}}
+    # instead of the flat param dict directly.
+    if list(arguments.keys()) == ["arguments"] and isinstance(arguments.get("arguments"), dict):
+        arguments = arguments["arguments"]
     resolved = dict(arguments)
     for alias, canonical in _ALIASES.items():
         if alias in resolved and canonical not in resolved:

