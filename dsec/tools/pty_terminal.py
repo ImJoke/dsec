@@ -1,10 +1,21 @@
 """
 DSEC Background Process Manager
 
-Provides the agent with persistent background processes (listeners, shells,
-relay tools) through a single `background` tool with clear action verbs.
+Two distinct use cases, handled cleanly:
 
-Internal implementation uses PTY pseudo-terminals for full interactive support.
+1. LISTENERS / SERVERS (ntlmrelayx, nc, chisel, ligolo):
+   background(action="run",  job_id="relay", command="ntlmrelayx.py ...", wait=5)
+   background(action="read", job_id="relay")
+   background(action="kill", job_id="relay")
+
+2. INTERACTIVE SHELLS (evil-winrm, mssqlclient, python REPL):
+   background(action="run",  job_id="winrm", command="evil-winrm -i ip -u user -H hash", wait=8)
+   background(action="exec", job_id="winrm", command="whoami /priv", wait=15)
+   background(action="exec", job_id="winrm", command="certutil -store My", wait=15)
+   → exec sends the command and waits for the shell prompt to reappear (smart, no timing guesses)
+
+NOTE: For single WinRM commands, prefer `nxc winrm -x "cmd"` over background — cleaner and stateless.
+Use background only when you need a persistent session (file uploads, multi-step ops).
 """
 import atexit
 import os
@@ -12,11 +23,13 @@ import pty
 import re
 import select
 import signal
+import struct
 import subprocess
 import time
 import fcntl
+import termios
 import uuid
-from typing import Dict
+from typing import Dict, List, Optional
 
 from dsec.core.registry import register
 
@@ -26,20 +39,59 @@ def strip_ansi(text: str) -> str:
     return ansi_escape.sub('', text)
 
 
+# Prompt patterns for known interactive shells — used by action="exec"
+_PROMPT_PATTERNS: List[str] = [
+    "*Evil-WinRM*",    # evil-winrm
+    "PS C:\\",         # PowerShell
+    "PS C:/",
+    "C:\\Windows\\",
+    "C:\\Users\\",
+    "SQL>",            # mssqlclient
+    ">>> ",            # Python REPL
+    ">>> ",
+    "$ ",              # bash
+    "# ",              # root bash
+    "bash-",           # bash without PS1
+    "smb: \\>",        # smbclient
+]
+
+
 class Pane:
     """A persistent PTY pane with a bash shell."""
+
+    # Dimensions used for all panes — large enough for tool output
+    COLS: int = 220
+    ROWS: int = 50
 
     def __init__(self, pane_id: str, init_timeout: float = 5.0):
         self.pane_id = pane_id
         self.master_fd, self.slave_fd = pty.openpty()
 
+        # Set a real terminal size immediately — default is 0×0 which breaks
+        # programs that call TIOCGWINSZ (less, vim, evil-winrm, certipy …)
+        size = struct.pack("HHHH", self.ROWS, self.COLS, 0, 0)
+        try:
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, size)
+            fcntl.ioctl(self.slave_fd,  termios.TIOCSWINSZ, size)
+        except OSError:
+            pass
+
         def preexec():
             try:
                 os.setsid()
-                import fcntl, termios
                 fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+                # Re-apply size inside the child process
+                fcntl.ioctl(0, termios.TIOCSWINSZ,
+                            struct.pack("HHHH", Pane.ROWS, Pane.COLS, 0, 0))
             except Exception:
                 pass
+
+        env = os.environ.copy()
+        env.update({
+            "TERM": "xterm-256color",
+            "COLUMNS": str(self.COLS),
+            "LINES": str(self.ROWS),
+        })
 
         self.process = subprocess.Popen(
             ["/bin/bash"],
@@ -47,7 +99,7 @@ class Pane:
             stdout=self.slave_fd,
             stderr=self.slave_fd,
             close_fds=True,
-            env=os.environ.copy(),
+            env=env,
             preexec_fn=preexec,
         )
         try:
@@ -79,6 +131,7 @@ class Pane:
         os.write(self.master_fd, data.encode("utf-8"))
 
     def read(self, timeout: float = 0.5) -> str:
+        """Read all available output until no new data for `timeout` seconds."""
         output = b""
         start_time = time.time()
         while True:
@@ -92,13 +145,47 @@ class Pane:
                     if not chunk:
                         break
                     output += chunk
-                    start_time = time.time()
+                    start_time = time.time()  # reset idle timer on new data
                 except OSError:
                     break
             else:
                 if time.time() - start_time > timeout:
                     break
         return output.decode("utf-8", errors="replace")
+
+    def read_until_prompt(self, patterns: List[str], timeout: float = 15.0) -> str:
+        """
+        Read until one of the prompt patterns appears in output or timeout.
+        Returns the full output INCLUDING the prompt line.
+        """
+        output = b""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                r, _, _ = select.select([self.master_fd], [], [], 0.05)
+            except (ValueError, OSError):
+                break
+            if self.master_fd in r:
+                try:
+                    chunk = os.read(self.master_fd, 8192)
+                    if not chunk:
+                        break
+                    output += chunk
+                    decoded = output.decode("utf-8", errors="replace")
+                    clean = strip_ansi(decoded)
+                    for pat in patterns:
+                        if pat in clean:
+                            return clean
+                except OSError:
+                    break
+            else:
+                # No data — if we already have output and saw something prompt-like, stop
+                if output:
+                    decoded = strip_ansi(output.decode("utf-8", errors="replace"))
+                    for pat in patterns:
+                        if pat in decoded:
+                            return decoded
+        return strip_ansi(output.decode("utf-8", errors="replace"))
 
     def send_signal(self, sig: int):
         if self.alive:
@@ -133,6 +220,11 @@ class Pane:
 
 _PANES: Dict[str, Pane] = {}
 _MAX_PANES = 8
+_RESUME_ERR = (
+    "Job '{}' does not exist — background jobs are in-memory and do not survive "
+    "session compression or resume. Use action='run' to restart the job, or check "
+    "action='list' to see what's currently running."
+)
 
 
 def _cleanup_all_panes():
@@ -160,6 +252,37 @@ def _get_or_create(job_id: str) -> Pane:
     return _PANES[job_id]
 
 
+def _clean_exec_output(raw: str, command: str) -> str:
+    """
+    Strip command echo and trailing prompt from exec output.
+    Returns just the command's output, ready for the AI to parse.
+    """
+    lines = raw.splitlines()
+    result_lines = []
+    cmd_stripped = command.strip()
+    in_output = False
+
+    for line in lines:
+        line_clean = line.strip()
+        # Skip the command echo line
+        if not in_output:
+            if cmd_stripped and cmd_stripped in line_clean:
+                in_output = True
+                continue
+            # Fallback: start after first non-empty line
+            if line_clean:
+                in_output = True
+                result_lines.append(line)
+            continue
+        # Skip trailing prompt lines
+        is_prompt = any(pat.strip() in line_clean for pat in _PROMPT_PATTERNS if pat.strip())
+        if is_prompt and line_clean.endswith(">") or line_clean.endswith("$") or line_clean.endswith("# "):
+            break
+        result_lines.append(line)
+
+    return "\n".join(result_lines).strip()
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Single unified tool
 # ═══════════════════════════════════════════════════════════════════════════
@@ -167,28 +290,45 @@ def _get_or_create(job_id: str) -> Pane:
 @register(
     "background",
     (
-        "Manage persistent background processes (listeners, shells, relay tools).\n"
-        "Actions:\n"
-        "  run   — start a command in a named background job (auto-creates job if needed)\n"
-        "          Returns initial output captured while wait_seconds elapses.\n"
-        "  read  — read accumulated output from a running job (non-blocking poll)\n"
-        "  send  — send raw input to a job; use \\x03 for Ctrl+C, \\n for Enter\n"
-        "  kill  — terminate a background job\n"
-        "  list  — list all active background jobs\n"
+        "Manage persistent background processes: listeners, relay tools, interactive shells.\n"
         "\n"
-        "Parameters:\n"
-        "  action      (required) one of: run | read | send | kill | list\n"
-        "  job_id      name for the job, e.g. 'relay', 'winrm', 'listener'\n"
-        "              (omit for 'list'; auto-generated if omitted for 'run')\n"
-        "  command     shell command to execute (required for action='run')\n"
-        "  input       text to send to stdin   (required for action='send')\n"
-        "  wait        seconds to wait for output after 'run' (default 3, max 30)\n"
+        "WHEN TO USE:\n"
+        "  - Listeners/servers: ntlmrelayx, nc -lvnp, chisel, ligolo, responder\n"
+        "  - Interactive shells: evil-winrm, mssqlclient, python REPL\n"
+        "  - NOT for single WinRM commands — use `nxc winrm -x 'cmd'` instead (cleaner)\n"
         "\n"
-        "Typical workflow:\n"
-        "  1. background(action='run', job_id='relay', command='ntlmrelayx ...')\n"
-        "  2. [trigger auth from victim via bash]\n"
-        "  3. background(action='read', job_id='relay')  # poll for captured hash\n"
+        "ACTIONS:\n"
+        "  run   — start command in a background job. For listeners: use wait=3-5.\n"
+        "          For interactive shells (evil-winrm): use wait=8 to get the banner.\n"
+        "  exec  — send ONE command to a running interactive shell and wait for the\n"
+        "          prompt to reappear. Returns clean output. BEST for interactive shells.\n"
+        "          Use this instead of send+read for evil-winrm, mssqlclient, etc.\n"
+        "  read  — poll accumulated output from a listener (non-blocking)\n"
+        "  send  — send raw keystrokes (\\x03=Ctrl+C, \\n=Enter). Use for special keys.\n"
+        "  kill  — terminate a job\n"
+        "  list  — list all active jobs\n"
+        "\n"
+        "PARAMETERS:\n"
+        "  action   (required) run | exec | read | send | kill | list\n"
+        "  job_id   name for this job (e.g. 'relay', 'winrm', 'listener')\n"
+        "  command  shell command (required for run; the command to execute for exec)\n"
+        "  input    raw keystrokes (required for send)\n"
+        "  wait     seconds to wait for output after 'run' (default 3, max 30)\n"
+        "\n"
+        "INTERACTIVE SHELL WORKFLOW (evil-winrm example):\n"
+        "  1. background(action='run',  job_id='winrm', command='evil-winrm -i IP -u USER -H HASH', wait=8)\n"
+        "  2. background(action='exec', job_id='winrm', command='whoami /priv', wait=15)\n"
+        "  3. background(action='exec', job_id='winrm', command='certutil -store My', wait=15)\n"
+        "  4. background(action='kill', job_id='winrm')\n"
+        "\n"
+        "LISTENER WORKFLOW (ntlmrelayx example):\n"
+        "  1. background(action='run',  job_id='relay', command='ntlmrelayx.py -t ldap://DC ...', wait=5)\n"
+        "  2. [trigger auth from victim]\n"
+        "  3. background(action='read', job_id='relay')   # poll for captured hashes\n"
         "  4. background(action='kill', job_id='relay')\n"
+        "\n"
+        "NOTE: Background jobs are IN-MEMORY. They do NOT survive session compression\n"
+        "or resume. If a job 'does not exist', restart it with action='run'.\n"
     ),
 )
 def background(
@@ -203,7 +343,7 @@ def background(
     # ── list ─────────────────────────────────────────────────────────────────
     if action == "list":
         if not _PANES:
-            return "No active background jobs."
+            return "No active background jobs. (Jobs are in-memory — they don't survive session resume.)"
         lines = [f"{'Job ID':<18} {'PID':<8} Status"]
         lines.append("─" * 38)
         for jid, pane in _PANES.items():
@@ -227,17 +367,44 @@ def background(
         status = "running" if pane.alive else "exited"
         return (
             f"[job '{job_id}' started — PID {pane.process.pid}, status: {status}]\n"
-            f"{output or '(no output yet — job is still starting)'}"
+            f"{output or '(no output yet — use action=read to poll later)'}"
         )
+
+    # ── exec (smart prompt-aware command dispatch) ────────────────────────────
+    if action == "exec":
+        if not job_id:
+            return "Error: 'job_id' is required for action='exec'."
+        if not command:
+            return "Error: 'command' is required for action='exec'."
+        if job_id not in _PANES:
+            return _RESUME_ERR.format(job_id)
+        pane = _PANES[job_id]
+        if not pane.alive:
+            return f"[job '{job_id}' has exited — use action='run' to restart]"
+
+        # Clear any pending output before sending command
+        pane.read(timeout=0.2)
+
+        # Send the command
+        pane.write(command + "\n")
+
+        # Wait for a prompt pattern to signal completion
+        wait_clamped = max(3.0, min(float(wait), 60.0))
+        raw = pane.read_until_prompt(_PROMPT_PATTERNS, timeout=wait_clamped)
+
+        # Clean up: strip command echo + trailing prompt
+        clean = _clean_exec_output(raw, command)
+        status = "running" if pane.alive else "exited"
+        if not clean:
+            return f"[job '{job_id}' exec '{command[:40]}' — {status}]\n(no output)"
+        return f"[job '{job_id}' exec '{command[:40]}' — {status}]\n{clean}"
 
     # ── read ─────────────────────────────────────────────────────────────────
     if action == "read":
         if not job_id:
             return "Error: 'job_id' is required for action='read'."
         if job_id not in _PANES:
-            existing = list(_PANES.keys())
-            hint = f" Active jobs: {existing}." if existing else " No active jobs."
-            return f"Error: job '{job_id}' does not exist.{hint}"
+            return _RESUME_ERR.format(job_id)
         pane = _PANES[job_id]
         output = strip_ansi(pane.read(timeout=1.0))
         status = "running" if pane.alive else f"exited({pane.process.returncode})"
@@ -250,7 +417,7 @@ def background(
         if not job_id:
             return "Error: 'job_id' is required for action='send'."
         if job_id not in _PANES:
-            return f"Error: job '{job_id}' does not exist."
+            return _RESUME_ERR.format(job_id)
         if not input:
             return "Error: 'input' is required for action='send'."
         pane = _PANES[job_id]
@@ -270,9 +437,9 @@ def background(
         if not job_id:
             return "Error: 'job_id' is required for action='kill'."
         if job_id not in _PANES:
-            return f"Error: job '{job_id}' does not exist."
+            return f"[job '{job_id}' does not exist — already gone or never started]"
         _PANES[job_id].close()
         del _PANES[job_id]
         return f"[job '{job_id}' killed]"
 
-    return f"Error: unknown action '{action}'. Valid actions: run, read, send, kill, list."
+    return f"Error: unknown action '{action}'. Valid: run, exec, read, send, kill, list."

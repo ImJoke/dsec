@@ -94,13 +94,24 @@ def programmer_edit_file(filepath: str, old_content: str, new_content: str) -> s
         return f"Error editing file {filepath}: {e}"
 
 
-@register("programmer_create_file", "Creates a new file with the specified content.")
-def programmer_create_file(filepath: str, content: str) -> str:
+@register(
+    "programmer_create_file",
+    "Creates a new file with the specified content. "
+    "Params: filepath (or 'path'), content (or 'text'). "
+    "Prefer write_file for new code — it handles overwrite and parent-dir creation.",
+)
+def programmer_create_file(filepath: str = "", content: str = "", **kwargs) -> str:
+    # Accept common aliases
+    filepath = filepath or kwargs.get("path", "") or kwargs.get("file_path", "")
+    content = content or kwargs.get("text", "") or kwargs.get("file_content", "") or kwargs.get("body", "")
+    if not filepath:
+        return "[error: programmer_create_file requires 'filepath' (or 'path') parameter]"
+    if content is None:
+        content = ""
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
-        if os.path.exists(filepath):
-            return f"Error: File {filepath} already exists. Use programmer_edit_file instead."
-
+        parent = os.path.dirname(os.path.abspath(filepath))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
         return f"Successfully created {filepath} ({len(content)} bytes)."

@@ -93,6 +93,7 @@ def _ensure_native_tools_loaded():
         import dsec.tools.gtfobins      # noqa: F401
         import dsec.tools.skill_manager # noqa: F401
         import dsec.tools.cron_tools    # noqa: F401
+        import dsec.tools.file_tools    # noqa: F401
         import dsec.skills.programmer   # noqa: F401
         import dsec.skills.persistence  # noqa: F401
         import dsec.tools.payload_tools # noqa: F401
@@ -1287,15 +1288,17 @@ def _run_agentic_loop(
     _STUCK_THRESHOLD = 3
     _TECHNIQUE_THRESHOLD = 2  # abandon a technique after this many conceptual failures
     _no_tool_streak = 0
-    _no_tool_error_streak = 0
+    _no_tool_error_streak = 0   # non-server no-tool turns (AI chose not to call tools)
+    _server_error_streak = 0    # consecutive transient server errors ("服务暂时不可用")
     _no_tool_repeat_streak = 0
     _last_no_tool_response = ""
     _checkpoint_every = 25   # inject progress-check every N iterations
     _flags_found = False      # True once user.txt or root.txt obtained
 
     _NO_TOOL_STREAK_LIMIT = 12
-    _NO_TOOL_ERROR_STREAK_LIMIT = 3
+    _NO_TOOL_ERROR_STREAK_LIMIT = 6   # AI-caused no-tool limit (not server errors)
     _NO_TOOL_REPEAT_LIMIT = 5
+    _SERVER_ERROR_RETRY_LIMIT = 10    # transient server errors before giving up
 
     # Patterns in tool output that indicate a technique conceptually failed
     # even when exit code is 0. Maps output substring → technique category key.
@@ -1409,53 +1412,39 @@ def _run_agentic_loop(
 
                 no_tool_server_error = _has_server_overflow_error(raw_no_tool)
                 if no_tool_server_error:
-                    _no_tool_error_streak += 1
-                    # Progressive compaction: 40% → 20% → 10% on successive overflows.
-                    # Fixed 40% was failing repeatedly when context was still too large.
-                    _COMPACT_PCTS = (0.40, 0.20, 0.10)
-                    _compact_pct = _COMPACT_PCTS[min(_no_tool_error_streak - 1, len(_COMPACT_PCTS) - 1)]
-                    if _no_tool_error_streak == 1:
-                        print_warning(
-                            "Autonomous response looks like an upstream/server error without tool calls; force-compacting context before retry."
+                    # TRANSIENT server failure ("服务暂时不可用") — NOT context overflow.
+                    # Strategy: exponential backoff + retry WITHOUT compacting context.
+                    # Compacting destroys attack state for no reason when the server is just busy.
+                    _server_error_streak += 1
+                    _no_tool_streak = max(0, _no_tool_streak - 1)  # don't count against AI
+                    _no_tool_repeat_streak = 0
+                    _last_no_tool_response = ""
+
+                    import time as _time
+                    _backoff = min(3.0 * (2 ** (_server_error_streak - 1)), 60.0)
+                    print_warning(
+                        f"Server temporarily unavailable (streak={_server_error_streak}/{_SERVER_ERROR_RETRY_LIMIT}). "
+                        f"Waiting {_backoff:.0f}s then retrying — context preserved."
+                    )
+                    _time.sleep(_backoff)
+
+                    if _server_error_streak >= _SERVER_ERROR_RETRY_LIMIT:
+                        stop_reason = (
+                            f"server unavailable after {_server_error_streak} consecutive retries; "
+                            "giving up to avoid infinite wait"
                         )
-                    else:
-                        print_warning(
-                            f"Server error streak={_no_tool_error_streak}; compacting to {int(_compact_pct*100)}% of budget."
+                        print_warning("Server unavailable for too long; stopping agentic loop.")
+                        autopilot.record_tool_result("__agentic_loop__", f"[error: {stop_reason}]")
+                        issue_path = autopilot.finalize(
+                            reason=stop_reason,
+                            had_tool_calls=True,
+                            loop_ended_normally=False,
+                            new_content=None,
                         )
-                    _compact_loop_context(reason="autonomous no-tool server error", force=True, target_pct=_compact_pct)
-                    if _no_tool_error_streak > 1:
-                        import time as _time
-                        _time.sleep(1.5)  # brief pause before retry; transient overloads often clear quickly
-                    # Allow one hard-recovery attempt before stopping.
-                    if _no_tool_error_streak >= _NO_TOOL_ERROR_STREAK_LIMIT:
-                        if not _hard_recovery_attempted:
-                            _hard_recovery_attempted = True
-                            _force_toolcall_now = True
-                            # Keep one more recovery turn available.
-                            _no_tool_error_streak = _NO_TOOL_ERROR_STREAK_LIMIT - 1
-                            print_warning(
-                                "Autonomous mode hit repeated server errors; forcing one strict recovery turn before aborting."
-                            )
-                        else:
-                            stop_reason = (
-                                f"autonomous no-tool server error detected {_no_tool_error_streak} times; "
-                                "model cannot recover or produce tool calls despite retries"
-                            )
-                            print_warning(
-                                "Autonomous mode detected repeated server errors with no tool calls; "
-                                "stopping to prevent infinite retry loop."
-                            )
-                            autopilot.record_tool_result("__agentic_loop__", f"[error: {stop_reason}]")
-                            issue_path = autopilot.finalize(
-                                reason=stop_reason,
-                                had_tool_calls=True,
-                                loop_ended_normally=False,
-                                new_content=None,
-                            )
-                            if issue_path:
-                                print_warning(f"Autopilot bug finder wrote issue report to {issue_path}")
-                            break
-                # Don't reset error_streak here; keep accumulating until abort condition
+                        if issue_path:
+                            print_warning(f"Autopilot bug finder wrote issue report to {issue_path}")
+                        break
+                    # Fall through to continue_msg retry. No compaction, no context loss.
 
                 if (not _force_toolcall_now) and _should_abort_no_tool_loop(
                     no_tool_streak=_no_tool_streak,
@@ -1555,6 +1544,7 @@ def _run_agentic_loop(
 
         _no_tool_streak = 0
         _no_tool_error_streak = 0
+        _server_error_streak = 0    # reset on successful tool call
         _no_tool_repeat_streak = 0
         _last_no_tool_response = ""
         _hard_recovery_attempted = False
@@ -1808,6 +1798,35 @@ def _run_agentic_loop(
                 is_install_cmd = any(p in cmd.lower() for p in _INSTALL_PATTERNS)
 
                 edited_cmd = cmd
+
+                # ── macOS nc compatibility ────────────────────────────────────
+                # Linux: nc -lvnp 4444  →  macOS: nc -l 4444  (or use ncat)
+                # The -p flag on macOS nc requires a separate argument, and
+                # combined -lvnp style flags don't work on macOS nc.
+                _NC_MACOS_RE = _re.compile(
+                    r'\bnc\s+-[a-zA-Z]*(?:l)[a-zA-Z]*v?n?p?\s+(\d+)',
+                )
+                _nc_match = _NC_MACOS_RE.search(edited_cmd)
+                if _nc_match and "ncat" not in edited_cmd:
+                    port = _nc_match.group(1)
+                    # Replace the whole nc invocation with macOS-compatible form
+                    edited_cmd = _NC_MACOS_RE.sub(f"nc -l {port}", edited_cmd)
+                    print_info(f"[AUTO] nc flags rewritten for macOS: nc -l {port}")
+
+                # ── Python code run directly as bash ─────────────────────────
+                # Detect when the AI sends raw Python code (import/def/for/class
+                # at start of command) without a python3 prefix — it would be
+                # executed as shell and fail immediately.
+                _first_line = edited_cmd.lstrip().splitlines()[0] if edited_cmd.strip() else ""
+                _PYTHON_STARTERS = ("import ", "from ", "def ", "class ", "import\t",
+                                    "#!/usr/bin/env python", "print(", "requests.", "ldap3.")
+                _looks_like_python = any(_first_line.startswith(s) for s in _PYTHON_STARTERS)
+                if _looks_like_python and not edited_cmd.lstrip().startswith("#!"):
+                    # Wrap in python3 -c or write to /tmp and run
+                    _py_escaped = edited_cmd.replace("'", "'\\''")
+                    edited_cmd = f"python3 - << 'PYEOF'\n{edited_cmd}\nPYEOF"
+                    print_info("[AUTO] Detected Python code — wrapped with 'python3 - << PYEOF'")
+
                 approved = False
 
                 if approve_all:
@@ -3244,6 +3263,16 @@ def _run_chat(
         # Abandon server-side history to reset its counter
         conversation_id = None
 
+    elif conversation_id is None and cm.turns:
+        # conversation_id was cleared on a previous turn (after pruning).
+        # The server no longer has this context — must send history explicitly.
+        # Call to_messages() with no limit: no LLM summarization triggered, just formats turns.
+        history = cm.to_messages()
+        if _cumulative_summary:
+            history = [
+                {"role": "system", "content": f"[CUMULATIVE SESSION HISTORY]\n{_cumulative_summary}\n[END HISTORY]"}
+            ] + history
+
     generator = chat_stream(
         message=final_prompt,
         model=model,
@@ -3267,8 +3296,7 @@ def _run_chat(
 
     if response_content is None or response_content.strip() == "":
         # Stale server-side conversation_id often causes empty responses after
-        # a session gap or machine reset. Clear it and retry once with explicit
-        # history so the model has context to respond to.
+        # a session gap or machine reset. Clear it and retry once with explicit history.
         print_warning(
             "Empty response from model — conversation_id may be stale. "
             "Retrying with cleared context…"
@@ -3278,7 +3306,8 @@ def _run_chat(
             from dsec.session import save_session
             save_session(session_name, session_data)
 
-        _retry_history = cm.to_messages(limit=int(cm.budget * 0.40)) if cm.turns else None
+        # Reuse already-computed history — don't call to_messages() again (avoids double LLM summary)
+        _retry_history = history if history else (cm.to_messages() if cm.turns else None)
         generator = chat_stream(
             message=final_prompt,
             model=model,

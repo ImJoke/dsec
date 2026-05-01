@@ -75,8 +75,35 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     tool = get_tool(name)
     if not tool:
         raise ValueError(f"Unknown tool: {name}")
-    
-    return tool["func"](**arguments)
+
+    # Resolve common argument aliases before dispatch so the AI doesn't have
+    # to remember exact parameter names for every tool.
+    # Maps alias → canonical name (only applied when canonical is missing).
+    _ALIASES: Dict[str, str] = {
+        "filepath": "path", "file_path": "path",       # programmer_create_file → write_file
+        "text": "content", "file_content": "content", "body": "content",
+        "cmd": "command",                               # background tool
+        "id": "job_id", "pane": "job_id", "pane_id": "job_id",
+    }
+    required = tool["schema"].get("required", [])
+    resolved = dict(arguments)
+    for alias, canonical in _ALIASES.items():
+        if alias in resolved and canonical not in resolved:
+            resolved[canonical] = resolved.pop(alias)
+
+    # Check required params and return a friendly error instead of a raw TypeError.
+    missing = [r for r in required if r not in resolved]
+    if missing:
+        params = ", ".join(f"{k}" for k in tool["schema"]["properties"])
+        return (
+            f"[error: '{name}' missing required argument(s): {missing}. "
+            f"Required params: {required}. All params: {params}]"
+        )
+
+    try:
+        return tool["func"](**resolved)
+    except TypeError as e:
+        return f"[error: {name}() call failed — {e}]"
 
 def build_tools_system_prompt() -> str:
     """Builds a system prompt string explaining the available Python tools."""
