@@ -3263,15 +3263,16 @@ def _run_chat(
         # Abandon server-side history to reset its counter
         conversation_id = None
 
-    elif conversation_id is None and cm.turns:
-        # conversation_id was cleared on a previous turn (after pruning).
-        # The server no longer has this context — must send history explicitly.
-        # Call to_messages() with no limit: no LLM summarization triggered, just formats turns.
+    elif cm.turns:
+        # Always send explicit history when we have local turns.
+        # conv_id loaded from disk may be hours/days stale; local session history
+        # is always authoritative. Avoids stale-conv_id → empty-response on resume.
         history = cm.to_messages()
         if _cumulative_summary:
             history = [
                 {"role": "system", "content": f"[CUMULATIVE SESSION HISTORY]\n{_cumulative_summary}\n[END HISTORY]"}
             ] + history
+        conversation_id = None  # don't rely on server-side state that may have expired
 
     generator = chat_stream(
         message=final_prompt,
@@ -3306,8 +3307,17 @@ def _run_chat(
             from dsec.session import save_session
             save_session(session_name, session_data)
 
-        # Reuse already-computed history — don't call to_messages() again (avoids double LLM summary)
-        _retry_history = history if history else (cm.to_messages() if cm.turns else None)
+        # Build best available history for retry.
+        # Prefer actual turns over pre-built history which may be summary-only.
+        # Note: cm.to_messages() returns [] (falsy) when fully pruned — handle that too.
+        if cm.turns:
+            _retry_history = cm.to_messages()
+            if _cumulative_summary:
+                _retry_history = [{"role": "system", "content": f"[CUMULATIVE SESSION HISTORY]\n{_cumulative_summary}\n[END HISTORY]"}] + _retry_history
+        elif _cumulative_summary:
+            _retry_history = [{"role": "system", "content": f"[CUMULATIVE SESSION HISTORY]\n{_cumulative_summary}\n[END HISTORY]"}]
+        else:
+            _retry_history = None
         generator = chat_stream(
             message=final_prompt,
             model=model,
@@ -3328,7 +3338,13 @@ def _run_chat(
             show_thinking=config.get("show_thinking", True) and not no_think,
         )
         if response_content is None or response_content.strip() == "":
-            print_warning("Model returned empty response again. Server may be unavailable — please try again in a moment.")
+            if not cm.turns and not _cumulative_summary:
+                print_warning(
+                    "Session context is empty — local history and server state are both gone.\n"
+                    "Start a fresh session with /new or re-run autopilot."
+                )
+            else:
+                print_warning("Model returned empty response again. Server may be unavailable — please try again in a moment.")
             return
 
     # ── Server error auto-retry with forced compaction ────────────────────────
