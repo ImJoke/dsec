@@ -10,6 +10,7 @@ Anti-hallucination rules are hardcoded and never bypassed.
 import hashlib
 import json
 import math
+import os
 import re
 import uuid
 from datetime import datetime, timezone
