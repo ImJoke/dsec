@@ -120,115 +120,41 @@ def provider_chat_stream(
     history: Optional[List[Dict[str, str]]] = None,
 ) -> Generator[Dict[str, Any], None, None]:
     """
-    Routes the request to the correct provider backend with auto-fallback.
+    DeepSeek-only routing. gpt4free / local fallback removed — they were
+    making things worse (gpt4free needs `pip install g4f`, local needs
+    Ollama running on :11434, neither set up by default).
 
-    Fallback Chain:
-      Selected Provider -> gpt4free -> local
+    Transient API errors ("服务暂时不可用", "第三方响应错误") that the
+    DeepSeek free API yields as ordinary content chunks pass through to the
+    agent loop, which detects them via _has_server_overflow_error and runs
+    its own inner-retry loop with exponential backoff + token rotation.
     """
     from dsec.client import _deepseek_chat_stream
 
-    providers_to_try = [provider]
-    # Build fallback chain
-    if "gpt4free" not in providers_to_try:
-        providers_to_try.append("gpt4free")
-    if "local" not in providers_to_try:
-        providers_to_try.append("local")
+    if not check_deepseek_health(base_url):
+        yield {
+            "type": "error",
+            "text": (
+                f"DeepSeek API unreachable at {base_url}.\n"
+                f"Start the deepseek-free-api Docker container, or set --base-url."
+            ),
+        }
+        return
 
-    last_error = ""
-
-    for current_provider in providers_to_try:
-        stream_generator = None
-        
-        if current_provider == "deepseek":
-            if not check_deepseek_health(base_url):
-                yield {"type": "thinking", "text": f"[System] Provider 'deepseek' unreachable at {base_url}. Falling back..."}
-                continue
-            stream_generator = _deepseek_chat_stream(message, model, conversation_id, base_url, token, history=history)
-            
-        elif current_provider == "gpt4free":
-            yield {"type": "thinking", "text": "[System] Trying gpt4free provider..."}
-            stream_generator = gpt4free_stream(message, model, history=history)
-            
-        elif current_provider == "local":
-            yield {"type": "thinking", "text": "[System] Trying local Ollama provider..."}
-            stream_generator = local_model_stream(message, model, "http://localhost:11434", history=history)
-
-        if stream_generator:
-            got_done = False
-            buffered: List[Dict[str, Any]] = []
-            content_text = ""
-            transient_detected = False
-            _TRANSIENT_PATTERNS = ("服务暂时不可用", "第三方响应错误", "服务繁忙")
-            try:
-                for chunk in stream_generator:
-                    if chunk.get("type") == "error":
-                        last_error = chunk.get("text", "Unknown error")
-                        yield {"type": "thinking", "text": f"[System] Provider '{current_provider}' failed: {last_error}"}
-                        break
-                    # Buffer content briefly so we can detect transient server
-                    # errors that the upstream API yields as ordinary content
-                    # (e.g. DeepSeek free API returns "服务暂时不可用" via the
-                    # content stream with HTTP 200).
-                    if chunk.get("type") == "content":
-                        content_text += chunk.get("text", "")
-                        buffered.append(chunk)
-                        # Real model output started → flush and stop buffering.
-                        if len(content_text) >= 200:
-                            for b in buffered:
-                                yield b
-                            buffered = []
-                            content_text = ""  # stop checking
-                    else:
-                        # Non-content chunk (thinking/done): flush buffer first.
-                        # If buffer is short and contains transient pattern, drop it.
-                        if buffered and len(content_text) < 200 and any(
-                            p in content_text for p in _TRANSIENT_PATTERNS
-                        ):
-                            last_error = content_text.strip() or "transient API error"
-                            transient_detected = True
-                            buffered = []
-                            content_text = ""
-                            yield {
-                                "type": "thinking",
-                                "text": f"[System] Provider '{current_provider}' transient error ({last_error}); switching provider…",
-                            }
-                            break
-                        for b in buffered:
-                            yield b
-                        buffered = []
-                        yield chunk
-                        if chunk.get("type") == "done":
-                            got_done = True
-                # End of stream — final flush. If buffer is short and contains
-                # the transient pattern, treat it as a provider failure (fall
-                # through to next provider).
-                if buffered and len(content_text) < 200 and any(
-                    p in content_text for p in _TRANSIENT_PATTERNS
-                ):
-                    last_error = content_text.strip() or "transient API error"
-                    transient_detected = True
-                    yield {
-                        "type": "thinking",
-                        "text": f"[System] Provider '{current_provider}' transient error ({last_error}); switching provider…",
-                    }
-                else:
-                    for b in buffered:
-                        yield b
-            except Exception as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                yield {"type": "thinking", "text": f"[System] Provider '{current_provider}' crashed: {last_error}"}
-
-            if got_done and not transient_detected:
-                return
-
-    # If all providers failed
-    yield {"type": "error", "text": f"All providers failed. Last error: {last_error}"}
+    try:
+        for chunk in _deepseek_chat_stream(
+            message, model, conversation_id, base_url, token, history=history
+        ):
+            yield chunk
+    except Exception as exc:
+        yield {
+            "type": "error",
+            "text": f"DeepSeek stream crashed: {type(exc).__name__}: {exc}",
+        }
 
 
 def list_providers() -> List[Dict[str, str]]:
     """Return metadata about available providers."""
     return [
         {"name": "deepseek", "description": "DeepSeek free API (Docker)", "requires": "deepseek-free-api container"},
-        {"name": "gpt4free", "description": "GPT4Free (g4f library)", "requires": "pip install g4f"},
-        {"name": "local", "description": "Local Ollama-compatible model", "requires": "Ollama running on localhost:11434"},
     ]

@@ -1352,10 +1352,10 @@ def _run_agentic_loop(
     _NO_TOOL_STREAK_LIMIT = 12
     _NO_TOOL_ERROR_STREAK_LIMIT = 6   # AI-caused no-tool limit (not server errors)
     _NO_TOOL_REPEAT_LIMIT = 5
-    # provider_chat_stream now auto-falls back to gpt4free + local on transient
-    # errors, so we only need a small inner-retry budget for cases where ALL
-    # providers fail simultaneously.
-    _SERVER_ERROR_RETRY_LIMIT = 6     # transient errors across all providers before cooldown
+    # DeepSeek-only routing — no provider fallback. Inner retry handles
+    # transient errors via exponential backoff with token rotation
+    # (get_next_token rotates on each call).
+    _SERVER_ERROR_RETRY_LIMIT = 12    # transient DeepSeek errors before extended cooldown
     _server_cooldown_used = False     # only allow one extended cooldown per loop
 
     # Patterns in tool output that indicate a technique conceptually failed
