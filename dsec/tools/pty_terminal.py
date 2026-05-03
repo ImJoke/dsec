@@ -65,15 +65,17 @@ def strip_ansi(text: str) -> str:
 
 
 # Prompt patterns for known interactive shells — used by action="exec"
+# All patterns are plain substring matches (no glob/fnmatch).
+# evil-winrm prompt is literally: *Evil-WinRM shell v3.x Final* PS C:\Users\>
+# So check for "Evil-WinRM" (the asterisks are literal in the output but vary in position).
 _PROMPT_PATTERNS: List[str] = [
-    "*Evil-WinRM*",    # evil-winrm
+    "Evil-WinRM",      # evil-winrm (literal asterisks in prompt vary; match core string)
     "PS C:\\",         # PowerShell
     "PS C:/",
     "C:\\Windows\\",
     "C:\\Users\\",
     "SQL>",            # mssqlclient
     ">>> ",            # Python REPL
-    ">>> ",
     "$ ",              # bash
     "# ",              # root bash
     "bash-",           # bash without PS1
@@ -154,6 +156,8 @@ class Pane:
         return self.process.poll() is None
 
     def write(self, data: str):
+        if self.master_fd < 0:
+            raise RuntimeError(f"Job '{self.pane_id}' PTY is already closed.")
         if not self.alive:
             raise RuntimeError(f"Job '{self.pane_id}' process has exited.")
         os.write(self.master_fd, data.encode("utf-8"))
@@ -163,13 +167,16 @@ class Pane:
         output = b""
         start_time = time.time()
         while True:
+            fd = self.master_fd  # snapshot — close() may race
+            if fd < 0:
+                break
             try:
-                r, _, _ = select.select([self.master_fd], [], [], 0.05)
+                r, _, _ = select.select([fd], [], [], 0.05)
             except (ValueError, OSError):
                 break
-            if self.master_fd in r:
+            if fd in r:
                 try:
-                    chunk = os.read(self.master_fd, 8192)
+                    chunk = os.read(fd, 8192)
                     if not chunk:
                         break
                     output += chunk
@@ -189,13 +196,16 @@ class Pane:
         output = b""
         start_time = time.time()
         while time.time() - start_time < timeout:
+            fd = self.master_fd  # snapshot — close() may race
+            if fd < 0:
+                break
             try:
-                r, _, _ = select.select([self.master_fd], [], [], 0.05)
+                r, _, _ = select.select([fd], [], [], 0.05)
             except (ValueError, OSError):
                 break
-            if self.master_fd in r:
+            if fd in r:
                 try:
-                    chunk = os.read(self.master_fd, 8192)
+                    chunk = os.read(fd, 8192)
                     if not chunk:
                         break
                     output += chunk

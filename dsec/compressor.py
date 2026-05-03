@@ -54,7 +54,7 @@ COMPRESS_PATTERN = re.compile(
 
 def should_compress(text: str, threshold: int = 500) -> bool:
     """Return True if the text is noisy tool output that should be compressed."""
-    if len(text) <= threshold:
+    if len(text) < threshold:
         return False
     return bool(COMPRESS_PATTERN.search(text))
 
