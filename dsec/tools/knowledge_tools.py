@@ -30,12 +30,32 @@ def _format_snippet(body: str, max_chars: int = 1500) -> str:
     return body[:max_chars].rstrip() + "\n...[snippet truncated — use notes_get for full content]"
 
 
+_WRITEUP_TERMS = {
+    "writeup", "write-up", "write up", "walkthrough", "walk-through", "solution",
+    "spoiler", "solved", "how to solve", "how to get", "flag",
+}
+
+_WRITEUP_QUERY_RE = __import__("re").compile(
+    r"\b(writeup|write.up|walkthrough|walk.through|solution|spoiler|how to solve|flag)\b",
+    __import__("re").IGNORECASE,
+)
+
+
 @register(
     "notes_search",
-    "Semantic search over your personal Obsidian notes (HTB writeups, AD/ADCS/web/CTF techniques). "
-    "Use when stuck on a target or attacking specific tech. Returns top matches with snippets.",
+    "Semantic search over personal Obsidian notes: AD/ADCS/Kerberos/web/CTF techniques, "
+    "impacket usage, tool syntax, attack patterns, enumeration references. "
+    "ONLY search for TECHNIQUES and TOOLS — never search for a specific machine name "
+    "or 'writeup'/'walkthrough' — that would be cheating and is blocked.",
 )
 def notes_search(query: str, tags: Optional[str] = None, limit: int = 5) -> str:
+    # Block writeup/solution searches — agent must solve independently
+    if _WRITEUP_QUERY_RE.search(query):
+        return (
+            "[notes_search] ⛔ Query blocked: searching for writeups or solutions is not allowed. "
+            "Use notes_search ONLY for attack techniques, tool syntax, and protocol references. "
+            "Solve the machine independently — do not look for hints or solutions."
+        )
     status = kb_status()
     if status["note_count"] == 0:
         return (
