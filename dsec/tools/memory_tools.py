@@ -49,10 +49,16 @@ def load_core_memory() -> Dict[str, Any]:
         return {"persona": "", "human": "", "project": "", "scratchpad": ""}
 
 
-def save_core_memory(mem: Dict[str, Any]):
-    os.makedirs(os.path.dirname(CORE_MEMORY_FILE), exist_ok=True)
-    with open(CORE_MEMORY_FILE, "w") as f:
-        json.dump(mem, f, indent=2)
+def save_core_memory(mem: Dict[str, Any]) -> bool:
+    try:
+        os.makedirs(os.path.dirname(CORE_MEMORY_FILE), exist_ok=True)
+        with open(CORE_MEMORY_FILE, "w") as f:
+            json.dump(mem, f, indent=2)
+        return True
+    except (OSError, PermissionError) as exc:
+        import sys
+        print(f"Warning: Failed to save core memory: {exc}", file=sys.stderr)
+        return False
 
 
 def format_core_memory_context() -> str:

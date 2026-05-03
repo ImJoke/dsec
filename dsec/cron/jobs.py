@@ -60,7 +60,8 @@ def create_job(prompt: str, schedule: str, name: Optional[str] = None, deliver: 
     return job
 
 def list_jobs() -> List[Dict[str, Any]]:
-    return load_jobs()
+    with _jobs_lock:
+        return load_jobs()
 
 def remove_job(job_id: str) -> bool:
     with _jobs_lock:

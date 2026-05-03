@@ -7,6 +7,7 @@ inspired by Mem0 (hybrid storage) + Letta/MemGPT (agentic memory management).
 
 Anti-hallucination rules are hardcoded and never bypassed.
 """
+import difflib
 import hashlib
 import json
 import math
@@ -601,8 +602,6 @@ def _save_graph(graph: Dict[str, Any]) -> None:
             pass
         raise
 
-
-import difflib
 
 def _resolve_entity_key(graph: Dict[str, Any], entity: str) -> str:
     """Normalize entity key, with fuzzy matching for better entity resolution."""

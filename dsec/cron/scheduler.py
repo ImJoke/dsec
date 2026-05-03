@@ -71,7 +71,7 @@ def run_job(job: Dict[str, Any]):
         update_job(job["id"], {"status": "running", "last_run_at": datetime.now().isoformat()})
         
         # Execute
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         
         status = "ok" if result.returncode == 0 else "error"
         error_msg = result.stderr if result.returncode != 0 else None

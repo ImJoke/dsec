@@ -155,14 +155,18 @@ def provider_chat_stream(
 
         if stream_generator:
             got_done = False
-            for chunk in stream_generator:
-                if chunk.get("type") == "error":
-                    last_error = chunk.get("text", "Unknown error")
-                    yield {"type": "thinking", "text": f"[System] Provider '{current_provider}' failed: {last_error}"}
-                    break
-                yield chunk
-                if chunk.get("type") == "done":
-                    got_done = True
+            try:
+                for chunk in stream_generator:
+                    if chunk.get("type") == "error":
+                        last_error = chunk.get("text", "Unknown error")
+                        yield {"type": "thinking", "text": f"[System] Provider '{current_provider}' failed: {last_error}"}
+                        break
+                    yield chunk
+                    if chunk.get("type") == "done":
+                        got_done = True
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                yield {"type": "thinking", "text": f"[System] Provider '{current_provider}' crashed: {last_error}"}
 
             if got_done:
                 return

@@ -405,5 +405,8 @@ def save_turn(
     
     data["history"] = history
     data["message_count"] = data.get("message_count", 0) + 1
-    save_session(name, data)
+    try:
+        save_session(name, data)
+    except Exception:
+        return False
     return True

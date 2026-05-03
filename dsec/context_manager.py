@@ -173,8 +173,14 @@ class ContextManager:
         from dsec.llm_utils import llm_summarize
         
         raw_text = "\n".join([f"{t.role.upper()}: {t.content}" for t in old_turns])
-        summary = llm_summarize(raw_text, focus="HTB attack progress: preserve all credentials/hashes, IPs, current foothold, exact next step")
-        
+        try:
+            summary = llm_summarize(raw_text, focus="HTB attack progress: preserve all credentials/hashes, IPs, current foothold, exact next step")
+        except Exception as _sum_exc:
+            # Summarization failed — keep turns intact rather than losing history
+            from dsec.formatter import print_warning
+            print_warning(f"LLM summarization failed ({_sum_exc}), keeping full context.")
+            return f"(compression skipped: summarization failed)"
+
         summary_lines = [
             "[SESSION SUMMARY — RECON & EXPLOIT PROGRESS (LLM Generated)]",
             summary,
@@ -183,7 +189,7 @@ class ContextManager:
 
         self._compressed_block = "\n".join(summary_lines)
 
-        # Replace turns with only recent ones
+        # Replace turns with only recent ones — AFTER successful summary
         old_token_count = sum(t.tokens_estimate for t in old_turns)
         new_compressed_tokens = self.estimate_tokens(self._compressed_block)
 
@@ -257,7 +263,12 @@ class ContextManager:
             raw_text = "\n".join(
                 f"{t.role.upper()}: {t.content[:800]}" for t in discarded_turns
             )
-            summary_text = llm_summarize(raw_text, focus="HTB attack progress: preserve all credentials/hashes, IPs, current foothold, exact next step")
+            try:
+                summary_text = llm_summarize(raw_text, focus="HTB attack progress: preserve all credentials/hashes, IPs, current foothold, exact next step")
+            except Exception as _sum_exc:
+                from dsec.formatter import print_warning as _pw
+                _pw(f"LLM summarization failed in to_messages ({_sum_exc}), skipping summary.")
+                summary_text = "(summarization failed — some prior context may be missing)"
             self._compressed_block = summary_text
 
             messages.append({

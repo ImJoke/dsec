@@ -1511,6 +1511,9 @@ def _run_agentic_loop(
                                 _server_stop = True
                                 break
 
+                        thinking = ""
+                        new_content = None
+                        new_conv_id = None
                         try:
                             gen = chat_stream(
                                 message="Continue your analysis. Use <tool_call> blocks for your next step.",
@@ -1538,6 +1541,9 @@ def _run_agentic_loop(
                             print_warning("Agentic loop cancelled.")
                             autopilot.note_user_interrupt()
                             return current_conv_id
+                        except Exception as _retry_exc:
+                            print_warning(f"Server retry API call failed: {_retry_exc}")
+                            # Leave new_content=None so the while loop retries
 
                         if new_conv_id:
                             current_conv_id = new_conv_id
@@ -2375,6 +2381,9 @@ def _run_agentic_loop(
         # ── send follow-up to AI ──────────────────────────────────────────────
         print_info(f"Feeding results back to AI (agent loop iteration {iteration})…")
 
+        thinking = ""
+        new_content = None
+        new_conv_id = None
         try:
             gen = chat_stream(
                 message=follow_up,
@@ -2402,6 +2411,8 @@ def _run_agentic_loop(
             print_warning("Agentic loop cancelled.")
             autopilot.note_user_interrupt()
             return current_conv_id
+        except Exception as _followup_exc:
+            print_warning(f"Follow-up API call failed: {_followup_exc}")
 
         if new_conv_id:
             current_conv_id = new_conv_id
@@ -2437,6 +2448,9 @@ def _run_agentic_loop(
                             new_content = None  # force break below
                             break
 
+                    thinking = ""
+                    new_content = None
+                    new_conv_id = None
                     try:
                         gen = chat_stream(
                             message=follow_up,
@@ -2464,6 +2478,9 @@ def _run_agentic_loop(
                         print_warning("Agentic loop cancelled.")
                         autopilot.note_user_interrupt()
                         return current_conv_id
+                    except Exception as _followup_retry_exc:
+                        print_warning(f"Follow-up retry API call failed: {_followup_retry_exc}")
+                        # Leave new_content=None so the while loop retries
 
                     if new_conv_id:
                         current_conv_id = new_conv_id

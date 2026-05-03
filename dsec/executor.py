@@ -226,8 +226,8 @@ class CommandRunner:
                 except (OSError, ValueError) as e:
                     exception_holder["err"] = e
 
-            t_out = threading.Thread(target=_read_stdout, daemon=False)
-            t_err = threading.Thread(target=_read_stderr, daemon=False)
+            t_out = threading.Thread(target=_read_stdout, daemon=True)
+            t_err = threading.Thread(target=_read_stderr, daemon=True)
             t_out.start()
             t_err.start()
 
