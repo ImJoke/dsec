@@ -98,6 +98,7 @@ def _ensure_native_tools_loaded():
         import dsec.skills.programmer   # noqa: F401
         import dsec.skills.persistence  # noqa: F401
         import dsec.tools.payload_tools # noqa: F401
+        import dsec.tools.knowledge_tools # noqa: F401
     except ImportError:
         pass
     try:

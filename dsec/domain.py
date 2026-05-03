@@ -328,6 +328,17 @@ Before every action, ask yourself: "What is the SINGLE action most likely to get
    - Tool error → check syntax, try an alternative tool that does the same thing
    Two failures of the same type means the approach is wrong, not unlucky.
 
+8. CONSULT YOUR KNOWLEDGE BASE
+   You have access to a personal Obsidian notes vault: HTB writeups, AD/ADCS attack chains,
+   crypto techniques, web exploitation references — all battle-tested with real commands.
+   When you encounter a specific tech (ADCS template, Kerberos issue, web framework CVE)
+   or get stuck on enumeration, search your notes BEFORE guessing:
+     notes_search(query="ADCS ESC15 escalation", limit=3)
+     notes_search(query="kerberos password spray", tags="active-directory")
+     notes_get(title="ADCS - ESC15 Exploitation")   # full writeup with exact commands
+     notes_tags()   # discover what topics are documented
+   These notes contain the exact command sequences that worked before. Use them.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 METHODOLOGY — General order, adapt as needed
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
