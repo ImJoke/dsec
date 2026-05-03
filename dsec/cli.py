@@ -1351,7 +1351,8 @@ def _run_agentic_loop(
     _NO_TOOL_STREAK_LIMIT = 12
     _NO_TOOL_ERROR_STREAK_LIMIT = 6   # AI-caused no-tool limit (not server errors)
     _NO_TOOL_REPEAT_LIMIT = 5
-    _SERVER_ERROR_RETRY_LIMIT = 10    # transient server errors before giving up
+    _SERVER_ERROR_RETRY_LIMIT = 15    # transient server errors before cooldown+retry
+    _server_cooldown_used = False     # only allow one extended cooldown per loop
 
     # Patterns in tool output that indicate a technique conceptually failed
     # even when exit code is 0. Maps output substring → technique category key.
@@ -1481,9 +1482,19 @@ def _run_agentic_loop(
                     _time.sleep(_backoff)
 
                     if _server_error_streak >= _SERVER_ERROR_RETRY_LIMIT:
+                        if not _server_cooldown_used:
+                            _server_cooldown_used = True
+                            print_warning(
+                                f"Server unavailable after {_server_error_streak} retries. "
+                                "Waiting 120s for recovery…"
+                            )
+                            _time.sleep(120)
+                            _server_error_streak = _SERVER_ERROR_RETRY_LIMIT - 5
+                            print_info("Resuming after extended cooldown.")
+                            continue
                         stop_reason = (
-                            f"server unavailable after {_server_error_streak} consecutive retries; "
-                            "giving up to avoid infinite wait"
+                            f"server unavailable after {_server_error_streak} retries + extended cooldown; "
+                            "giving up"
                         )
                         print_warning("Server unavailable for too long; stopping agentic loop.")
                         autopilot.record_tool_result("__agentic_loop__", f"[error: {stop_reason}]")
@@ -2074,6 +2085,14 @@ def _run_agentic_loop(
                         _flag_like = _re.search(r"[0-9a-f]{32}", result_text)
                         if _flag_like:
                             _flags_found = True
+
+                    # 4. Credential discovery nudge — remind to spray
+                    if _re.search(r"(?i)(?:password|passwd|pwd)\s*[:=]\s*\S+", result_text):
+                        result_text += (
+                            "\n\n[SYSTEM] Credential detected in output! IMMEDIATELY test this credential "
+                            "against ALL open services (SMB, WinRM, SSH, LDAP, MSSQL) using nxc. "
+                            "Also try it for all known users — password reuse is common."
+                        )
 
                     # Collapse repeated identical lines (e.g. SQL client spamming the same error
                     # when a heredoc EOF delimiter is fed as input to an interactive program).
