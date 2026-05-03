@@ -221,7 +221,7 @@ class BrowserManager:
         # Fetch and scan external scripts
         for src_url in result.get("external", [])[:20]:
             try:
-                resp = await self.page.evaluate(f"fetch('{src_url}').then(r => r.text())")
+                resp = await self.page.evaluate("(url) => fetch(url).then(r => r.text())", src_url)
                 if resp and len(resp) < 500000:
                     for pattern in endpoint_patterns:
                         for match in pattern.finditer(resp):

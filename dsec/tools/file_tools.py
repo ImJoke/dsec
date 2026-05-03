@@ -9,6 +9,7 @@ Tools:
   read_file   — read a file (for verification before editing)
   patch_file  — targeted find-and-replace in an existing file
 """
+import difflib
 import os
 from pathlib import Path
 from typing import Optional
@@ -74,11 +75,36 @@ def write_file(path: str, content: str, mode: str = "write") -> str:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         write_mode = "a" if mode == "append" else "w"
-        p.write_text(content, encoding="utf-8") if write_mode == "w" else open(p, "a", encoding="utf-8").write(content)
+        old_content = ""
+        if p.exists() and write_mode == "w":
+            try:
+                old_content = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        if write_mode == "w":
+            p.write_text(content, encoding="utf-8")
+        else:
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(content)
         size = p.stat().st_size
         lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
         action = "Appended to" if mode == "append" else "Wrote"
-        return f"[{action} '{p}' — {size} bytes, {lines} lines]"
+        result = f"[{action} '{p}' — {size} bytes, {lines} lines]"
+        # Append unified diff summary for overwrite operations
+        if old_content and write_mode == "w":
+            diff_lines = list(difflib.unified_diff(
+                old_content.splitlines(keepends=True),
+                content.splitlines(keepends=True),
+                fromfile="before",
+                tofile="after",
+                n=2,
+            ))
+            if diff_lines:
+                diff_str = "".join(diff_lines[:40])
+                if len(diff_lines) > 40:
+                    diff_str += f"\n... [{len(diff_lines) - 40} more diff lines]"
+                result += f"\n\nDiff:\n{diff_str}"
+        return result
     except OSError as e:
         return f"[error writing '{path}': {e}]"
 
@@ -161,8 +187,8 @@ def patch_file(
         return "[error: 'new_string' is required]"
 
     try:
-        p = Path(path).expanduser().resolve()
-    except Exception as e:
+        p = _safe_path(path)
+    except ValueError as e:
         return f"[error: {e}]"
 
     if not p.exists():
@@ -200,4 +226,18 @@ def patch_file(
         return f"[error writing '{path}': {e}]"
 
     size = p.stat().st_size
-    return f"[Patched '{p}' — replaced {n_replaced} occurrence(s), {size} bytes total]"
+    # Include a compact diff to confirm the change
+    diff_lines = list(difflib.unified_diff(
+        original.splitlines(keepends=True),
+        modified.splitlines(keepends=True),
+        fromfile="before",
+        tofile="after",
+        n=1,
+    ))
+    diff_str = ""
+    if diff_lines:
+        diff_str = "".join(diff_lines[:30])
+        if len(diff_lines) > 30:
+            diff_str += f"\n... [{len(diff_lines) - 30} more diff lines]"
+        diff_str = f"\n\nDiff:\n{diff_str}"
+    return f"[Patched '{p}' — replaced {n_replaced} occurrence(s), {size} bytes total]{diff_str}"

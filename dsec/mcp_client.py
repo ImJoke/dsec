@@ -22,6 +22,7 @@ Usage::
 """
 from __future__ import annotations
 
+import itertools
 import json
 import sys
 import os
@@ -140,8 +141,10 @@ class MCPServer:
         self._extra_env = env or {}
         self._proc: Optional[subprocess.Popen] = None  # type: ignore[type-arg]
         self._tools: List[Dict[str, Any]] = []
-        self._req_id = 0
+        self._req_id_gen = itertools.count(1)
         self._lock = threading.Lock()
+        self._stderr_thread: Optional[threading.Thread] = None
+        self._stderr_buf: list[str] = []
 
     # ── state ─────────────────────────────────────────────────────────────────
 
@@ -175,30 +178,45 @@ class MCPServer:
         except Exception:  # noqa: BLE001
             return False
 
-        # MCP initialise
-        self._req_id += 1
-        try:
-            _send(self._proc, "initialize", {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "dsec", "version": "1.0"},
-            }, self._req_id)
-            resp = _read_response(self._proc, self._req_id, timeout=timeout)
-        except Exception:  # noqa: BLE001
-            self.disconnect()
-            return False
+        # Drain stderr in background to prevent pipe buffer deadlock
+        self._stderr_buf = []
+        def _drain_stderr(proc: subprocess.Popen) -> None:  # type: ignore[type-arg]
+            try:
+                assert proc.stderr is not None
+                for line in proc.stderr:
+                    self._stderr_buf.append(line.rstrip("\n"))
+                    if len(self._stderr_buf) > 200:
+                        self._stderr_buf = self._stderr_buf[-100:]
+            except (ValueError, OSError):
+                pass
+        self._stderr_thread = threading.Thread(target=_drain_stderr, args=(self._proc,), daemon=True)
+        self._stderr_thread.start()
 
-        if not resp or "result" not in resp:
-            self.disconnect()
-            return False
+        # MCP initialise — all I/O under the lock
+        with self._lock:
+            req_id = next(self._req_id_gen)
+            try:
+                _send(self._proc, "initialize", {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "dsec", "version": "1.0"},
+                }, req_id)
+                resp = _read_response(self._proc, req_id, timeout=timeout)
+            except Exception:  # noqa: BLE001
+                self.disconnect()
+                return False
 
-        # Acknowledge
-        try:
-            _notify(self._proc, "notifications/initialized", {})
-        except Exception:  # noqa: BLE001
-            pass
+            if not resp or "result" not in resp:
+                self.disconnect()
+                return False
 
-        # Discover tools
+            # Acknowledge
+            try:
+                _notify(self._proc, "notifications/initialized", {})
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Discover tools (acquires lock internally)
         self._refresh_tools(timeout=timeout)
         return True
 
@@ -214,6 +232,12 @@ class MCPServer:
             except Exception:  # noqa: BLE001
                 pass
             finally:
+                for pipe in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
+                    if pipe:
+                        try:
+                            pipe.close()
+                        except Exception:  # noqa: BLE001
+                            pass
                 self._proc = None
         self._tools = []
 
@@ -222,14 +246,15 @@ class MCPServer:
     def _refresh_tools(self, timeout: float = 10.0) -> None:
         if not self._proc:
             return
-        self._req_id += 1
-        try:
-            _send(self._proc, "tools/list", {}, self._req_id)
-            resp = _read_response(self._proc, self._req_id, timeout=timeout)
-        except Exception:  # noqa: BLE001
-            return
-        if resp and "result" in resp:
-            self._tools = resp["result"].get("tools", [])
+        with self._lock:
+            req_id = next(self._req_id_gen)
+            try:
+                _send(self._proc, "tools/list", {}, req_id)
+                resp = _read_response(self._proc, req_id, timeout=timeout)
+            except Exception:  # noqa: BLE001
+                return
+            if resp and "result" in resp:
+                self._tools = resp["result"].get("tools", [])
 
     def list_tools(self) -> List[Dict[str, Any]]:
         return list(self._tools)
@@ -244,14 +269,42 @@ class MCPServer:
         if not self.connected:
             raise RuntimeError(f"MCP server '{self.name}' is not connected.")
 
+        # Pre-validate arguments against the stored tool schema before hitting the wire.
+        # This catches missing required params and type mismatches (e.g. int where bool
+        # is expected) locally, producing a clear error rather than an opaque -32602.
+        params = dict(params or {})
+        for tool in self._tools:
+            if tool.get("name") == tool_name:
+                schema = tool.get("inputSchema", {})
+                required = schema.get("required", [])
+                props = schema.get("properties", {})
+
+                missing = [r for r in required if r not in params]
+                if missing:
+                    sig = ", ".join(
+                        f"{k}: {v.get('type', 'any')}" for k, v in props.items()
+                    )
+                    raise ValueError(
+                        f"Missing required parameter(s) {missing} for '{tool_name}'. "
+                        f"Signature: {tool_name}({sig})"
+                    )
+
+                # Coerce integer → boolean for params declared as boolean in the schema.
+                # Models frequently pass count=10 instead of count=true.
+                for pname, pschema in props.items():
+                    if pschema.get("type") == "boolean" and pname in params:
+                        val = params[pname]
+                        if isinstance(val, int) and not isinstance(val, bool):
+                            params[pname] = bool(val)
+                break
+
         assert self._proc is not None
 
         with self._lock:
-            self._req_id += 1
-            req_id = self._req_id
+            req_id = next(self._req_id_gen)
             _send(self._proc, "tools/call", {
                 "name": tool_name,
-                "arguments": params or {},
+                "arguments": params,
             }, req_id)
             resp = _read_response(self._proc, req_id, timeout=timeout)
 
@@ -312,6 +365,11 @@ class MCPManager:
 
         if name in self._servers and self._servers[name].connected:
             return True
+
+        # Clean up old dead server before creating a new one
+        old = self._servers.pop(name, None)
+        if old:
+            old.disconnect()
 
         defn = self._defs[name]
         srv = MCPServer(
@@ -397,6 +455,7 @@ class MCPManager:
             "args": args or [],
             "env": env or {},
         }
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(raw, indent=2))
         self._defs[name] = raw["mcp_servers"][name]
 

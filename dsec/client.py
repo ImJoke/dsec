@@ -66,8 +66,8 @@ def _deepseek_chat_stream(
     # Use history if provided, otherwise default to current message
     if history:
         messages = list(history)
-        # Append current message if it's not already in history
-        if not messages or messages[-1].get("content") != message:
+        last = messages[-1] if messages else None
+        if not last or last.get("role") != "user" or last.get("content") != message:
             messages.append({"role": "user", "content": message})
     else:
         messages = [{"role": "user", "content": message}]
@@ -169,17 +169,20 @@ def _deepseek_chat_stream(
                     if content:
                         # Fallback parser if the API proxy fails to separate reasoning_content
                         if "<think>" in content:
+                            before, after = content.split("<think>", 1)
+                            if before and not in_think_block:
+                                yield {"type": "content", "text": before}
                             in_think_block = True
-                            content = content.replace("<think>", "")
-                        
+                            content = after
+
                         if "</think>" in content:
                             in_think_block = False
-                            parts = content.split("</think>")
+                            parts = content.split("</think>", 1)
                             if parts[0]:
                                 yield {"type": "thinking", "text": parts[0]}
                             if len(parts) > 1 and parts[1]:
                                 yield {"type": "content", "text": parts[1]}
-                        else:
+                        elif content:
                             if in_think_block:
                                 yield {"type": "thinking", "text": content}
                             else:

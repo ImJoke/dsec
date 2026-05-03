@@ -46,6 +46,7 @@ _SLASH_COMMANDS: List[str] = [
     "/autoexec",
     "/clear",
     "/session",
+    "/sessions",
     "/status",
     "/note",
     "/domain",
@@ -173,7 +174,23 @@ if _PROMPT_TOOLKIT_AVAILABLE:
                 yield from _completions_for(skills, word)
                 return
 
-            if text.lstrip().startswith("/mode"):
+            # Extract the command word to avoid prefix collisions
+            # (e.g. "/mode" vs "/model", "/session" vs "/sessions")
+            cmd = text.split()[0].lower() if text.split() else ""
+
+            if cmd == "/model":
+                parts = text.split()
+                if len(parts) == 1 and not text.endswith(" "):
+                    for c in _KNOWN_MODELS:
+                        yield Completion(" " + c, start_position=0)
+                    return
+                word = parts[-1] if len(parts) > 1 and not text.endswith(" ") else ""
+                if word.startswith("/"):
+                    word = ""
+                yield from _completions_for(_KNOWN_MODELS, word)
+                return
+
+            if cmd == "/mode":
                 parts = text.split()
                 modes = ["architect", "recon", "exploit", "ask", "auto"]
                 if len(parts) == 1 and not text.endswith(" "):
@@ -186,7 +203,7 @@ if _PROMPT_TOOLKIT_AVAILABLE:
                 yield from _completions_for(modes, word)
                 return
 
-            if text.lstrip().startswith("/personality"):
+            if cmd == "/personality":
                 parts = text.split()
                 pers = ["professional", "hacker", "teacher"]
                 if len(parts) == 1 and not text.endswith(" "):
@@ -199,17 +216,28 @@ if _PROMPT_TOOLKIT_AVAILABLE:
                 yield from _completions_for(pers, word)
                 return
 
-            if text.lstrip().startswith("/model"):
+            if cmd == "/history":
                 parts = text.split()
                 if len(parts) == 1 and not text.endswith(" "):
-                    # No space yet — prefix completions with a space
-                    for c in _KNOWN_MODELS:
+                    for c in ("search",):
                         yield Completion(" " + c, start_position=0)
                     return
                 word = parts[-1] if len(parts) > 1 and not text.endswith(" ") else ""
                 if word.startswith("/"):
                     word = ""
-                yield from _completions_for(_KNOWN_MODELS, word)
+                yield from _completions_for(["search"], word)
+                return
+
+            if cmd == "/session":
+                parts = text.split()
+                if len(parts) == 1 and not text.endswith(" "):
+                    for c in ("audit",):
+                        yield Completion(" " + c, start_position=0)
+                    return
+                word = parts[-1] if len(parts) > 1 and not text.endswith(" ") else ""
+                if word.startswith("/"):
+                    word = ""
+                yield from _completions_for(["audit"], word)
                 return
 
             stripped = text.lstrip()
@@ -345,6 +373,42 @@ def build_prompt_session(state: Dict[str, Any]) -> Optional["PromptSession"]:  #
     @kb.add("enter")
     def _smart_enter(event: Any) -> None:  # noqa: ANN001
         event.current_buffer.validate_and_handle()
+
+    # ── Ctrl+E: open $EDITOR for multiline editing ───────────────────────────
+    @kb.add("c-e")
+    def _open_editor(event: Any) -> None:  # noqa: ANN001
+        import os
+        import subprocess
+        import tempfile
+        buf = event.current_buffer
+        current_text = buf.text
+        editor = os.environ.get("EDITOR", os.environ.get("VISUAL", "vi"))
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", prefix="dsec_msg_",
+            encoding="utf-8", delete=False
+        ) as f:
+            f.write(current_text)
+            tmpfile = f.name
+        try:
+            # Temporarily suspend prompt_toolkit's input processing
+            with event.app.input.detach():
+                subprocess.call([editor, tmpfile])
+            with open(tmpfile, encoding="utf-8", errors="replace") as f:
+                new_text = f.read()
+            # Replace buffer contents with edited text (strip trailing newline)
+            buf.set_document(
+                buf.document.__class__(
+                    text=new_text.rstrip("\n"),
+                    cursor_position=len(new_text.rstrip("\n")),
+                )
+            )
+        except Exception:
+            pass
+        finally:
+            try:
+                os.unlink(tmpfile)
+            except OSError:
+                pass
 
     # ── Ctrl+Enter / Ctrl+J / Alt+Enter: explicit submit ─────────────────────
     @kb.add("c-j")

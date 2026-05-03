@@ -9,31 +9,31 @@ from typing import Optional, List, Dict
     description="Generate common security payloads (reverse shells, file transfers, etc.) based on target OS and language."
 )
 def dsec_generate_payload(
-    type: str, 
-    lhost: str, 
-    lport: int, 
-    os: str = "linux", 
+    type: str,
+    lhost: str,
+    lport: int,
+    target_os: str = "linux",
     language: Optional[str] = None
 ) -> str:
     """
     Generate payloads for various scenarios.
     type: reverse_shell, bind_shell, file_transfer
-    os: linux, windows
+    target_os: linux, windows
     language: bash, python, php, perl, powershell, nc, socat
     """
     type = type.lower()
-    os = os.long().lower() if hasattr(os, "long") else os.lower()
-    
+    target_os = target_os.strip().lower()
+
     if type == "reverse_shell":
-        payloads = _get_reverse_shells(lhost, lport, os, language)
+        payloads = _get_reverse_shells(lhost, lport, target_os, language)
     elif type == "bind_shell":
-        payloads = _get_bind_shells(lport, os, language)
+        payloads = _get_bind_shells(lport, target_os, language)
     else:
         return f"Unknown payload type: {type}. Supported: reverse_shell, bind_shell"
-    
+
     if not payloads:
-        return f"No payloads found for {os}/{language}."
-        
+        return f"No payloads found for {target_os}/{language}."
+
     lines = [f"Generated Payloads ({type}):"]
     for lang, cmd in payloads.items():
         lines.append(f"\n[{lang.upper()}]")

@@ -260,7 +260,8 @@ def gtfobins_search(binary: str) -> str:
     if matches:
         lines = [f"No exact match for '{binary}'. Similar binaries:"]
         for m in matches[:5]:
-            cats = ", ".join(_GTFOBINS_DB[m].keys())
+            db = _GTFOBINS_DB if m in _GTFOBINS_DB else _LOLBAS_DB
+            cats = ", ".join(db[m].keys())
             lines.append(f"  • {m} ({cats})")
         return "\n".join(lines)
     

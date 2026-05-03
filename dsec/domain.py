@@ -494,7 +494,7 @@ Output format:
 ## 🧪 Testing Strategy
 
 CRITICAL MEMORY RULE: Memory context provides historical constraints or project rules. Always adhere to project-wide conventions stored in memory.""",
-    "research_sources": ["github", "stack_overflow", "official_docs"],
+    "research_sources": ["github_advisories", "nvd", "exploitdb"],
     "auto_research_triggers": ["error", "exception", "framework", "library", "syntax"],
 }
 
@@ -674,26 +674,47 @@ _PERSONALITY_PROMPTS = {
 
 def get_system_prompt(domain_name: str, *, exec_enabled: bool = True, user_input: str = "", mode: str = "auto", personality: str = "professional") -> str:
     from dsec.skills.loader import auto_select_skills, format_skills_context
-    
+
     base = get_domain(domain_name)["system_prompt"]
     parts = [base]
-    
+
     # Inject mode
     mode_str = _MODE_PROMPTS.get(mode, "")
     if mode_str:
         parts.append(f"\n[MODE CONSTRAINT]\n{mode_str}")
-        
+
     # Inject personality
     pers_str = _PERSONALITY_PROMPTS.get(personality, "")
     if pers_str:
         parts.append(f"\n[PERSONALITY]\n{pers_str}")
-    
+
+    # Inject scope (targets and exclusions from /scope command)
+    try:
+        from dsec.scope import get_scope
+        scope_cfg = get_scope()
+        in_scope = scope_cfg.get("in_scope", [])
+        out_of_scope = scope_cfg.get("out_of_scope", [])
+        if in_scope or out_of_scope:
+            scope_lines = ["[ENGAGEMENT SCOPE — HARDCODED, DO NOT DEVIATE]"]
+            if in_scope:
+                scope_lines.append("IN SCOPE (only these targets are authorized):")
+                for t in in_scope:
+                    scope_lines.append(f"  ✅ {t}")
+            if out_of_scope:
+                scope_lines.append("OUT OF SCOPE (never touch):")
+                for t in out_of_scope:
+                    scope_lines.append(f"  ❌ {t}")
+            scope_lines.append("Before every tool call, verify the target is IN SCOPE. Abort if not.")
+            parts.append("\n".join(scope_lines))
+    except Exception:
+        pass
+
     # Inject skills
     active_skills = auto_select_skills(domain_name, user_input)
     skills_context = format_skills_context(active_skills)
     if skills_context:
         parts.append(skills_context)
-        
+
     # Inject dynamic native tools list
     from dsec.core.registry import build_tools_system_prompt
     dynamic_tools = build_tools_system_prompt()
@@ -703,10 +724,10 @@ def get_system_prompt(domain_name: str, *, exec_enabled: bool = True, user_input
     # Inject execution block
     if exec_enabled and mode != "architect" and mode != "ask":
         parts.append(_EXEC_BLOCK)
-        
+
     # Inject memory guidance
     parts.append(_MEMORY_GUIDANCE)
-        
+
     return "\n\n".join(parts)
 
 

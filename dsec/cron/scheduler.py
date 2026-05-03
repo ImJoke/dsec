@@ -100,7 +100,9 @@ def tick():
     for job in jobs:
         if not job.get("enabled", True):
             continue
-            
+        if job.get("status") == "running":
+            continue
+
         next_run_str = job.get("next_run_at")
         if not next_run_str:
             # Initialize next_run_at if missing

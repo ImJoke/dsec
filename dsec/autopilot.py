@@ -69,7 +69,7 @@ class AutopilotBugFinder:
             self._tool_failures[tool_name] = self._tool_failures.get(tool_name, 0) + 1
             self._signals.append(f"{tool_name}: timeout or cancellation")
             self._evidence.append(f"{tool_name}: {result_text[:240]}")
-        elif text.startswith("[error:") or "[error:" in text or "failed" in text:
+        elif text.startswith("[error:") or "[error:" in text:
             self._tool_failures[tool_name] = self._tool_failures.get(tool_name, 0) + 1
             self._signals.append(f"{tool_name}: error result")
             self._evidence.append(f"{tool_name}: {result_text[:240]}")
@@ -84,8 +84,6 @@ class AutopilotBugFinder:
         if new_content is None:
             return True
         if not loop_ended_normally and self._tool_failures:
-            return True
-        if self._tool_failures and loop_ended_normally:
             return True
         return False
 

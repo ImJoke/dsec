@@ -12,13 +12,15 @@ _OUT_OF_SCOPE: List[str] = []
 
 def add_in_scope(target: str):
     """Add a target to the in-scope list."""
-    if target and target not in _IN_SCOPE:
-        _IN_SCOPE.append(target.strip().lower())
+    normalized = target.strip().lower() if target else ""
+    if normalized and normalized not in _IN_SCOPE:
+        _IN_SCOPE.append(normalized)
 
 def add_out_of_scope(target: str):
     """Add a target to the out-of-scope list."""
-    if target and target not in _OUT_OF_SCOPE:
-        _OUT_OF_SCOPE.append(target.strip().lower())
+    normalized = target.strip().lower() if target else ""
+    if normalized and normalized not in _OUT_OF_SCOPE:
+        _OUT_OF_SCOPE.append(normalized)
 
 def clear_scope():
     """Clear all scope definitions."""
@@ -43,11 +45,12 @@ def _is_match(target: str, pattern: str) -> bool:
         if target == base_domain or target.endswith("." + base_domain):
             return True
 
-    # CIDR match
+    # CIDR match — strip port from target (e.g. "10.10.10.5:8080" → "10.10.10.5")
     if "/" in pattern:
         try:
             net = ipaddress.ip_network(pattern, strict=False)
-            ip = ipaddress.ip_address(target)
+            ip_str = target.rsplit(":", 1)[0] if ":" in target and "." in target else target
+            ip = ipaddress.ip_address(ip_str)
             return ip in net
         except ValueError:
             pass

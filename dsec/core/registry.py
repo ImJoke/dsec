@@ -19,20 +19,27 @@ def register(name: str, description: str):
         for param_name, param in sig.parameters.items():
             if param_name == "self":
                 continue
-                
+            if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                continue
+
             param_type = "string"
-            if param.annotation is int:
+            ann = param.annotation
+            if ann is int:
                 param_type = "integer"
-            elif param.annotation is bool:
+            elif ann is bool:
                 param_type = "boolean"
-            elif param.annotation is float:
+            elif ann is float:
                 param_type = "number"
-                
+            elif ann is list or getattr(ann, "__origin__", None) is list:
+                param_type = "array"
+            elif ann is dict or getattr(ann, "__origin__", None) is dict:
+                param_type = "object"
+
             properties[param_name] = {
                 "type": param_type,
                 "description": f"Parameter {param_name}"
             }
-            
+
             if param.default is inspect.Parameter.empty:
                 required.append(param_name)
                 

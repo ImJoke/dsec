@@ -12,13 +12,28 @@ Inspired by: Aider, RooCode
 import difflib
 import os
 import re
+from pathlib import Path
 from typing import List, Optional
 
 from dsec.core.registry import register
 
 
+def _safe_path(path: str) -> str:
+    """Resolve path, refuse access outside $HOME and /tmp."""
+    p = Path(path).expanduser().resolve()
+    home = Path.home().resolve()
+    _tmp_real = Path("/tmp").resolve()
+    if not (str(p).startswith(str(home)) or str(p).startswith("/tmp") or str(p).startswith(str(_tmp_real))):
+        raise ValueError(f"Path '{p}' is outside $HOME and /tmp — access denied for safety.")
+    return str(p)
+
+
 @register("programmer_view_file", "Views the content of a local file with line numbers.")
 def programmer_view_file(filepath: str, start_line: int = 0, end_line: int = 0) -> str:
+    try:
+        filepath = _safe_path(filepath)
+    except ValueError as e:
+        return str(e)
     if not os.path.exists(filepath):
         return f"File not found: {filepath}"
     try:
@@ -56,6 +71,10 @@ def programmer_view_file(filepath: str, start_line: int = 0, end_line: int = 0) 
 
 @register("programmer_edit_file", "Edits a file by replacing an exact old block of code with a new block (Aider SEARCH/REPLACE style).")
 def programmer_edit_file(filepath: str, old_content: str, new_content: str) -> str:
+    try:
+        filepath = _safe_path(filepath)
+    except ValueError as e:
+        return str(e)
     if not os.path.exists(filepath):
         return f"File not found: {filepath}"
     try:
@@ -106,6 +125,10 @@ def programmer_create_file(filepath: str = "", content: str = "", **kwargs) -> s
     content = content or kwargs.get("text", "") or kwargs.get("file_content", "") or kwargs.get("body", "")
     if not filepath:
         return "[error: programmer_create_file requires 'filepath' (or 'path') parameter]"
+    try:
+        filepath = _safe_path(filepath)
+    except ValueError as e:
+        return str(e)
     if content is None:
         content = ""
     try:
@@ -192,6 +215,10 @@ def programmer_search(pattern: str, directory: str = ".", file_glob: str = "*", 
 
 @register("programmer_diff", "Generates a unified diff between two files or between old/new content.")
 def programmer_diff(filepath: str, new_content: str = "") -> str:
+    try:
+        filepath = _safe_path(filepath)
+    except ValueError as e:
+        return str(e)
     if not os.path.exists(filepath):
         return f"File not found: {filepath}"
     try:

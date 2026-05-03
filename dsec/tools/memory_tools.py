@@ -73,8 +73,15 @@ def format_core_memory_context() -> str:
 _VALID_BLOCKS = ["persona", "human", "project", "scratchpad"]
 
 
+_MAX_BLOCK_SIZE = 8000
+
 def _scan_content(content: str) -> str:
     """Security Injection Protection for memory blocks."""
+    import re
+    import unicodedata
+    # Normalize unicode to strip zero-width chars and confusables
+    normalized = unicodedata.normalize("NFKD", content)
+    cl = re.sub(r"[\s​‌‍﻿]+", " ", normalized).lower().strip()
     forbidden = [
         "ignore all previous instructions",
         "ignore previous instructions",
@@ -83,11 +90,14 @@ def _scan_content(content: str) -> str:
         "forget all rules",
         "disregard previous",
         "bypass rules",
+        "override instructions",
+        "new system prompt",
+        "act as if",
+        "pretend you are",
     ]
-    cl = content.lower()
     for f in forbidden:
         if f in cl:
-            return f"[SECURITY_BLOCK] Rejected memory write: detected potential prompt injection pattern '{f}'"
+            return f"[SECURITY_BLOCK] Rejected memory write: detected potential prompt injection pattern"
     return ""
 
 
@@ -99,7 +109,10 @@ def core_memory_append(block: str, content: str) -> str:
     if err: return err
     
     mem = load_core_memory()
-    mem[block] = (mem.get(block, "") + "\n" + content).strip()
+    new_val = (mem.get(block, "") + "\n" + content).strip()
+    if len(new_val) > _MAX_BLOCK_SIZE:
+        return f"Error: appending would exceed {_MAX_BLOCK_SIZE} char limit for block '{block}' (current: {len(mem.get(block, ''))}, adding: {len(content)}). Use core_memory_replace to trim first."
+    mem[block] = new_val
     save_core_memory(mem)
     return f"Appended to core memory block '{block}'. Current length: {len(mem[block])} chars."
 
@@ -111,6 +124,8 @@ def core_memory_replace(block: str, new_content: str) -> str:
     err = _scan_content(new_content)
     if err: return err
         
+    if len(new_content) > _MAX_BLOCK_SIZE:
+        return f"Error: content exceeds {_MAX_BLOCK_SIZE} char limit ({len(new_content)} chars). Trim before writing."
     mem = load_core_memory()
     old_len = len(mem.get(block, ""))
     mem[block] = new_content

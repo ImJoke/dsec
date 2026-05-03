@@ -51,6 +51,10 @@ def _write_config(config: Dict[str, Any]) -> None:
     with open(CONFIG_FILE, "w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2)
         handle.write("\n")
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except OSError:
+        pass
 
 
 def _read_extra_keys() -> Dict[str, Any]:
@@ -297,6 +301,7 @@ def add_tokens(token_string: str) -> int:
         config["current_token_index"] %= len(existing)
     extras = _read_extra_keys()
     _write_config({**extras, **config})
+    _invalidate_cache()
     return added
 
 

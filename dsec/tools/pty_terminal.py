@@ -276,7 +276,7 @@ def _clean_exec_output(raw: str, command: str) -> str:
             continue
         # Skip trailing prompt lines
         is_prompt = any(pat.strip() in line_clean for pat in _PROMPT_PATTERNS if pat.strip())
-        if is_prompt and line_clean.endswith(">") or line_clean.endswith("$") or line_clean.endswith("# "):
+        if is_prompt and (line_clean.endswith(">") or line_clean.endswith("$") or line_clean.endswith("# ")):
             break
         result_lines.append(line)
 

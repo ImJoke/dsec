@@ -144,9 +144,30 @@ def repair_json(raw: str) -> str:
     # Remove trailing commas
     fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
 
-    # Fix missing closing braces/brackets
-    open_curly = fixed.count('{') - fixed.count('}')
-    open_bracket = fixed.count('[') - fixed.count(']')
+    # Fix missing closing braces/brackets (string-aware count)
+    open_curly = 0
+    open_bracket = 0
+    _in_str = False
+    _esc = False
+    for _ch in fixed:
+        if _esc:
+            _esc = False
+            continue
+        if _ch == '\\' and _in_str:
+            _esc = True
+            continue
+        if _ch == '"':
+            _in_str = not _in_str
+            continue
+        if not _in_str:
+            if _ch == '{':
+                open_curly += 1
+            elif _ch == '}':
+                open_curly -= 1
+            elif _ch == '[':
+                open_bracket += 1
+            elif _ch == ']':
+                open_bracket -= 1
 
     if open_curly > 0:
         fixed += '}' * open_curly

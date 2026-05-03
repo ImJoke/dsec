@@ -92,6 +92,7 @@ def _ensure_native_tools_loaded():
         import dsec.tools.pty_terminal  # noqa: F401
         import dsec.tools.gtfobins      # noqa: F401
         import dsec.tools.skill_manager # noqa: F401
+        import dsec.tools.skill_tools   # noqa: F401
         import dsec.tools.cron_tools    # noqa: F401
         import dsec.tools.file_tools    # noqa: F401
         import dsec.skills.programmer   # noqa: F401
@@ -107,11 +108,13 @@ from .session import (
     add_history_entry,
     add_note,
     add_tags,
+    append_audit_log,
     create_session,
     delete_session,
     get_current_session_name,
     increment_message_count,
     list_sessions,
+    load_audit_log,
     load_last_session,
     load_session,
     rename_session,
@@ -452,6 +455,7 @@ _XML_INVOKE_RE = _re.compile(r'<invoke\s+name=["\']?([^"\'\s>]+)["\']?>(.*?)</in
 _XML_PARAMETER_RE = _re.compile(r'<parameter\s+name=["\']?([^"\'\s>]+)["\']?[^>]*>(.*?)</parameter>', _re.DOTALL | _re.IGNORECASE)
 _BROKEN_TOOL_CALL_LINE_RE = _re.compile(r"^\s*<?tool_call>\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s+(.+?)\s*(?:</tool_call>)?\s*$", _re.IGNORECASE)
 _LEGACY_BASH_LINE_RE = _re.compile(r"(?im)^\s*(?:bash|sh|shell)\s*>\s*(.+?)\s*$")
+_NC_MACOS_RE = _re.compile(r'\bnc\s+-[a-zA-Z]*(?:l)[a-zA-Z]*v?n?p?\s+(\d+)')
 _NAME_FIELD_RE = _re.compile(r'"(?:name|tool)"\s*:\s*"([^"]+)"', _re.IGNORECASE)
 _COMMAND_FIELD_RE = _re.compile(r'"command"\s*:\s*"((?:\\\\.|[^"\\\\])*)"', _re.DOTALL | _re.IGNORECASE)
 _PLAIN_COMMAND_LINE_RE = _re.compile(r"^\s*(?:\$\s*)?([a-zA-Z0-9_./-][^`]*)$")
@@ -1185,14 +1189,21 @@ def _detect_format_issues(text: str) -> Optional[str]:
     # 4. Unclosed heredoc in bash command
     # NOTE: JSON-encoded tool calls use \n (two chars) not real newlines, so we must
     # also check the JSON-escaped form: \nDELIM\n or \nDELIM" (at end of JSON string).
+    # We also handle the case where the AI embeds actual newlines in the JSON string
+    # and the delimiter is followed immediately by the JSON closing quote (no trailing \n).
     heredoc_opens = _re.findall(r"<<\s*['\"]?(\w+)['\"]?", text)
     for delim in heredoc_opens:
         esc = _re.escape(delim)
+        # Unified real-newline check: delimiter preceded by start-of-line or \n,
+        # followed by a JSON closer, end of string, or another newline.
+        _real_nl_closed = bool(_re.search(
+            r'(?:^|\n)' + esc + r'(?:\n|\r|"|}|$)', text
+        ))
         closed = (
-            _re.search(rf'^{esc}$', text, _re.MULTILINE)  # real newlines (plain text)
-            or f'\\n{delim}\\n' in text   # JSON-escaped: \nDELIM\n
-            or f'\\n{delim}"' in text     # JSON-escaped at end of string: \nDELIM"
-            or f'\\n{delim}\\\\n' in text # rare double-escaped edge case
+            _real_nl_closed                # real newlines (any trailing JSON char)
+            or f'\\n{delim}\\n' in text    # JSON-escaped: \nDELIM\n
+            or f'\\n{delim}"' in text      # JSON-escaped at end of string: \nDELIM"
+            or f'\\n{delim}\\\\n' in text  # rare double-escaped edge case
         )
         if not closed:
             issues.append(
@@ -1246,6 +1257,43 @@ def _should_abort_no_tool_loop(
     )
 
 
+_PHASE_RECON_WORDS = frozenset([
+    "nmap", "enum", "recon", "enumerat", "scan", "discover", "fingerprint",
+    "gobuster", "ffuf", "feroxbuster", "whatweb", "nikto", "wfuzz", "netcat",
+    "curl", "ping", "traceroute", "whois", "dig", "host", "masscan",
+])
+_PHASE_EXPLOIT_WORDS = frozenset([
+    "exploit", "payload", "reverse shell", "shell", "rce", "lfi", "sqli",
+    "injection", "overflow", "buffer", "metasploit", "msfconsole", "sqlmap",
+    "burp", "privilege escalation", "privesc", "linpeas", "winpeas",
+    "lateral movement", "post-exploit", "upload", "webshell",
+])
+_PHASE_REPORT_WORDS = frozenset([
+    "flag", "root.txt", "user.txt", "submit", "found the flag", "pwned",
+    "rooted", "summary", "report", "complete", "congrat",
+])
+
+
+def _detect_phase(text: str) -> str:
+    """
+    Infer the current agent phase from response text.
+    Returns one of: 'recon', 'exploit', 'report', 'idle'.
+    """
+    if not text:
+        return "idle"
+    lower = text.lower()
+    for w in _PHASE_REPORT_WORDS:
+        if w in lower:
+            return "report"
+    for w in _PHASE_EXPLOIT_WORDS:
+        if w in lower:
+            return "exploit"
+    for w in _PHASE_RECON_WORDS:
+        if w in lower:
+            return "recon"
+    return "idle"
+
+
 def _run_agentic_loop(
     response_content: str,
     *,
@@ -1282,9 +1330,14 @@ def _run_agentic_loop(
     runner = get_runner()
     _loop_pruned_history: Optional[List] = None  # set when mid-loop compaction resets conv_id
 
+    # Phase tracking for TUI color shifts
+    _current_phase: str = _detect_phase(response_content)
+
     # Stuck detection state
     _fail_history: Dict[str, int] = {}  # "tool_name:cmd_prefix" -> fail_count
     _technique_fail: Dict[str, int] = {}  # "technique_category" -> fail_count
+    _mcp_server_failures: Dict[str, int] = {}  # server_name -> consecutive error count
+    _MCP_SERVER_FAIL_THRESHOLD = 3  # after this many consecutive errors, inject pivot hint
     _STUCK_THRESHOLD = 3
     _TECHNIQUE_THRESHOLD = 2  # abandon a technique after this many conceptual failures
     _no_tool_streak = 0
@@ -1381,7 +1434,6 @@ def _run_agentic_loop(
         tool_calls = _extract_tool_calls(current_response)
         if not tool_calls:
             if auto_exec:
-                _force_toolcall_now = False
                 raw_no_tool = (current_response or "").strip()
                 normalized_no_tool = _re.sub(r"\s+", " ", raw_no_tool)
 
@@ -1401,7 +1453,7 @@ def _run_agentic_loop(
                     "provide the new ip" in (raw_no_tool or "").lower()
                     or "new ip address" in (raw_no_tool or "").lower()
                     or "target appears offline" in (raw_no_tool or "").lower()
-                    or "machine.*offline" in (raw_no_tool or "").lower()
+                    or _re.search(r"machine.*offline", (raw_no_tool or ""), _re.IGNORECASE)
                 )
                 if _asking_for_ip and auto_exec:
                     console.print(
@@ -1445,8 +1497,10 @@ def _run_agentic_loop(
                             print_warning(f"Autopilot bug finder wrote issue report to {issue_path}")
                         break
                     # Fall through to continue_msg retry. No compaction, no context loss.
+                else:
+                    _no_tool_error_streak += 1
 
-                if (not _force_toolcall_now) and _should_abort_no_tool_loop(
+                if _should_abort_no_tool_loop(
                     no_tool_streak=_no_tool_streak,
                     no_tool_error_streak=_no_tool_error_streak,
                     no_tool_repeat_streak=_no_tool_repeat_streak,
@@ -1477,13 +1531,7 @@ def _run_agentic_loop(
                     f"(streak={_no_tool_streak}); continuing autonomous mode…"
                 )
 
-                if _force_toolcall_now:
-                    continue_msg = (
-                        "RECOVERY MODE: Your last responses failed to produce usable tool calls due to upstream/server errors. "
-                        "You MUST emit exactly one valid <tool_call> now using JSON format inside the tag. "
-                        "Do not include prose, markdown, XML wrappers, or empty <tool_calls>."
-                    )
-                elif _no_tool_streak >= 2:
+                if _no_tool_streak >= 2:
                     continue_msg = (
                         "Your previous response did not include any <tool_call> blocks. "
                         "If work remains, you MUST emit at least one valid <tool_call> now. "
@@ -1516,6 +1564,7 @@ def _run_agentic_loop(
                         research_sources=None,
                         memory_count=0,
                         show_thinking=config.get("show_thinking", True) and not no_think,
+                        phase=_current_phase,
                     )
                 except KeyboardInterrupt:
                     console.print()
@@ -1800,12 +1849,6 @@ def _run_agentic_loop(
                 edited_cmd = cmd
 
                 # ── macOS nc compatibility ────────────────────────────────────
-                # Linux: nc -lvnp 4444  →  macOS: nc -l 4444  (or use ncat)
-                # The -p flag on macOS nc requires a separate argument, and
-                # combined -lvnp style flags don't work on macOS nc.
-                _NC_MACOS_RE = _re.compile(
-                    r'\bnc\s+-[a-zA-Z]*(?:l)[a-zA-Z]*v?n?p?\s+(\d+)',
-                )
                 _nc_match = _NC_MACOS_RE.search(edited_cmd)
                 if _nc_match and "ncat" not in edited_cmd:
                     port = _nc_match.group(1)
@@ -1822,8 +1865,6 @@ def _run_agentic_loop(
                                     "#!/usr/bin/env python", "print(", "requests.", "ldap3.")
                 _looks_like_python = any(_first_line.startswith(s) for s in _PYTHON_STARTERS)
                 if _looks_like_python and not edited_cmd.lstrip().startswith("#!"):
-                    # Wrap in python3 -c or write to /tmp and run
-                    _py_escaped = edited_cmd.replace("'", "'\\''")
                     edited_cmd = f"python3 - << 'PYEOF'\n{edited_cmd}\nPYEOF"
                     print_info("[AUTO] Detected Python code — wrapped with 'python3 - << PYEOF'")
 
@@ -1842,17 +1883,37 @@ def _run_agentic_loop(
                         return current_conv_id
                     if choice in ("y",):
                         approved = True
-                    # No "A" option for install commands
-                elif approve_all:
-                    approved = True
                 else:
-                    try:
-                        console.print(
-                            "  [bold green][[y]][/bold green]es  "
-                            "[bold red][[n]][/bold red]o  "
-                            "[bold yellow][[A]][/bold yellow]ll yes  "
-                            "[bold][[e]][/bold]dit"
+                    # ── Tool Call Preview Card ─────────────────────────────────
+                    # Assess risk level from command content
+                    _HIGH_RISK = ("rm ", "mkfs", "dd ", "shred", "nc -l", "> /", "chmod 777",
+                                  "curl | bash", "wget | sh", "; rm", "&& rm", "DROP TABLE",
+                                  "DELETE FROM", "truncate", "format c:")
+                    _MED_RISK  = ("sudo", "passwd", "chmod", "chown", "mv /", "cp /",
+                                  "curl", "wget", "python3", "php", "perl", "ruby",
+                                  "msfconsole", "metasploit")
+                    cmd_lower = cmd.lower()
+                    if any(p in cmd_lower for p in _HIGH_RISK):
+                        risk_color, risk_label = "bold red", "HIGH RISK"
+                    elif any(p in cmd_lower for p in _MED_RISK):
+                        risk_color, risk_label = "bold yellow", "MEDIUM"
+                    else:
+                        risk_color, risk_label = "green", "LOW"
+
+                    from rich.panel import Panel as _Panel
+                    preview_cmd = cmd if len(cmd) <= 300 else cmd[:300] + "\n… [truncated]"
+                    console.print(
+                        _Panel(
+                            f"[bold cyan]$ [/bold cyan][white]{preview_cmd}[/white]",
+                            title=f"[bold cyan]bash ({idx}/{len(tool_calls)})[/bold cyan]  [{risk_color}]⚠ {risk_label}[/{risk_color}]",
+                            title_align="left",
+                            subtitle="[bold green][[y]][/bold green]es  [bold red][[n]][/bold red]o  [bold yellow][[A]][/bold yellow]ll  [bold][[e]][/bold]dit",
+                            subtitle_align="left",
+                            border_style="#444444",
+                            padding=(0, 1),
                         )
+                    )
+                    try:
                         choice = _safe_input("> ").lower()
                     except (EOFError, KeyboardInterrupt):
                         console.print()
@@ -1906,6 +1967,7 @@ def _run_agentic_loop(
                 console.print("[#888888]────────────────────────────────────[/]")
 
                 res = result_holder[0]
+                _offline_detected = False
                 if res is None:
                     result_text = "[command failed to complete]"
                 else:
@@ -2022,6 +2084,13 @@ def _run_agentic_loop(
                         result_text = result_text[:15000] + "\n\n[OUTPUT TRUNCATED: Output too long. Consider using grep, head, or piping to a file.]"
 
                 tool_responses.append({"name": tool_name, "result": result_text})
+                if session_name:
+                    append_audit_log(session_name, {
+                        "tool": tool_name,
+                        "args": {"cmd": cmd[:200]},
+                        "result_preview": result_text[:120].replace("\n", " "),
+                        "success": res is not None and res.returncode == 0,
+                    })
 
                 # Stop dispatching remaining tools in this batch when the target is offline.
                 # Without this, queued tool calls (e.g. KRB5 export after a failed SMB connect)
@@ -2052,10 +2121,60 @@ def _run_agentic_loop(
                 )
                 try:
                     mcp_out = get_mcp_manager().call_tool(srv_name, mcp_tool, arguments)
-                    tool_responses.append({"name": tool_name, "result": str(mcp_out)})
+                    # Success — reset per-server failure counter.
+                    _mcp_server_failures[srv_name] = 0
+                    mcp_result_str = str(mcp_out)
+                    tool_responses.append({"name": tool_name, "result": mcp_result_str})
+                    if session_name:
+                        append_audit_log(session_name, {
+                            "tool": tool_name,
+                            "args": arguments,
+                            "result_preview": mcp_result_str[:120].replace("\n", " "),
+                            "success": True,
+                        })
                 except Exception as mcp_exc:
+                    err_str = str(mcp_exc)
                     print_warning(f"MCP {srv_name}/{mcp_tool} failed: {mcp_exc}")
-                    tool_responses.append({"name": tool_name, "result": f"[error: {mcp_exc}]"})
+
+                    # Enrich the error with actionable hints for known MCP error codes.
+                    if "-32611" in err_str:
+                        hint = (
+                            f"[error: {mcp_exc}] "
+                            f"Tool '{mcp_tool}' is not available in the current MCP server mode. "
+                            "Restart the server with the -p (permissive) flag, OR use bash to "
+                            f"run radare2 commands directly: e.g. bash r2 -q -c '...' <file>."
+                        )
+                    elif "-32602" in err_str and "Missing required parameter" in err_str.replace("missing", "Missing"):
+                        hint = (
+                            f"[error: {mcp_exc}] "
+                            f"Provide all required parameters for '{mcp_tool}'. "
+                            "Check the tool schema: /mcp tools " + srv_name + "."
+                        )
+                    elif "-32602" in err_str and "expected boolean" in err_str:
+                        hint = (
+                            f"[error: {mcp_exc}] "
+                            "Pass true or false (not a number) for the boolean parameter."
+                        )
+                    else:
+                        hint = f"[error: {mcp_exc}]"
+
+                    # Track consecutive failures for this server.
+                    _mcp_server_failures[srv_name] = _mcp_server_failures.get(srv_name, 0) + 1
+                    if _mcp_server_failures[srv_name] == _MCP_SERVER_FAIL_THRESHOLD:
+                        # Inject a one-time pivot hint so the model stops hammering
+                        # a broken MCP server and switches to bash alternatives.
+                        pivot_hint = (
+                            f"\n[SYSTEM] MCP server '{srv_name}' has failed {_MCP_SERVER_FAIL_THRESHOLD} "
+                            "times in a row. Stop calling its tools. Use bash to accomplish the "
+                            "same tasks directly (e.g. r2, strings, objdump, nm, file commands)."
+                        )
+                        hint += pivot_hint
+                        print_warning(
+                            f"MCP server '{srv_name}' failed {_MCP_SERVER_FAIL_THRESHOLD}x — "
+                            "injecting pivot hint to use bash tools instead."
+                        )
+
+                    tool_responses.append({"name": tool_name, "result": hint})
 
             # ── Native registered tools ───────────────────────────────────────
             elif registry_get_tool(tool_name):
@@ -2070,6 +2189,13 @@ def _run_agentic_loop(
                             result_text = result_text[:10000] + "\n... [truncated]"
                         tool_responses.append({"name": tool_name, "result": result_text})
                         console.print(f"  [bold green]✔ {tool_name}[/bold green] [#888888]{args_str}[/]")
+                        if session_name:
+                            append_audit_log(session_name, {
+                                "tool": tool_name,
+                                "args": arguments,
+                                "result_preview": result_text[:120].replace("\n", " "),
+                                "success": True,
+                            })
                         
                         # Show output to the user so they aren't blind
                         display_text = result_text.strip()
@@ -2211,6 +2337,7 @@ def _run_agentic_loop(
                 research_sources=None,
                 memory_count=0,
                 show_thinking=config.get("show_thinking", True) and not no_think,
+                phase=_current_phase,
             )
         except KeyboardInterrupt:
             console.print()
@@ -2248,6 +2375,7 @@ def _run_agentic_loop(
                     research_sources=None,
                     memory_count=0,
                     show_thinking=config.get("show_thinking", True) and not no_think,
+                    phase=_current_phase,
                 )
             except KeyboardInterrupt:
                 console.print()
@@ -2257,6 +2385,12 @@ def _run_agentic_loop(
 
             if new_conv_id:
                 current_conv_id = new_conv_id
+
+        # Update phase based on the new response
+        if new_content:
+            detected = _detect_phase(new_content)
+            if detected != "idle":
+                _current_phase = detected
 
         if new_content is None:
             issue_path = autopilot.finalize(
@@ -2309,6 +2443,71 @@ def _run_agentic_loop(
 
 def _generate_shell_session_name() -> str:
     return datetime.now().strftime("shell-%Y%m%d-%H%M%S")
+
+
+def _browse_sessions() -> Optional[str]:
+    """Show a numbered session list and return the chosen session name (or None for new)."""
+    sessions = list_sessions()
+    if not sessions:
+        return None
+
+    DOMAIN_COLORS = {"htb": "green", "bugbounty": "yellow", "ctf": "cyan", "research": "magenta"}
+    from dsec.formatter import _relative_time, _model_short
+    from rich.table import Table
+    from rich import box
+
+    table = Table(
+        title="[bold]Previous Sessions[/bold]",
+        title_justify="left",
+        box=box.SIMPLE,
+        border_style="#444444",
+        header_style="bold #888888",
+        show_lines=False,
+    )
+    table.add_column("#", justify="right", style="#555555", min_width=3)
+    table.add_column("Session", style="bold white", min_width=22)
+    table.add_column("Domain", justify="center", min_width=10)
+    table.add_column("Turns", justify="right", min_width=5)
+    table.add_column("Last Used", min_width=13)
+
+    for i, s in enumerate(sessions, 1):
+        dom = s.get("domain", "htb")
+        color = DOMAIN_COLORS.get(dom, "white")
+        dom_cfg = get_domain(dom)
+        dom_display = dom_cfg.get("display", dom.upper())
+        last = _relative_time(s.get("last_used", ""))
+        table.add_row(
+            str(i),
+            s.get("name", ""),
+            f"[{color}]{dom_display}[/{color}]",
+            str(s.get("message_count", 0)),
+            last,
+        )
+
+    console.print(table)
+    console.print(
+        "[#888888]Enter[/] [bold cyan]number[/bold cyan][#888888] to resume · [/]"
+        "[bold cyan]n[/bold cyan][#888888] for new · [/]"
+        "[bold cyan]Enter[/bold cyan][#888888] to resume latest[/]"
+    )
+    try:
+        choice = console.input("> ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return None  # new session
+
+    if not choice or choice == "r":
+        return sessions[0]["name"]
+    if choice == "n":
+        return None
+    if choice.isdigit():
+        idx = int(choice) - 1
+        if 0 <= idx < len(sessions):
+            return sessions[idx]["name"]
+    # Try matching by name substring
+    for s in sessions:
+        if choice in s["name"].lower():
+            return s["name"]
+    return None  # fallback: new
 
 
 def _print_shell_banner(session_name: str, domain: str, model: str, sudo_set: bool = False) -> None:
@@ -2378,8 +2577,11 @@ def _print_shell_help() -> None:
                 "                  [#888888]Also reads DSEC_SUDO_PASS env var on startup.[/]\n\n"
 
                 "[bold cyan]── Session Management ──────────────────────────[/bold cyan]\n"
+                "[bold]/sessions[/bold]         browse & switch between previous sessions\n"
                 "[bold]/session[/bold]          show session details (notes, flags, history)\n"
+                "[bold]/session audit[/bold]    show structured tool call audit log\n"
                 "[bold]/history[/bold]          show last 10 conversation turns\n"
+                "[bold]/history search <q>[/bold] full-text search across all session histories\n"
                 "[bold]/note <text>[/bold]      add a note to the session\n"
                 "[bold]/new [name][/bold]       start a new session (clear context)\n"
                 "[bold]/status[/bold]           show all current shell settings\n"
@@ -2531,11 +2733,31 @@ def _handle_shell_command(raw: str, state: Dict[str, Any]) -> bool:
 
     # ── session ───────────────────────────────────────────────────────────────
     if command == "/session":
-        data = load_session(state["session_name"])
-        if data:
-            print_session_detail(data)
+        if arg and arg.lower() == "audit":
+            _print_session_audit(state["session_name"])
         else:
-            print_warning("No saved session data yet for this shell.")
+            data = load_session(state["session_name"])
+            if data:
+                print_session_detail(data)
+            else:
+                print_warning("No saved session data yet for this shell.")
+        return True
+
+    # ── sessions (browse & switch) ────────────────────────────────────────────
+    if command == "/sessions":
+        chosen = _browse_sessions()
+        if chosen and chosen != state["session_name"]:
+            _resolve_session(chosen, "", load_config(),
+                             state.get("domain_override"), state.get("model_override"))
+            state["session_name"] = chosen
+            dom = state["domain_override"] or detect_domain("", chosen)
+            state["resolved_domain"] = dom
+            _print_shell_banner(chosen, dom, state["model_override"] or "default")
+            print_success(f"Switched to session: {chosen}")
+        elif chosen == state["session_name"]:
+            print_info(f"Already in session: {chosen}")
+        else:
+            print_info("No session selected.")
         return True
 
     # ── status ────────────────────────────────────────────────────────────────
@@ -2592,7 +2814,16 @@ def _handle_shell_command(raw: str, state: Dict[str, Any]) -> bool:
 
     # ── history ───────────────────────────────────────────────────────────────
     if command == "/history":
-        _print_shell_history(state["session_name"])
+        if arg and arg.lower().startswith("search "):
+            query = arg[7:].strip()
+            if query:
+                _search_shell_history(query, state["session_name"])
+            else:
+                print_warning("Usage: /history search <query>")
+        elif arg and arg.lower() == "search":
+            print_warning("Usage: /history search <query>")
+        else:
+            _print_shell_history(state["session_name"])
         return True
 
     # ── autoexec ──────────────────────────────────────────────────────────────
@@ -2733,6 +2964,77 @@ def _print_shell_history(session_name: str, max_turns: int = 10) -> None:
             content = content[:800] + "…"
         color = "green" if role == "assistant" else "cyan"
         table.add_row(f"[{color}]{role}[/{color}]", content)
+    console.print(table)
+
+
+def _search_shell_history(query: str, session_name: str) -> None:
+    """Full-text search across all session histories using FTS5."""
+    from dsec.history_search import search_history, rebuild_index
+    from rich.table import Table
+    from rich import box
+
+    with console.status(f"[bold cyan]Searching history…[/bold cyan]", spinner="dots"):
+        total = rebuild_index()
+        results = search_history(query, limit=15, session_filter=None)
+
+    if not results:
+        print_info(f"No history matches found for: {query!r}")
+        return
+
+    table = Table(
+        title=f"History Search: {query!r}",
+        title_justify="left",
+        border_style="#888888",
+        box=box.SIMPLE,
+    )
+    table.add_column("Session", style="#888888", max_width=18)
+    table.add_column("Role", style="bold", max_width=10)
+    table.add_column("Turn", justify="right", max_width=5)
+    table.add_column("Match", overflow="fold")
+
+    for r in results:
+        sess = r["session"]
+        role = r["role"]
+        turn = str(r.get("turn", "?"))
+        snippet = r.get("snippet") or r.get("content", "")
+        # Highlight FTS5 match markers
+        snippet = snippet.replace("[", "[bold yellow]").replace("]", "[/bold yellow]")
+        color = "green" if role == "assistant" else "cyan"
+        table.add_row(sess, f"[{color}]{role}[/{color}]", turn, snippet)
+
+    console.print(table)
+    console.print(f"  [#888888]{len(results)} result(s)[/]")
+
+
+def _print_session_audit(session_name: str) -> None:
+    """Display the structured audit log for a session."""
+    from rich.table import Table
+    from rich import box
+
+    entries = load_audit_log(session_name, limit=50)
+    if not entries:
+        print_info(f"No audit log entries for session '{session_name}' yet.")
+        return
+
+    table = Table(
+        title=f"Audit Log — {session_name}",
+        title_justify="left",
+        border_style="#888888",
+        box=box.SIMPLE,
+    )
+    table.add_column("Time", style="#888888", max_width=20)
+    table.add_column("Tool", style="bold magenta", max_width=28)
+    table.add_column("OK", justify="center", max_width=4)
+    table.add_column("Preview", overflow="fold")
+
+    for entry in entries:
+        ts = (entry.get("ts") or "")[:19].replace("T", " ")
+        tool = entry.get("tool", "?")
+        success = entry.get("success", True)
+        ok_mark = "[green]✔[/green]" if success else "[red]✗[/red]"
+        preview = entry.get("result_preview", "")[:100]
+        table.add_row(ts, tool, ok_mark, preview)
+
     console.print(table)
 
 
@@ -2984,25 +3286,11 @@ def _launch_shell(
     # ── Session resolution ────────────────────────────────────────────────────
     if session_name:
         shell_session = session_name
+    elif quick:
+        shell_session = _generate_shell_session_name()
     else:
-        # Offer to resume the last used session
-        last = load_last_session()
-        if last and not quick:
-            last_data = load_session(last)
-            msgs = last_data.get("message_count", 0) if last_data else 0
-            try:
-                console.print(
-                    rf"[#888888]Last session:[/] [bold]{last}[/bold] "
-                    rf"[#888888]({msgs} messages)[/]  "
-                    rf"[bold cyan](r)[/bold cyan][#888888]esume  [/]"
-                    rf"[bold cyan](n)[/bold cyan][#888888]ew[/]"
-                )
-                choice = console.input("> ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                choice = "n"
-            shell_session = last if choice in ("r", "") else _generate_shell_session_name()
-        else:
-            shell_session = _generate_shell_session_name()
+        chosen = _browse_sessions()
+        shell_session = chosen if chosen else _generate_shell_session_name()
 
     if not quick:
         _resolve_session(shell_session, "", config, domain_override, model_override)

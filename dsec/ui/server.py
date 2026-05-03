@@ -72,4 +72,4 @@ def static_files(path):
     return send_from_directory("static", path)
 
 def run_dashboard(port=8080):
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="127.0.0.1", port=port)

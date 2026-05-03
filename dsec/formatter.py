@@ -22,6 +22,7 @@ from rich.table import Table
 from rich.text import Text
 
 import re as _re
+from rich.markup import escape as _rich_escape
 
 from .domain import get_domain
 
@@ -44,7 +45,7 @@ _XML_INVOKE_STRIP_RE = _re.compile(
     _re.DOTALL | _re.IGNORECASE,
 )
 # Strip malformed tool-call lines such as `tool_call name="bash"> ...`.
-_BROKEN_TOOL_CALL_LINE_RE = _re.compile(r'^\s*<?tool_call\b[^>]*name\s*=.*$', _re.IGNORECASE)
+_BROKEN_TOOL_CALL_LINE_RE = _re.compile(r'^\s*<?tool_call\b[^>]*name\s*=.*$', _re.IGNORECASE | _re.MULTILINE)
 _BARE_TOOL_LINE_RE = _re.compile(
     r'^\s*(?:bash\s+)?([a-z][a-z0-9_]*)\s*(\{[^}]*\})?\s*$'
 )
@@ -75,7 +76,7 @@ def _clean_display_content(text: str, *, streaming: bool = False) -> str:
         m = _BARE_TOOL_LINE_RE.match(line)
         if m:
             name = m.group(1)
-            if any(name.startswith(p) or name == p.rstrip("_") for p in _NATIVE_TOOL_PREFIXES):
+            if any(name.startswith(p) for p in _NATIVE_TOOL_PREFIXES) or name in _NATIVE_TOOL_PREFIXES:
                 continue
         lines.append(line)
     # Collapse triple+ blank lines to double
@@ -264,10 +265,11 @@ def _build_inline_layout(
     is_streaming: bool,
     show_thinking: bool,
     elapsed: float,
+    phase_color: Optional[str] = None,
 ) -> Any:
     """Build the inline layout (natural scroll, Claude Code style)."""
     domain_cfg = get_domain(domain)
-    color = domain_cfg.get("color", "white")
+    color = phase_color if phase_color else domain_cfg.get("color", "white")
 
     # ---- Thinking Block (Collapsible style) ----
     thinking_renderable = None
@@ -305,8 +307,22 @@ def _build_inline_layout(
     else:
         body = Text("")
 
+    # ---- Phase indicator (shown when agent is in a non-idle phase) ----
+    phase_renderables = []
+    if phase_color and not is_streaming:
+        # Map color to a short human-readable label
+        _PHASE_LABELS = {
+            "#00d4ff": "RECON",
+            "#ff4444": "EXPLOIT",
+            "#a3e635": "REPORT",
+        }
+        label = _PHASE_LABELS.get(phase_color, "ACTIVE")
+        phase_renderables.append(
+            Text(f"  ◆ {label}", style=f"bold {phase_color}")
+        )
+
     # ---- Assembly ----
-    renderables = []
+    renderables = phase_renderables
     if thinking_renderable:
         renderables.append(thinking_renderable)
     if body and str(body):
@@ -329,6 +345,7 @@ def stream_response(
     research_sources: Optional[List[str]] = None,
     memory_count: int = 0,
     show_thinking: bool = True,
+    phase: str = "idle",
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Stream response from generator to the terminal using Rich Live with
@@ -341,15 +358,26 @@ def stream_response(
     conv_id: Optional[str] = None
     start_time = time.time()
 
+    # Phase color override: each phase maps to a border color
+    _PHASE_COLORS = {
+        "recon":   "#00d4ff",   # cyan — reconnaissance / enumeration
+        "exploit": "#ff4444",   # red — exploitation
+        "report":  "#a3e635",   # lime — reporting / done
+        "idle":    None,        # None → use domain color (no override)
+    }
+    phase_color = _PHASE_COLORS.get(phase)
+    effective_domain = domain  # used below; phase color is separate
+
     cancelled = False
 
     def _render(streaming: bool) -> Any:
         elapsed = time.time() - start_time
         return _build_inline_layout(
             "".join(thinking_parts), "".join(content_parts),
-            domain, session_name, model, turn,
+            effective_domain, session_name, model, turn,
             compression_info, research_sources, memory_count,
             streaming, show_thinking, elapsed,
+            phase_color=phase_color,
         )
 
     try:
@@ -409,11 +437,26 @@ def stream_response(
         _build_inline_layout(
             partial_thinking,
             partial_content,
-            domain, session_name, model, turn,
+            effective_domain, session_name, model, turn,
             compression_info, research_sources, memory_count,
             False, show_thinking, elapsed,
+            phase_color=phase_color,
         )
     )
+
+    # Token rate footer (dim one-liner: "12.3 tok/s · 456 tokens · 37.2s")
+    if partial_content and not cancelled and elapsed > 0.1:
+        approx_tokens = max(1, len(partial_content) // 4)
+        tok_per_sec = approx_tokens / elapsed
+        pal = _get_palette(effective_domain)
+        p = pal["primary"]
+        phase_tag = f" [{p}]{phase}[/{p}]" if phase and phase != "idle" else ""
+        console.print(
+            f"  [#444444]{tok_per_sec:.1f} tok/s · {approx_tokens} tokens · {elapsed:.1f}s[/]"
+            + phase_tag,
+            highlight=False,
+        )
+
     if cancelled:
         # Re-raise so the outer except KeyboardInterrupt: block in the caller
         # can perform proper cleanup (save turn, stop loop, etc.).
@@ -438,13 +481,13 @@ def print_compression_notice(info: Dict) -> None:
 
 
 def print_research_notice(queries: List[Dict]) -> None:
-    q_strs = [f'"{q["query"]}"' for q in queries[:4]]
+    q_strs = [f'"{_rich_escape(q["query"])}"' for q in queries[:4]]
     console.print(f"[cyan]🔬 Auto-researching: {', '.join(q_strs)}…[/cyan]", highlight=False)
 
 
 def print_research_complete(total: int, sources: List[str]) -> None:
     if total > 0:
-        src_str = ", ".join(sources[:5])
+        src_str = ", ".join(_rich_escape(s) for s in sources[:5])
         console.print(f"[cyan]✅ Research: {total} finding(s) from [{src_str}][/cyan]", highlight=False)
     else:
         console.print("[#888888]🔬 Research: no relevant findings[/]", highlight=False)
@@ -649,19 +692,19 @@ def print_memory_detail(memory: Dict) -> None:
 # ---------------------------------------------------------------------------
 
 def print_info(msg: str) -> None:
-    console.print(f"[bold cyan]ℹ[/bold cyan] {msg}", highlight=False)
+    console.print(f"[bold cyan]ℹ[/bold cyan] {_rich_escape(msg)}", highlight=False)
 
 
 def print_success(msg: str) -> None:
-    console.print(f"[bold green]✓[/bold green] {msg}", highlight=False)
+    console.print(f"[bold green]✓[/bold green] {_rich_escape(msg)}", highlight=False)
 
 
 def print_error(msg: str) -> None:
-    console.print(f"[bold red]✖[/bold red] {msg}", highlight=False)
+    console.print(f"[bold red]✖[/bold red] {_rich_escape(msg)}", highlight=False)
 
 
 def print_warning(msg: str) -> None:
-    console.print(f"[bold yellow]⚠[/bold yellow] {msg}", highlight=False)
+    console.print(f"[bold yellow]⚠[/bold yellow] {_rich_escape(msg)}", highlight=False)
 
 # ---------------------------------------------------------------------------
 # Shell UI & Agentic Loop Formatting (Hermes/OpenCode inspired)

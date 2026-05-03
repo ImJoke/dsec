@@ -23,7 +23,8 @@ def gpt4free_stream(
         client = Client()
 
         messages = list(history) if history else []
-        if not messages or messages[-1].get("content") != message:
+        last = messages[-1] if messages else None
+        if not last or last.get("role") != "user" or last.get("content") != message:
             messages.append({"role": "user", "content": message})
 
         response = client.chat.completions.create(
@@ -59,7 +60,8 @@ def local_model_stream(
 
         url = f"{base_url.rstrip('/')}/api/chat"
         messages = list(history) if history else []
-        if not messages or messages[-1].get("content") != message:
+        last = messages[-1] if messages else None
+        if not last or last.get("role") != "user" or last.get("content") != message:
             messages.append({"role": "user", "content": message})
 
         payload = {
@@ -152,20 +154,17 @@ def provider_chat_stream(
             stream_generator = local_model_stream(message, model, "http://localhost:11434", history=history)
 
         if stream_generator:
-            success = False
+            got_done = False
             for chunk in stream_generator:
                 if chunk.get("type") == "error":
                     last_error = chunk.get("text", "Unknown error")
                     yield {"type": "thinking", "text": f"[System] Provider '{current_provider}' failed: {last_error}"}
-                    break # Break out of inner loop, try next provider
-                
-                # If we get content or thinking, the provider is working
-                if chunk.get("type") in ("content", "thinking", "done"):
-                    success = True
-                    yield chunk
-            
-            # If the generator finished successfully (yielded a done chunk without error breaking)
-            if success:
+                    break
+                yield chunk
+                if chunk.get("type") == "done":
+                    got_done = True
+
+            if got_done:
                 return
                 
     # If all providers failed

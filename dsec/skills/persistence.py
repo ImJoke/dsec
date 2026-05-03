@@ -15,17 +15,24 @@ from typing import List, Optional
 from dsec.core.registry import register
 from dsec.skills.loader import _USER_SKILLS_DIR
 
+
+def _safe_skill_name(name: str) -> str:
+    """Sanitize skill name to prevent path traversal."""
+    return "".join(c for c in name if c.isalnum() or c in "-_").lower() or "unnamed"
+
+
 @register("skill_persist", "Persists a successful workflow or exploit chain as a new reusable SKILL.md. Use this when you find a method that works (e.g., a specific way to exploit a CVE or bypass a WAF).")
 def skill_persist(name: str, description: str, steps: List[str], triggers: List[str]) -> str:
     """
     Creates a new SKILL.md in the user's local skills directory.
-    
+
     Args:
         name: Short name for the skill (e.g., 'smb-relay-attack')
         description: One-sentence description of the skill.
         steps: List of manual steps or commands to perform.
         triggers: List of keywords that should trigger this skill.
     """
+    name = _safe_skill_name(name)
     skill_dir = _USER_SKILLS_DIR / name
     os.makedirs(skill_dir, exist_ok=True)
     
@@ -47,7 +54,7 @@ def skill_persist(name: str, description: str, steps: List[str], triggers: List[
         
     lines.append("\n## Contextual Notes")
     lines.append("- Automatically persisted by DSEC following a successful mission.")
-    lines.append("- Verified at: " + os.uname().nodename)
+    lines.append("- Automatically verified by DSEC.")
     
     try:
         with open(skill_file, "w") as f:
@@ -62,7 +69,7 @@ def skill_reflect(skill_name: str, observation: str, improvement: str) -> str:
     """
     Updates an existing skill with a new observation and improvement.
     """
-    # Try to find the skill file in user dir first, then bundled (but we can't edit bundled easily)
+    skill_name = _safe_skill_name(skill_name)
     skill_file = _USER_SKILLS_DIR / skill_name / "SKILL.md"
     
     if not skill_file.exists():

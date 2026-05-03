@@ -33,7 +33,10 @@ def _sessions_dir() -> Path:
 
 
 def _session_path(name: str) -> Path:
-    return _sessions_dir() / f"{name}.json"
+    safe = "".join(c for c in name if c.isalnum() or c in "-_. ").strip()
+    if not safe:
+        safe = "unnamed"
+    return _sessions_dir() / f"{safe}.json"
 
 
 def _now_iso() -> str:
@@ -324,6 +327,39 @@ def load_last_session() -> Optional[str]:
     except Exception:  # noqa: BLE001
         pass
     return None
+
+
+def append_audit_log(name: str, entry: Dict[str, Any]) -> None:
+    """Append a JSON-line audit entry to ~/.dsec/sessions/<name>/audit.jsonl."""
+    try:
+        audit_dir = _sessions_dir() / name
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        audit_path = audit_dir / "audit.jsonl"
+        line = json.dumps({**entry, "ts": _now_iso()}, ensure_ascii=False)
+        with open(audit_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def load_audit_log(name: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """Return the last *limit* audit log entries for a session."""
+    audit_path = _sessions_dir() / name / "audit.jsonl"
+    if not audit_path.exists():
+        return []
+    try:
+        lines = audit_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        entries = []
+        for line in lines[-limit:]:
+            line = line.strip()
+            if line:
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        return entries
+    except Exception:
+        return []
 
 
 def save_turn(

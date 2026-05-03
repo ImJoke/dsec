@@ -95,8 +95,10 @@ class ContextManager:
             # Try exact match first, then prefix match
             self.budget = _MODEL_BUDGETS.get(model, 0)
             if not self.budget:
-                for k, v in _MODEL_BUDGETS.items():
-                    if k in model or model in k:
+                # Prefer longer (more specific) matches first so "deepseek-v3-1m"
+                # matches before "deepseek-v3".
+                for k, v in sorted(_MODEL_BUDGETS.items(), key=lambda x: -len(x[0])):
+                    if model.startswith(k) or k.startswith(model):
                         self.budget = v
                         break
             if not self.budget:
@@ -266,10 +268,15 @@ class ContextManager:
         # Assemble eligible messages, skipping degenerate turns that would
         # confuse the model (e.g. turns that are only a Ctrl-C cancellation marker).
         _SKIP_MARKERS = ("✖ Response cancelled.",)
+        # Ensure first non-system message is a user message (required by most APIs).
+        started = False
         for turn in eligible_turns:
             content = turn.content
             if content and content.strip() in _SKIP_MARKERS:
                 continue  # discard bare cancellation turns from context
+            if not started and turn.role == "assistant":
+                continue  # skip leading assistant turns
+            started = True
             if turn.thinking and turn.role == "assistant":
                 if "<think>" not in content:
                     content = f"<think>\n{turn.thinking}\n</think>\n{content}"

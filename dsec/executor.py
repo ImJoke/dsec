@@ -31,29 +31,18 @@ def _has_sudo(cmd: "str | list[str]") -> bool:
     return bool(_LEADING_SUDO_RE.search(cmd))
 
 
-def _inject_sudo_password_inline(cmd: str, password: str) -> str:
-    """
-    Insert a printf pipe directly before the first leading sudo so that
-    sudo -S reads the password from stdin.  Inserting at the sudo site
-    (not at string start) keeps compound commands like 'A && sudo B'
-    working correctly:
+def _inject_sudo_stdin_flag(cmd: str) -> str:
+    """Add -S -p '' flags to the first leading sudo so it reads from stdin.
 
-        A && printf '%s\\n' 'PASS' | sudo -S -p "" B
-
-    Bash parses | before &&, so printf's stdout goes to sudo, not A.
-
-    -S  → read password from stdin
-    -p "" → suppress the 'Password:' prompt
+    Returns the modified command.  The actual password is fed via Popen's
+    stdin to avoid leaking it in `ps aux`.
     """
     first_match = _LEADING_SUDO_RE.search(cmd)
     if not first_match:
         return cmd
     start, end = first_match.span()
     leading_space = first_match.group(1)
-    pw_quoted = shlex.quote(password)
-    prefix = f"printf '%s\\n' {pw_quoted} | "
-    # Insert: [before match][leading_space][prefix][sudo -S -p ""][rest]
-    return cmd[:start] + leading_space + prefix + 'sudo -S -p ""' + cmd[end:]
+    return cmd[:start] + leading_space + 'sudo -S -p ""' + cmd[end:]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -180,23 +169,23 @@ class CommandRunner:
                 return CommandResult(command, "", "Empty command.", 1)
             # shutil.which would be ideal but let the OS raise FileNotFoundError
 
-        # Inject sudo password inline: printf 'PASS' | sudo -S -p "" cmd
-        # Works regardless of TTY, env_reset, or macOS sandbox restrictions.
+        # Inject sudo -S flag and feed password via stdin pipe (not visible in ps aux).
+        _sudo_stdin: Optional[str] = None
         if sudo_password and _has_sudo(argv):
             if isinstance(argv, str):
-                argv = _inject_sudo_password_inline(argv, sudo_password)
-            # list form: convert to shell string so we can use the pipe trick
+                argv = _inject_sudo_stdin_flag(argv)
             elif isinstance(argv, list) and argv and argv[0] == "sudo":
-                argv = _inject_sudo_password_inline(shlex.join(argv), sudo_password)
-                shell = True  # now a shell string
+                argv = _inject_sudo_stdin_flag(shlex.join(argv))
+                shell = True
+            _sudo_stdin = sudo_password + "\n"
 
         try:
             env = os.environ.copy()
-            env.pop("DSEC_SUDO_PASS", None)  # don't leak into child env
+            env.pop("DSEC_SUDO_PASS", None)
             with self._lock:
                 self._proc = subprocess.Popen(
                     argv,
-                    stdin=None,
+                    stdin=subprocess.PIPE if _sudo_stdin else None,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -205,7 +194,15 @@ class CommandRunner:
                     cwd=cwd or None,
                     env=env,
                 )
-            proc = self._proc  # local ref for thread closures
+            proc = self._proc
+
+            if _sudo_stdin and proc.stdin:
+                try:
+                    proc.stdin.write(_sudo_stdin)
+                    proc.stdin.flush()
+                    proc.stdin.close()
+                except OSError:
+                    pass
 
             exception_holder = {"out": None, "err": None}
 

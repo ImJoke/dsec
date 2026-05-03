@@ -94,6 +94,7 @@ def _compress_nmap(text: str) -> str:
         if not stripped or stripped.startswith("#"):
             continue
         if "Not shown:" in line:
+            os_info.append(stripped)
             continue
         if line.startswith("SF-"):
             continue
@@ -106,7 +107,7 @@ def _compress_nmap(text: str) -> str:
             os_info.append(stripped)
             continue
 
-        m = re.match(r"(\d+)/(\w+)\s+(open)\s+(\S+)\s*(.*)", line)
+        m = re.match(r"(\d+)/(\w+)\s+(open(?:\|filtered)?)\s+(\S+)\s*(.*)", line)
         if m:
             port, proto, _, service, version = m.groups()
             version = version.strip()

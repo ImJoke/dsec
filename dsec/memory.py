@@ -585,7 +585,20 @@ def _load_graph() -> Dict[str, Any]:
 
 
 def _save_graph(graph: Dict[str, Any]) -> None:
-    _graph_path().write_text(json.dumps(graph, indent=2, ensure_ascii=False))
+    import tempfile as _tf
+    gp = _graph_path()
+    gp.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = _tf.mkstemp(dir=str(gp.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(graph, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, str(gp))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 import difflib
@@ -598,7 +611,7 @@ def _resolve_entity_key(graph: Dict[str, Any], entity: str) -> str:
         
     # Find close matches to prevent duplicate entities (e.g., 'windows_10' vs 'windows10')
     existing_keys = list(graph["nodes"].keys())
-    matches = difflib.get_close_matches(raw_key, existing_keys, n=1, cutoff=0.85)
+    matches = difflib.get_close_matches(raw_key, existing_keys, n=1, cutoff=0.92)
     
     if matches:
         return matches[0]
