@@ -6,10 +6,20 @@ than for a normal completion or an explicit user interrupt.
 """
 from __future__ import annotations
 
+import re as _re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
+
+# Match real timeout/cancellation messages but NOT help-text like "[-t TIMEOUT]" or
+# "TIMEOUT" appearing in a tool's flag reference.
+_TIMEOUT_RE = _re.compile(
+    r"(cancelled after|timed out|connection timed out|process timed out"
+    r"|execution timed out|request timed out|read timed out|recv timed out"
+    r"|task was cancelled|operation cancelled)",
+    _re.IGNORECASE,
+)
 
 
 @dataclass
@@ -65,11 +75,11 @@ class AutopilotBugFinder:
         if not text:
             return
 
-        if "cancelled after" in text or "timed out" in text or "timeout" in text:
+        if _TIMEOUT_RE.search(text):
             self._tool_failures[tool_name] = self._tool_failures.get(tool_name, 0) + 1
             self._signals.append(f"{tool_name}: timeout or cancellation")
             self._evidence.append(f"{tool_name}: {result_text[:240]}")
-        elif text.startswith("[error:") or "[error:" in text:
+        elif text.startswith("[error:") or "\n[error:" in text or " [error:" in text:
             self._tool_failures[tool_name] = self._tool_failures.get(tool_name, 0) + 1
             self._signals.append(f"{tool_name}: error result")
             self._evidence.append(f"{tool_name}: {result_text[:240]}")
