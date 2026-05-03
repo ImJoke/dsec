@@ -281,6 +281,7 @@ class ContextManager:
         _SKIP_MARKERS = ("✖ Response cancelled.",)
         # Ensure first non-system message is a user message (required by most APIs).
         started = False
+        msgs_before_turns = len(messages)
         for turn in eligible_turns:
             content = turn.content
             if content and content.strip() in _SKIP_MARKERS:
@@ -292,7 +293,16 @@ class ContextManager:
                 if "<think>" not in content:
                     content = f"<think>\n{turn.thinking}\n</think>\n{content}"
             messages.append({"role": turn.role, "content": content})
-            
+
+        # Safety net: if pruning left us with system-only messages (all eligible
+        # turns were assistant or skip-markers), inject a synthetic user turn so
+        # the API call doesn't fail with "messages must contain a user message".
+        if len(messages) == msgs_before_turns:
+            messages.append({
+                "role": "user",
+                "content": "[Context resumed from session summary] Continue from where the attack left off.",
+            })
+
         return messages
 
     def get_summary_text(self) -> str:

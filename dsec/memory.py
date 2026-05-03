@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -567,6 +568,9 @@ def memory_available() -> bool:
 _GRAPH_FILE: Optional[Path] = None
 
 
+_graph_lock = threading.RLock()
+
+
 def _graph_path() -> Path:
     global _GRAPH_FILE
     if _GRAPH_FILE is None:
@@ -582,6 +586,18 @@ def _load_graph() -> Dict[str, Any]:
         return {"nodes": {}, "edges": []}
     try:
         return json.loads(gp.read_text())
+    except json.JSONDecodeError as e:
+        # Corrupt graph file (likely from a crash mid-save). Preserve a backup
+        # so the user can recover, then start fresh rather than silently lose
+        # all edges.
+        import sys as _sys
+        try:
+            bak = gp.with_suffix(gp.suffix + ".corrupt")
+            gp.replace(bak)
+            print(f"[memory] knowledge_graph.json corrupted ({e}); backed up to {bak}", file=_sys.stderr)
+        except Exception:
+            pass
+        return {"nodes": {}, "edges": []}
     except Exception:
         return {"nodes": {}, "edges": []}
 
@@ -618,62 +634,76 @@ def _resolve_entity_key(graph: Dict[str, Any], entity: str) -> str:
     return raw_key
 
 def graph_add_node(entity: str, entity_type: str = "unknown", properties: Optional[Dict[str, str]] = None) -> str:
-    """Add or update a node in the knowledge graph. Returns node key."""
-    graph = _load_graph()
-    key = _resolve_entity_key(graph, entity)
-    existing = graph["nodes"].get(key, {})
-    node = {
-        "entity": entity,
-        "type": entity_type,
-        "properties": {**existing.get("properties", {}), **(properties or {})},
-        "updated": datetime.now(timezone.utc).isoformat(),
-    }
-    graph["nodes"][key] = node
-    _save_graph(graph)
-    return key
+    """Add or update a node in the knowledge graph. Returns node key.
+
+    Thread-safe: load+modify+save happens atomically under _graph_lock so
+    concurrent writers from different sessions/cron jobs don't lose updates.
+    """
+    with _graph_lock:
+        graph = _load_graph()
+        key = _resolve_entity_key(graph, entity)
+        existing = graph["nodes"].get(key, {})
+        node = {
+            "entity": entity,
+            "type": entity_type,
+            "properties": {**existing.get("properties", {}), **(properties or {})},
+            "updated": datetime.now(timezone.utc).isoformat(),
+        }
+        graph["nodes"][key] = node
+        _save_graph(graph)
+        return key
 
 
 def graph_add_edge(source: str, relation: str, target: str, confidence: str = "suspected") -> bool:
-    """Add a directed relationship edge.  Also stores in ChromaDB for vector search."""
-    graph = _load_graph()
-    src_key = _resolve_entity_key(graph, source)
-    tgt_key = _resolve_entity_key(graph, target)
+    """Add a directed relationship edge.  Also stores in ChromaDB for vector search.
 
-    # Ensure both nodes exist
-    for key, label in [(src_key, source), (tgt_key, target)]:
-        if key not in graph["nodes"]:
-            graph["nodes"][key] = {
-                "entity": label, "type": "unknown",
-                "properties": {}, "updated": datetime.now(timezone.utc).isoformat(),
-            }
+    Thread-safe under _graph_lock.
+    """
+    with _graph_lock:
+        graph = _load_graph()
+        src_key = _resolve_entity_key(graph, source)
+        tgt_key = _resolve_entity_key(graph, target)
 
-    edge = {
-        "source": src_key,
-        "relation": relation,
-        "target": tgt_key,
-        "confidence": confidence,
-        "created": datetime.now(timezone.utc).isoformat(),
-    }
+        # Ensure both nodes exist
+        for key, label in [(src_key, source), (tgt_key, target)]:
+            if key not in graph["nodes"]:
+                graph["nodes"][key] = {
+                    "entity": label, "type": "unknown",
+                    "properties": {}, "updated": datetime.now(timezone.utc).isoformat(),
+                }
 
-    # Deduplicate: skip if identical edge already exists
-    for e in graph["edges"]:
-        if e["source"] == src_key and e["relation"] == relation and e["target"] == tgt_key:
-            return True
-
-    graph["edges"].append(edge)
-    _save_graph(graph)
-
-    # Also store in ChromaDB for semantic retrieval
-    store_memory(
-        content=f"{source} {relation} {target}",
-        metadata={
-            "domain": "graph",
-            "type": "relation",
+        edge = {
+            "source": src_key,
+            "relation": relation,
+            "target": tgt_key,
             "confidence": confidence,
-            "tags": [src_key, tgt_key, relation],
-            "source": "graph",
-        },
-    )
+            "created": datetime.now(timezone.utc).isoformat(),
+        }
+
+        # Deduplicate: skip if identical edge already exists
+        for e in graph["edges"]:
+            if e["source"] == src_key and e["relation"] == relation and e["target"] == tgt_key:
+                return True
+
+        graph["edges"].append(edge)
+        _save_graph(graph)
+
+    # ChromaDB store outside graph lock (different storage, can be slow,
+    # don't block other graph writers). Wrap in try so chroma failure doesn't
+    # break the caller — the JSON graph is already persisted.
+    try:
+        store_memory(
+            content=f"{source} {relation} {target}",
+            metadata={
+                "domain": "graph",
+                "type": "relation",
+                "confidence": confidence,
+                "tags": [src_key, tgt_key, relation],
+                "source": "graph",
+            },
+        )
+    except Exception:
+        pass
     return True
 
 
@@ -731,12 +761,16 @@ def graph_stats() -> Dict[str, int]:
 
 
 def graph_forget_node(entity: str) -> bool:
-    """Remove a node and all its edges from the knowledge graph (Letta-style forget)."""
-    graph = _load_graph()
-    key = _resolve_entity_key(graph, entity)
-    if key not in graph["nodes"]:
-        return False
-    del graph["nodes"][key]
-    graph["edges"] = [e for e in graph["edges"] if e["source"] != key and e["target"] != key]
-    _save_graph(graph)
-    return True
+    """Remove a node and all its edges from the knowledge graph (Letta-style forget).
+
+    Thread-safe under _graph_lock.
+    """
+    with _graph_lock:
+        graph = _load_graph()
+        key = _resolve_entity_key(graph, entity)
+        if key not in graph["nodes"]:
+            return False
+        del graph["nodes"][key]
+        graph["edges"] = [e for e in graph["edges"] if e["source"] != key and e["target"] != key]
+        _save_graph(graph)
+        return True

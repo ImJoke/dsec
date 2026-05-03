@@ -1707,10 +1707,22 @@ def _run_agentic_loop(
         safe_parallel_calls = []
         sequential_calls = []
         
+        # Read-only tools that are safe to dispatch in parallel.
+        # Names MUST match dsec.core.registry — mismatched names silently fall
+        # through to sequential dispatch (no parallelism, wasted potential).
         SAFE_PARALLEL_TOOLS = {
-            "memory_search", "list_memories", "get_memory", 
-            "skill_list", "skill_view", "programmer_view_file", 
-            "programmer_list_dir", "gtfobins_search", "gtfobins_get"
+            # Memory / archival reads
+            "graph_memory_search", "dsec_archival_search", "core_memory_read",
+            # Skills
+            "list_user_skills",
+            # Programmer
+            "programmer_view_file", "programmer_tree", "programmer_search", "programmer_diff",
+            # GTFOBins
+            "gtfobins_search", "gtfobins_list",
+            # File reads
+            "read_file",
+            # Knowledge base (BM25 in-memory, fast, read-only)
+            "notes_search", "notes_get", "notes_tags",
         }
 
         for idx, call in enumerate(tool_calls, 1):

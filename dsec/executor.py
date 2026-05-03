@@ -245,6 +245,23 @@ class CommandRunner:
             t_out.join(timeout=10)
             t_err.join(timeout=10)
 
+            # If a reader thread is still alive (rare: shell spawned a child
+            # that holds the pipe open), force-close the pipe so the thread
+            # gets EOF and exits. Otherwise daemon threads accumulate over a
+            # 100+ command run and eventually exhaust file descriptors.
+            if t_out.is_alive() and proc.stdout is not None:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+                t_out.join(timeout=2)
+            if t_err.is_alive() and proc.stderr is not None:
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+                t_err.join(timeout=2)
+
             # Report reader thread exceptions (they would otherwise be lost)
             if exception_holder.get("out"):
                 try:
