@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # ─── Vault discovery ─────────────────────────────────────────────────────────
 
 _DEFAULT_VAULT_CANDIDATES = [
+    "~/Documents/vincent",                               # whole notes directory (preferred)
     "~/Documents/vincent/The Repository v2",
     "~/Documents/vincent/The Repository v3 - Shadow Garden",
     "~/.dsec/notes",

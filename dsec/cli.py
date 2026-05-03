@@ -1407,7 +1407,9 @@ def _run_agentic_loop(
         for _t in _sd["history"]:
             _cm.add_turn(_t["role"], _t.get("content", ""), _t.get("thinking", ""))
 
-        if not force and _cm.usage_percent < 50:
+        # Even forced compaction (large tool output) should not fire at very low usage.
+        # Normal path: skip if < 50%. Forced path: skip if < 60%.
+        if _cm.usage_percent < (60 if force else 50):
             return
 
         _target = int(_cm.budget * target_pct)
