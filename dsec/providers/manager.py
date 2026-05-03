@@ -155,22 +155,72 @@ def provider_chat_stream(
 
         if stream_generator:
             got_done = False
+            buffered: List[Dict[str, Any]] = []
+            content_text = ""
+            transient_detected = False
+            _TRANSIENT_PATTERNS = ("服务暂时不可用", "第三方响应错误", "服务繁忙")
             try:
                 for chunk in stream_generator:
                     if chunk.get("type") == "error":
                         last_error = chunk.get("text", "Unknown error")
                         yield {"type": "thinking", "text": f"[System] Provider '{current_provider}' failed: {last_error}"}
                         break
-                    yield chunk
-                    if chunk.get("type") == "done":
-                        got_done = True
+                    # Buffer content briefly so we can detect transient server
+                    # errors that the upstream API yields as ordinary content
+                    # (e.g. DeepSeek free API returns "服务暂时不可用" via the
+                    # content stream with HTTP 200).
+                    if chunk.get("type") == "content":
+                        content_text += chunk.get("text", "")
+                        buffered.append(chunk)
+                        # Real model output started → flush and stop buffering.
+                        if len(content_text) >= 200:
+                            for b in buffered:
+                                yield b
+                            buffered = []
+                            content_text = ""  # stop checking
+                    else:
+                        # Non-content chunk (thinking/done): flush buffer first.
+                        # If buffer is short and contains transient pattern, drop it.
+                        if buffered and len(content_text) < 200 and any(
+                            p in content_text for p in _TRANSIENT_PATTERNS
+                        ):
+                            last_error = content_text.strip() or "transient API error"
+                            transient_detected = True
+                            buffered = []
+                            content_text = ""
+                            yield {
+                                "type": "thinking",
+                                "text": f"[System] Provider '{current_provider}' transient error ({last_error}); switching provider…",
+                            }
+                            break
+                        for b in buffered:
+                            yield b
+                        buffered = []
+                        yield chunk
+                        if chunk.get("type") == "done":
+                            got_done = True
+                # End of stream — final flush. If buffer is short and contains
+                # the transient pattern, treat it as a provider failure (fall
+                # through to next provider).
+                if buffered and len(content_text) < 200 and any(
+                    p in content_text for p in _TRANSIENT_PATTERNS
+                ):
+                    last_error = content_text.strip() or "transient API error"
+                    transient_detected = True
+                    yield {
+                        "type": "thinking",
+                        "text": f"[System] Provider '{current_provider}' transient error ({last_error}); switching provider…",
+                    }
+                else:
+                    for b in buffered:
+                        yield b
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 yield {"type": "thinking", "text": f"[System] Provider '{current_provider}' crashed: {last_error}"}
 
-            if got_done:
+            if got_done and not transient_detected:
                 return
-                
+
     # If all providers failed
     yield {"type": "error", "text": f"All providers failed. Last error: {last_error}"}
 

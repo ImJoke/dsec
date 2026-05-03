@@ -1352,7 +1352,10 @@ def _run_agentic_loop(
     _NO_TOOL_STREAK_LIMIT = 12
     _NO_TOOL_ERROR_STREAK_LIMIT = 6   # AI-caused no-tool limit (not server errors)
     _NO_TOOL_REPEAT_LIMIT = 5
-    _SERVER_ERROR_RETRY_LIMIT = 15    # transient server errors before cooldown+retry
+    # provider_chat_stream now auto-falls back to gpt4free + local on transient
+    # errors, so we only need a small inner-retry budget for cases where ALL
+    # providers fail simultaneously.
+    _SERVER_ERROR_RETRY_LIMIT = 6     # transient errors across all providers before cooldown
     _server_cooldown_used = False     # only allow one extended cooldown per loop
 
     # Patterns in tool output that indicate a technique conceptually failed
@@ -1477,7 +1480,7 @@ def _run_agentic_loop(
 
                     while True:
                         _server_error_streak += 1
-                        _backoff = min(3.0 * (2 ** (_server_error_streak - 1)), 60.0)
+                        _backoff = min(3.0 * (2 ** (_server_error_streak - 1)), 30.0)
                         print_warning(
                             f"Server temporarily unavailable (streak={_server_error_streak}/{_SERVER_ERROR_RETRY_LIMIT}). "
                             f"Waiting {_backoff:.0f}s then retrying — context preserved."
@@ -2442,7 +2445,7 @@ def _run_agentic_loop(
                 import time as _time
                 while True:
                     _server_error_streak += 1
-                    _backoff = min(3.0 * (2 ** (_server_error_streak - 1)), 60.0)
+                    _backoff = min(3.0 * (2 ** (_server_error_streak - 1)), 30.0)
                     print_warning(
                         f"Server temporarily unavailable after tool follow-up "
                         f"(streak={_server_error_streak}/{_SERVER_ERROR_RETRY_LIMIT}). "
