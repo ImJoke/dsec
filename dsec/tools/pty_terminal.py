@@ -34,6 +34,31 @@ from typing import Dict, List, Optional
 from dsec.core.registry import register
 
 
+# Output above this threshold is saved to /tmp and the AI gets a preview + path
+_LARGE_OUTPUT_THRESHOLD = 8000  # chars
+
+
+def _maybe_save_output(job_id: str, output: str) -> str:
+    """If output exceeds threshold, save to /tmp and return preview + path."""
+    if len(output) <= _LARGE_OUTPUT_THRESHOLD:
+        return output
+    from datetime import datetime as _dt
+    ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", job_id)
+    path = f"/tmp/dsec_{safe_id}_{ts}.txt"
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(output)
+        preview = output[:3000]
+        return (
+            f"[Output large ({len(output):,} chars) — full output saved to {path}]\n"
+            f"{preview}\n"
+            f"...[read {path} for complete output]"
+        )
+    except OSError:
+        return output[:_LARGE_OUTPUT_THRESHOLD] + f"\n...[truncated at {_LARGE_OUTPUT_THRESHOLD} chars]"
+
+
 def strip_ansi(text: str) -> str:
     ansi_escape = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
     return ansi_escape.sub('', text)
@@ -110,6 +135,9 @@ class Pane:
 
         fl = fcntl.fcntl(self.master_fd, fcntl.F_GETFL)
         fcntl.fcntl(self.master_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+        # Per-pane command history: list of {"cmd": str, "output": str}
+        self._history: List[Dict[str, str]] = []
 
         time.sleep(0.3)
         try:
@@ -304,22 +332,31 @@ def _clean_exec_output(raw: str, command: str) -> str:
         "          prompt to reappear. Returns clean output. BEST for interactive shells.\n"
         "          Use this instead of send+read for evil-winrm, mssqlclient, etc.\n"
         "  read  — poll accumulated output from a listener (non-blocking)\n"
-        "  send  — send raw keystrokes (\\x03=Ctrl+C, \\n=Enter). Use for special keys.\n"
-        "  kill  — terminate a job\n"
-        "  list  — list all active jobs\n"
+        "  send    — send raw keystrokes (\\x03=Ctrl+C, \\x04=Ctrl+D, \\n=Enter). Use for special keys only.\n"
+        "  history — show command history for a job\n"
+        "            mode='last' (default): last command + its output\n"
+        "            mode='all':  every command + output run in this pane\n"
+        "            Large outputs are auto-saved to /tmp/dsec_<job>_<ts>.txt — preview shown inline.\n"
+        "  kill    — terminate a job\n"
+        "  list    — list all active jobs\n"
         "\n"
         "PARAMETERS:\n"
-        "  action   (required) run | exec | read | send | kill | list\n"
+        "  action   (required) run | exec | read | send | history | kill | list\n"
         "  job_id   name for this job (e.g. 'relay', 'winrm', 'listener')\n"
         "  command  shell command (required for run; the command to execute for exec)\n"
         "  input    raw keystrokes (required for send)\n"
-        "  wait     seconds to wait for output after 'run' (default 3, max 30)\n"
+        "  wait     seconds to wait for output after 'run' or 'exec' (default 3, max 30/60)\n"
+        "  mode     for action='history': 'last' (default) or 'all'\n"
+        "\n"
+        "LARGE OUTPUT: Any output > 8000 chars is auto-saved to /tmp/dsec_<job>_<ts>.txt.\n"
+        "  The tool returns a 3000-char preview + file path. Use bash `cat` or `grep` on the file.\n"
         "\n"
         "INTERACTIVE SHELL WORKFLOW (evil-winrm example):\n"
         "  1. background(action='run',  job_id='winrm', command='evil-winrm -i IP -u USER -H HASH', wait=8)\n"
         "  2. background(action='exec', job_id='winrm', command='whoami /priv', wait=15)\n"
         "  3. background(action='exec', job_id='winrm', command='certutil -store My', wait=15)\n"
-        "  4. background(action='kill', job_id='winrm')\n"
+        "  4. background(action='history', job_id='winrm', mode='all')  # review all commands run\n"
+        "  5. background(action='kill', job_id='winrm')\n"
         "\n"
         "LISTENER WORKFLOW (ntlmrelayx example):\n"
         "  1. background(action='run',  job_id='relay', command='ntlmrelayx.py -t ldap://DC ...', wait=5)\n"
@@ -337,6 +374,7 @@ def background(
     command: str = "",
     input: str = "",
     wait: float = 3.0,
+    mode: str = "last",
 ) -> str:
     action = action.strip().lower()
 
@@ -365,9 +403,12 @@ def background(
         wait_clamped = max(0.5, min(float(wait), 30.0))
         output = strip_ansi(pane.read(timeout=wait_clamped))
         status = "running" if pane.alive else "exited"
+        # Track history (raw output before large-output truncation)
+        pane._history.append({"cmd": command, "output": output})
+        display_output = _maybe_save_output(job_id, output) if output else "(no output yet — use action=read to poll later)"
         return (
             f"[job '{job_id}' started — PID {pane.process.pid}, status: {status}]\n"
-            f"{output or '(no output yet — use action=read to poll later)'}"
+            f"{display_output}"
         )
 
     # ── exec (smart prompt-aware command dispatch) ────────────────────────────
@@ -394,10 +435,12 @@ def background(
 
         # Clean up: strip command echo + trailing prompt
         clean = _clean_exec_output(raw, command)
+        # Track history (raw clean output before large-output truncation)
+        pane._history.append({"cmd": command, "output": clean})
         status = "running" if pane.alive else "exited"
         if not clean:
             return f"[job '{job_id}' exec '{command[:40]}' — {status}]\n(no output)"
-        return f"[job '{job_id}' exec '{command[:40]}' — {status}]\n{clean}"
+        return f"[job '{job_id}' exec '{command[:40]}' — {status}]\n{_maybe_save_output(job_id, clean)}"
 
     # ── read ─────────────────────────────────────────────────────────────────
     if action == "read":
@@ -432,6 +475,29 @@ def background(
         output = strip_ansi(pane.read(timeout=0.5))
         return f"[sent to '{job_id}']\n{output}" if output else f"[sent to '{job_id}']"
 
+    # ── history ──────────────────────────────────────────────────────────────
+    if action == "history":
+        if not job_id:
+            return "Error: 'job_id' is required for action='history'."
+        if job_id not in _PANES:
+            return _RESUME_ERR.format(job_id)
+        pane = _PANES[job_id]
+        if not pane._history:
+            return f"[job '{job_id}'] No command history recorded yet."
+        mode_lower = (mode or "last").strip().lower()
+        if mode_lower in ("all", "full"):
+            parts = [f"[job '{job_id}' — command history, {len(pane._history)} commands]"]
+            for i, entry in enumerate(pane._history, 1):
+                parts.append(f"\n── [{i}] $ {entry['cmd']}")
+                parts.append(entry["output"] or "(no output)")
+            combined = "\n".join(parts)
+            return _maybe_save_output(job_id, combined)
+        else:
+            # mode="last" — only most recent command
+            last = pane._history[-1]
+            output = _maybe_save_output(job_id, last["output"] or "(no output)")
+            return f"[job '{job_id}'] $ {last['cmd']}\n{output}"
+
     # ── kill ─────────────────────────────────────────────────────────────────
     if action == "kill":
         if not job_id:
@@ -442,4 +508,4 @@ def background(
         del _PANES[job_id]
         return f"[job '{job_id}' killed]"
 
-    return f"Error: unknown action '{action}'. Valid: run, exec, read, send, kill, list."
+    return f"Error: unknown action '{action}'. Valid: run, exec, read, send, history, kill, list."
