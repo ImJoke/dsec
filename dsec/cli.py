@@ -1345,7 +1345,7 @@ def _run_agentic_loop(
     _server_error_streak = 0    # consecutive transient server errors ("服务暂时不可用")
     _no_tool_repeat_streak = 0
     _last_no_tool_response = ""
-    _checkpoint_every = 25   # inject progress-check every N iterations
+    _checkpoint_every = 15   # inject self-assessment every N iterations
     _flags_found = False      # True once user.txt or root.txt obtained
 
     _NO_TOOL_STREAK_LIMIT = 12
@@ -1491,23 +1491,59 @@ def _run_agentic_loop(
                             _time.sleep(120)
                             _server_error_streak = _SERVER_ERROR_RETRY_LIMIT - 5
                             print_info("Resuming after extended cooldown.")
-                            continue
-                        stop_reason = (
-                            f"server unavailable after {_server_error_streak} retries + extended cooldown; "
-                            "giving up"
+                            # Fall through to retry API call below
+                        else:
+                            stop_reason = (
+                                f"server unavailable after {_server_error_streak} retries + extended cooldown; "
+                                "giving up"
+                            )
+                            print_warning("Server unavailable for too long; stopping agentic loop.")
+                            autopilot.record_tool_result("__agentic_loop__", f"[error: {stop_reason}]")
+                            issue_path = autopilot.finalize(
+                                reason=stop_reason,
+                                had_tool_calls=True,
+                                loop_ended_normally=False,
+                                new_content=None,
+                            )
+                            if issue_path:
+                                print_warning(f"Autopilot bug finder wrote issue report to {issue_path}")
+                            break
+
+                    # Retry API call after backoff — use a neutral prompt that
+                    # doesn't scold the AI for missing tool calls (it was the server).
+                    try:
+                        gen = chat_stream(
+                            message="Continue your analysis. Use <tool_call> blocks for your next step.",
+                            model=model,
+                            conversation_id=current_conv_id,
+                            base_url=config.get("base_url", "http://localhost:8000"),
+                            token=get_next_token(),
+                            history=_loop_pruned_history,
                         )
-                        print_warning("Server unavailable for too long; stopping agentic loop.")
-                        autopilot.record_tool_result("__agentic_loop__", f"[error: {stop_reason}]")
-                        issue_path = autopilot.finalize(
-                            reason=stop_reason,
-                            had_tool_calls=True,
-                            loop_ended_normally=False,
-                            new_content=None,
+                        _loop_pruned_history = None
+                        thinking, new_content, new_conv_id = stream_response(
+                            generator=gen,
+                            session_name=session_name or "none",
+                            domain=domain,
+                            model=model,
+                            turn=turn + iteration,
+                            compression_info=None,
+                            research_sources=None,
+                            memory_count=0,
+                            show_thinking=config.get("show_thinking", True) and not no_think,
+                            phase=_current_phase,
                         )
-                        if issue_path:
-                            print_warning(f"Autopilot bug finder wrote issue report to {issue_path}")
-                        break
-                    # Fall through to continue_msg retry. No compaction, no context loss.
+                    except KeyboardInterrupt:
+                        console.print()
+                        print_warning("Agentic loop cancelled.")
+                        autopilot.note_user_interrupt()
+                        return current_conv_id
+
+                    if new_conv_id:
+                        current_conv_id = new_conv_id
+                    if new_content is not None:
+                        current_response = new_content
+                    continue
                 else:
                     _no_tool_error_streak += 1
 
@@ -1618,17 +1654,17 @@ def _run_agentic_loop(
             _techniques_tried = list(_technique_fail.keys())
             _failed_cmds = [k.replace("bash:", "") for k, v in _fail_history.items() if v >= _STUCK_THRESHOLD]
             _checkpoint_msg = (
-                f"[SYSTEM CHECKPOINT — iteration {iteration}]\n"
-                f"You have run {iteration} iterations without capturing a flag.\n"
-                f"Techniques that failed repeatedly: {_techniques_tried or 'none tracked'}\n"
-                f"Commands that failed {_STUCK_THRESHOLD}+ times: {_failed_cmds[:5] or 'none'}\n"
-                "\nBefore continuing, you MUST:\n"
-                "1. State what your CURRENT attack path is (1 sentence)\n"
-                "2. State WHY you believe it will work given results so far\n"
-                "3. If the current path has failed more than twice, PIVOT to a different technique\n"
-                "4. If you are unsure of the next step, run `whoami /priv` or enumerate what "
-                "privileges/access you currently have before doing anything else\n"
-                "DO NOT just repeat what you were doing. Reassess."
+                f"[SELF-ASSESSMENT — iteration {iteration}]\n"
+                f"You have been working for {iteration} iterations. "
+                f"Techniques that hit errors: {_techniques_tried or 'none'}. "
+                f"Commands that failed {_STUCK_THRESHOLD}+ times: {_failed_cmds[:5] or 'none'}.\n\n"
+                "Before your next action, reason through these questions in <think>:\n"
+                "1. INVENTORY — What credentials, hashes, and access (shells/sessions) do I have RIGHT NOW?\n"
+                "2. UNUSED ACCESS — Did I gain access I haven't exploited yet? (e.g. WinRM Pwn3d but never opened a shell)\n"
+                "3. MISSED DATA — Did I read any large file where the output was truncated? Could I have missed key info?\n"
+                "4. LOOP CHECK — Am I repeating the same type of action (e.g. downloading more SMB files, re-running the same enum)? If yes, why?\n"
+                "5. NEXT HIGHEST-VALUE ACTION — What single action is most likely to advance me toward a flag?\n\n"
+                "Act on your assessment. If you have unused access, use it. If you're looping, pivot."
             )
             # Inject as an extra tool response so it appears as feedback
             tool_calls_for_checkpoint = _extract_tool_calls(current_response)
@@ -2086,21 +2122,20 @@ def _run_agentic_loop(
                         if _flag_like:
                             _flags_found = True
 
-                    # 4. Credential discovery nudge — remind to spray
-                    if _re.search(r"(?i)(?:password|passwd|pwd)\s*[:=]\s*\S+", result_text):
-                        result_text += (
-                            "\n\n[SYSTEM] Credential detected in output! IMMEDIATELY test this credential "
-                            "against ALL open services (SMB, WinRM, SSH, LDAP, MSSQL) using nxc. "
-                            "Also try it for all known users — password reuse is common."
-                        )
-
                     # Collapse repeated identical lines (e.g. SQL client spamming the same error
                     # when a heredoc EOF delimiter is fed as input to an interactive program).
                     result_text = _deduplicate_lines(result_text, max_repeats=3)
 
                     # Truncate extremely long output to save context window
                     if len(result_text) > 15000:
-                        result_text = result_text[:15000] + "\n\n[OUTPUT TRUNCATED: Output too long. Consider using grep, head, or piping to a file.]"
+                        result_text = result_text[:15000] + (
+                            "\n\n[OUTPUT TRUNCATED — you are only seeing the FIRST 15K chars! "
+                            "CRITICAL data may be HIDDEN below the cut. To find what you need:\n"
+                            "  grep -iE 'password|credential|secret|token|key' <file>\n"
+                            "  grep -iE 'connect|bind|auth|login' <file>\n"
+                            "  tail -100 <file>    # see the END of the file\n"
+                            "NEVER assume the truncated output contains all relevant information.]"
+                        )
 
                 tool_responses.append({"name": tool_name, "result": result_text})
                 if session_name:
@@ -2278,15 +2313,10 @@ def _run_agentic_loop(
 
         # Append checkpoint as tool response if we had real tool calls this iteration
         if iteration > 1 and iteration % _checkpoint_every == 0 and not _flags_found and tool_responses:
-            _techniques_tried = list(_technique_fail.keys())
-            _failed_cmds = [k.replace("bash:", "") for k, v in _fail_history.items() if v >= _STUCK_THRESHOLD]
             _cp_msg = (
-                f"[SYSTEM CHECKPOINT — iteration {iteration}] "
-                f"You have run {iteration} iterations without a flag. "
-                f"Failed techniques: {_techniques_tried or 'none'}. "
-                f"Repeatedly failing commands: {_failed_cmds[:3] or 'none'}. "
-                "REASSESS: Is your current attack path still viable? "
-                "If not, enumerate your current privileges (whoami /priv) and pivot to a different technique."
+                f"[SELF-ASSESSMENT — iteration {iteration}] "
+                f"Pause and think: What access do you have that you haven't used? "
+                f"Are you repeating yourself? What's the single highest-value next action?"
             )
             tool_responses.append({"name": "checkpoint", "result": _cp_msg})
 
@@ -2367,12 +2397,29 @@ def _run_agentic_loop(
         if new_conv_id:
             current_conv_id = new_conv_id
 
-        if new_content is None or _has_server_overflow_error(new_content) or _has_server_overflow_error(thinking):
-            if new_content is not None:
-                print_warning("Server returned an error during the tool-follow-up step. Force-compacting and retrying…")
+        _followup_error = new_content is None or _has_server_overflow_error(new_content) or _has_server_overflow_error(thinking)
+        _followup_transient = _followup_error and new_content is not None and (
+            "服务暂时不可用" in (new_content or "") or "第三方响应错误" in (new_content or "")
+            or "服务暂时不可用" in (thinking or "") or "第三方响应错误" in (thinking or "")
+        )
+
+        if _followup_error:
+            if _followup_transient:
+                # Transient server busy — backoff and retry without compacting context
+                import time as _time
+                _server_error_streak += 1
+                _backoff = min(3.0 * (2 ** (_server_error_streak - 1)), 60.0)
+                print_warning(
+                    f"Server temporarily unavailable after tool follow-up (streak={_server_error_streak}/{_SERVER_ERROR_RETRY_LIMIT}). "
+                    f"Waiting {_backoff:.0f}s then retrying — context preserved."
+                )
+                _time.sleep(_backoff)
             else:
-                print_warning("Tool-follow-up stopped early. Force-compacting and retrying…")
-            _compact_loop_context(reason="agentic loop overflow", force=True)
+                if new_content is not None:
+                    print_warning("Server returned an error during the tool-follow-up step. Force-compacting and retrying…")
+                else:
+                    print_warning("Tool-follow-up stopped early. Force-compacting and retrying…")
+                _compact_loop_context(reason="agentic loop overflow", force=True)
 
             try:
                 gen = chat_stream(
