@@ -624,6 +624,17 @@ class TestAgenticLoopIntegration(unittest.TestCase):
     the real loop, not just in a simulation harness.
     """
 
+    def setUp(self):
+        # Clear test-session audit logs so each run starts with empty state.
+        # (Audit-replay primes _last_cmd_signature from disk on load.)
+        from dsec.session import _sessions_dir
+        import shutil
+        for name in ("test-integ", "test-integ-divergent", "stress-50",
+                    "stress-alt"):
+            sd = _sessions_dir() / name
+            if sd.exists():
+                shutil.rmtree(sd, ignore_errors=True)
+
     def _make_chat_stream_mock(self, responses):
         """Yield the given list of LLM responses across consecutive calls.
 
@@ -784,6 +795,14 @@ class TestStress(unittest.TestCase):
     PTY through edge cases at high volume. Verifies nothing crashes and
     invariants hold under load.
     """
+
+    def setUp(self):
+        from dsec.session import _sessions_dir
+        import shutil
+        for name in ("stress-50", "stress-alt"):
+            sd = _sessions_dir() / name
+            if sd.exists():
+                shutil.rmtree(sd, ignore_errors=True)
 
     # ── Extractor + dedup at high volume ──────────────────────────────────
 
@@ -1435,6 +1454,81 @@ class TestExtremeStress(unittest.TestCase):
             last_failed = False
 
         self.assertEqual(skipped, 1, f"expected 1 skip, got {skipped}")
+
+
+class TestAuditReplayPersistence(unittest.TestCase):
+    """Regression: state vars (_last_cmd_signature, _fail_history) were
+    process-local — across dsec restarts they reset, so an identical bash
+    retry from a previous session re-dispatched. Audit replay primes the
+    state from disk on session resume."""
+
+    def setUp(self):
+        from dsec.session import _sessions_dir
+        import tempfile, shutil
+        self._sess_root = _sessions_dir()
+        self._test_session = "stress-replay-test"
+        sd = self._sess_root / self._test_session
+        if sd.exists():
+            shutil.rmtree(sd)
+        sd.mkdir(parents=True, exist_ok=True)
+        # Seed audit.jsonl with a failed bloodyAD entry
+        bad_cmd = "bloodyAD -d logging.htb -u wallace.everette -p 'Welcome2026@' --host 10.129.236.203 add groupMember IT wallace.everette"
+        seed = [
+            {
+                "tool": "bash",
+                "args": {"cmd": bad_cmd},
+                "result_preview": "Traceback ... insufficientAccessRights",
+                "success": False,
+                "ts": "2026-05-04T11:30:00+00:00",
+            }
+        ]
+        (sd / "audit.jsonl").write_text("\n".join(json.dumps(e) for e in seed) + "\n")
+
+    def tearDown(self):
+        import shutil
+        sd = self._sess_root / self._test_session
+        if sd.exists():
+            shutil.rmtree(sd)
+
+    def test_replay_blocks_identical_retry_after_restart(self):
+        """Fresh _run_agentic_loop with audit pointing to the same failed
+        bloodyAD must NOT re-dispatch when the agent re-emits it."""
+        from unittest import mock
+        from dsec import cli as cli_mod
+
+        bad_cmd = "bloodyAD -d logging.htb -u wallace.everette -p 'Welcome2026@' --host 10.129.236.203 add groupMember IT wallace.everette"
+        block = f'<tool_call>{{"name":"bash","arguments":{{"command":"{bad_cmd}"}}}}</tool_call>'
+
+        fake_chat, _ = TestAgenticLoopIntegration._make_chat_stream_mock(self, [block, ""])
+        fake_runner, run_log = TestAgenticLoopIntegration._make_runner_mock(self, [1, 1, 1])
+
+        with mock.patch.object(cli_mod, "chat_stream", fake_chat), \
+             mock.patch.object(cli_mod, "get_runner", lambda: fake_runner):
+            try:
+                cli_mod._run_agentic_loop(
+                    response_content=block,
+                    session_name=self._test_session,
+                    domain="htb",
+                    model="x",
+                    conversation_id=None,
+                    config={"base_url": "http://localhost:8000",
+                            "show_thinking": False, "enable_multi_agent": False},
+                    turn=1,
+                    no_think=True,
+                    no_memory=True,
+                    auto_exec=True,
+                    sudo_password=None,
+                    max_iterations=3,
+                )
+            except Exception:
+                pass
+
+        bloody_dispatches = [r for r in run_log if "bloodyAD" in r["command"]]
+        self.assertEqual(
+            len(bloody_dispatches), 0,
+            f"REPLAY FAILED: identical bloodyAD ran {len(bloody_dispatches)} times "
+            f"despite prior-session audit showing it failed. Dispatches: {run_log}",
+        )
 
 
 if __name__ == "__main__":
