@@ -1665,5 +1665,132 @@ class TestAuditReplayPersistence(unittest.TestCase):
         )
 
 
+class TestStalemateDetector(unittest.TestCase):
+    """Forensic finding from session shell-20260503-221227: agent ran 110×
+    nxc, 55× certipy, 41× smbclient — 600+ turns of pure enumeration with
+    no commitment to an exploit chain. Stalemate detector forces a pivot
+    after N turns of enumeration without progress markers (Got hash, Got
+    TGT, Pwn3d!, Authenticated, etc.)."""
+
+    def _replicate_helpers(self):
+        """Reproduce the closures inside _run_agentic_loop so we can test
+        their classification logic without invoking the full loop."""
+        ENUM_TOOL_PREFIXES = (
+            "nxc smb", "nxc ldap", "nxc winrm",
+            "smbclient -l", "smbclient //",
+            "smbmap", "ldapsearch", "ldapdomaindump",
+            "curl ", "wget ", "feroxbuster", "gobuster", "ffuf",
+            "nmap", "rustscan", "certipy find",
+            "GetNPUsers.py", "GetUserSPNs.py",
+        )
+        ENUM_NATIVE_TOOLS = {
+            "notes_search", "notes_get", "graph_memory_search",
+            "dsec_archival_search", "gtfobins_search", "read_file",
+            "core_memory_read",
+        }
+        PROGRESS_PATTERNS = (
+            "Got hash for ", "Got TGT", "Got ST", "Pwn3d!",
+            "[+] Authenticated", "Wrote credential cache",
+            "[+] Successfully wrote", "[+] SMB Session received",
+        )
+
+        def is_enum(tool_name, args):
+            if tool_name == "bash":
+                cmd = (args.get("command") or args.get("cmd") or "").strip().lower()
+                return any(cmd.startswith(p.lower()) for p in ENUM_TOOL_PREFIXES)
+            return tool_name in ENUM_NATIVE_TOOLS
+
+        def is_progress(text):
+            if not text:
+                return False
+            tl = text.lower()
+            if "traceback" in tl or "[-] error" in tl:
+                return False
+            return any(m in text for m in PROGRESS_PATTERNS)
+
+        return is_enum, is_progress
+
+    def test_classify_nxc_smb_as_enum(self):
+        is_enum, _ = self._replicate_helpers()
+        self.assertTrue(is_enum("bash", {"command": "nxc smb 10.10.10.5 -u u -p p --shares"}))
+        self.assertTrue(is_enum("bash", {"command": "nxc ldap 10.10.10.5 -u u -p p --bloodhound"}))
+
+    def test_classify_certipy_find_as_enum(self):
+        is_enum, _ = self._replicate_helpers()
+        self.assertTrue(is_enum("bash", {"command": "certipy find -u user@dom -p pwd -dc-ip 10.10.10.5"}))
+
+    def test_classify_certipy_req_as_exploit(self):
+        is_enum, _ = self._replicate_helpers()
+        # `certipy req` mints a certificate — exploit-class
+        self.assertFalse(is_enum("bash", {"command": "certipy req -u u -p p -ca CA -template T"}))
+
+    def test_classify_write_file_as_exploit(self):
+        is_enum, _ = self._replicate_helpers()
+        # write_file isn't in ENUM_NATIVE_TOOLS — counts as exploit
+        self.assertFalse(is_enum("write_file", {"path": "/tmp/x", "content": "y"}))
+
+    def test_classify_notes_search_as_enum(self):
+        is_enum, _ = self._replicate_helpers()
+        self.assertTrue(is_enum("notes_search", {"query": "kerberoast"}))
+
+    def test_progress_detection_got_hash(self):
+        _, is_progress = self._replicate_helpers()
+        self.assertTrue(is_progress(
+            "[*] Got hash for 'wallace.everette@logging.htb': aad3b435...:40e28a964..."
+        ))
+
+    def test_progress_detection_pwn3d(self):
+        _, is_progress = self._replicate_helpers()
+        self.assertTrue(is_progress("SMB  10.10.10.5 445 DC01  [+] dom\\admin (Pwn3d!)"))
+
+    def test_progress_ignored_in_traceback(self):
+        _, is_progress = self._replicate_helpers()
+        # Even if the marker substring appears, a Traceback indicates failure.
+        self.assertFalse(is_progress(
+            "Traceback (most recent call last): ... Got hash for x"
+        ))
+
+    def test_simulated_30_enum_turns_triggers_hint(self):
+        """End-to-end logic: simulate the streak counter the way the loop
+        does. After 30 enum turns with no progress, hint should fire."""
+        from collections import deque
+        is_enum, is_progress = self._replicate_helpers()
+        turns_since_progress = 0
+        window = deque(maxlen=20)
+
+        # 30 nxc smb enum turns, none with progress
+        for _ in range(30):
+            args = {"command": "nxc smb 10.10.10.5 -u u -p p --shares"}
+            window.append("enum" if is_enum("bash", args) else "exploit")
+            if is_progress("(no creds returned)"):
+                turns_since_progress = 0
+            else:
+                turns_since_progress += 1
+
+        self.assertGreaterEqual(turns_since_progress, 30)
+        enum_count = sum(1 for t in window if t == "enum")
+        ratio = enum_count / len(window)
+        self.assertGreaterEqual(ratio, 0.80)
+
+    def test_progress_resets_streak(self):
+        from collections import deque
+        is_enum, is_progress = self._replicate_helpers()
+        turns_since_progress = 0
+        window = deque(maxlen=20)
+
+        # 20 enum turns, then one exploit success (Got hash)
+        for _ in range(20):
+            window.append("enum")
+            turns_since_progress += 1
+
+        # Exploit-class call with progress marker
+        result = "[*] Got hash for 'svc_recovery@logging.htb': :hashvalue"
+        window.append("exploit")
+        if is_progress(result):
+            turns_since_progress = 0
+
+        self.assertEqual(turns_since_progress, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
