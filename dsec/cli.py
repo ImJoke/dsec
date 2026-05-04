@@ -1371,6 +1371,79 @@ def _run_agentic_loop(
     _last_cmd_signature: Optional[str] = None
     _last_cmd_failed: bool = False
 
+    # ── Stalemate detector ──────────────────────────────────────────────
+    # Counts iterations since the last sign of "real progress" (credential
+    # acquired, foothold gained, file written, relay caught, etc.). When
+    # we cross _STALEMATE_TURNS_THRESHOLD without progress AND the recent
+    # tool window is dominated by enumeration, inject a hard pivot hint
+    # into tool_responses so the model is forced to commit to an exploit
+    # plan instead of more enumeration.
+    _STALEMATE_TURNS_THRESHOLD = 30
+    _STALEMATE_ENUM_WINDOW = 20  # last N turns considered for enum-ratio
+    _STALEMATE_ENUM_RATIO = 0.80  # ≥ 80% of window must be enum-class
+    _STALEMATE_REINJECT_COOLDOWN = 15  # turns between repeat injections
+    _turns_since_progress = 0
+    _last_stalemate_inject_iter = -999
+    from collections import deque as _deque_cls
+    _recent_tool_window: "_deque_cls[str]" = _deque_cls(maxlen=_STALEMATE_ENUM_WINDOW)
+
+    # Tool / command prefixes that count as "enumeration-class" — read-only
+    # discovery that doesn't change target state. Anything not matching is
+    # treated as "exploit-class" (write_file, payload_tools, bash w/ exec
+    # verbs, etc.) and breaks a stalemate streak when it succeeds.
+    _ENUM_TOOL_PREFIXES = (
+        "nxc smb", "nxc ldap", "nxc winrm",            # nxc enum
+        "netexec smb", "netexec ldap", "netexec winrm",
+        "smbclient -L", "smbclient //",
+        "smbmap",
+        "ldapsearch", "ldapdomaindump",
+        "curl ", "curl\t", "wget ",
+        "feroxbuster", "gobuster", "ffuf",
+        "nmap", "rustscan", "masscan",
+        "enum4linux", "kerbrute users", "kerbrute userenum",
+        "GetNPUsers.py",                                # ASREProast = enum-tier
+        "GetUserSPNs.py",                               # roastable enum
+        "certipy find",                                 # ADCS template enum
+        "bloodhound", "BloodHound.py",
+        "dig ", "host ", "nslookup",
+    )
+    _ENUM_NATIVE_TOOLS = {
+        "notes_search", "notes_get", "notes_tags", "notes_reload",
+        "graph_memory_search", "graph_memory_path", "dsec_archival_search",
+        "gtfobins_search", "gtfobins_list",
+        "read_file", "programmer_view_file", "programmer_tree",
+        "programmer_search", "programmer_diff", "live_research",
+        "core_memory_read",
+    }
+
+    # Patterns that indicate a TURN MADE PROGRESS — agent acquired a new
+    # credential, gained a foothold, exfilled a flag, or wrote/uploaded a
+    # payload. Matched against the tool result text.
+    _PROGRESS_OUTPUT_PATTERNS = (
+        "Got hash for ",
+        "Got TGT",
+        "Got ST",
+        "[+] TGS-REP",                  # GetUserSPNs success
+        "ASREP for ",                    # GetNPUsers success
+        "Pwn3d!",                        # nxc admin marker
+        "(Pwn3d!)",
+        "[+] Authenticated",
+        "Service Pack",                  # secretsdump banner — only fires when ntds dumped
+        ":::",                           # NTDS dump signature lines (user:rid:lmhash:nthash:::)
+        "[+] Got root",
+        "User Properties",               # certipy auth dump
+        "Wrote credential cache",
+        "Saving credential cache",
+        "[+] Successfully wrote",
+        "[+] Created",
+        "[+] Uploaded",
+        "[+] Forced authentication",
+        "[+] SMB Session received",      # ntlmrelayx capture
+        "[+] Authenticating against",
+        "successfully changed",          # password reset
+        "Account modification",
+    )
+
     # Replay recent audit log so cross-turn guard + _fail_history survive
     # session-resume across dsec restarts. Without this, a fresh process
     # has empty state and re-dispatches a command the user has already
@@ -1474,6 +1547,77 @@ def _run_agentic_loop(
     ]
     _hard_recovery_attempted = False
 
+    def _is_enum_class_call(tool_name: str, args: Dict[str, Any]) -> bool:
+        """Classify a tool call as enumeration-class (read-only discovery)
+        for the stalemate detector. Anything that mutates state, writes a
+        file, runs an exploit, or grabs credentials counts as exploit-class."""
+        if tool_name == "bash":
+            cmd = (args.get("command") or args.get("cmd") or "").strip().lower()
+            for prefix in _ENUM_TOOL_PREFIXES:
+                if cmd.startswith(prefix.lower()):
+                    return True
+            return False
+        return tool_name in _ENUM_NATIVE_TOOLS
+
+    def _is_progress_result(result_text: str) -> bool:
+        """Did this tool result advance the attack? Checked against a list
+        of credential / foothold / write-action markers."""
+        if not result_text:
+            return False
+        # Skip obvious failures even if a marker accidentally substring-matches
+        rl = result_text.lower()
+        if "traceback" in rl or "[-] error" in rl:
+            return False
+        for marker in _PROGRESS_OUTPUT_PATTERNS:
+            if marker in result_text:
+                return True
+        return False
+
+    def _track_for_stalemate(tool_name: str, args: Dict[str, Any], result_text: str) -> None:
+        """Update the recent-tool window + reset progress counter on success."""
+        nonlocal _turns_since_progress
+        try:
+            _recent_tool_window.append(
+                "enum" if _is_enum_class_call(tool_name, args) else "exploit"
+            )
+        except Exception:
+            pass
+        if _is_progress_result(result_text):
+            _turns_since_progress = 0
+        # else: caller increments _turns_since_progress at iteration end
+
+    def _stalemate_hint() -> Optional[str]:
+        """Return a forced-pivot hint if the agent has been over-enumerating
+        without progress. Called at the top of each iteration. Once-per-
+        cooldown to avoid spamming."""
+        nonlocal _last_stalemate_inject_iter
+        if _turns_since_progress < _STALEMATE_TURNS_THRESHOLD:
+            return None
+        if iteration - _last_stalemate_inject_iter < _STALEMATE_REINJECT_COOLDOWN:
+            return None
+        if len(_recent_tool_window) < min(10, _STALEMATE_ENUM_WINDOW):
+            return None  # not enough samples
+        enum_count = sum(1 for tag in _recent_tool_window if tag == "enum")
+        ratio = enum_count / len(_recent_tool_window)
+        if ratio < _STALEMATE_ENUM_RATIO:
+            return None
+        _last_stalemate_inject_iter = iteration
+        return (
+            f"[STALEMATE DETECTED — {_turns_since_progress} iterations since last "
+            f"credential / foothold / write action. {int(ratio*100)}% of recent "
+            f"tools were enumeration. STOP enumerating. In your NEXT message, "
+            f"ANSWER ALL FOUR before any new tool call:\n"
+            f"  1. CREDENTIALS: list every (user, password|hash|TGT|cert) you currently hold.\n"
+            f"  2. SERVICES: which OPEN service accepts those credentials? Pick ONE.\n"
+            f"  3. EXPLOIT CHAIN: name the exact technique (e.g. 'WSUS update push', "
+            f"'DCSync', 'ADCS ESC8 relay') + the exact 3-5 commands you will run.\n"
+            f"  4. FAILURE LOG: list 2-3 chains you've already tried that didn't work, "
+            f"to avoid repeating.\n"
+            f"Then COMMIT to the chosen chain and execute it end-to-end. Do not run "
+            f"another nxc / smbclient / curl / certipy find / ldap dump until the chain "
+            f"completes or fails with a concrete error.]"
+        )
+
     from .autopilot import AutopilotBugFinder
 
     autopilot = AutopilotBugFinder(
@@ -1546,6 +1690,11 @@ def _run_agentic_loop(
         _brain_context_token = None
 
     for iteration in range(1, max_iterations + 1):
+        # Stalemate check at iteration start. If the agent has been
+        # over-enumerating without progress, this returns a hint that gets
+        # injected as a synthetic tool_response *before* dispatching real
+        # tools — the model sees the pivot demand on the next chat call.
+        _pending_stalemate_hint = _stalemate_hint()
         tool_calls = _extract_tool_calls(current_response)
         # Dedupe: model sometimes emits the same <tool_call> block multiple times
         # in one turn (especially during streaming hiccups). Identical (name+args)
@@ -2336,6 +2485,7 @@ def _run_agentic_loop(
                         )
 
                 tool_responses.append({"name": tool_name, "result": result_text})
+                _track_for_stalemate(tool_name, arguments, result_text)
                 import hashlib as _hashlib
                 _bash_arg_blob = _json.dumps(arguments, sort_keys=True, default=str)
                 _last_cmd_signature = f"bash:{_hashlib.sha1(_bash_arg_blob.encode()).hexdigest()[:12]}"
@@ -2506,6 +2656,7 @@ def _run_agentic_loop(
                                 _bg_read_streak.pop(_job, None)
 
                         tool_responses.append({"name": tool_name, "result": result_text})
+                        _track_for_stalemate(tool_name, arguments, result_text)
                         _last_cmd_signature = _sig
                         _last_cmd_failed = False
                         console.print(f"  [bold green]✔ {tool_name}[/bold green] [#888888]{args_str}[/]")
@@ -2619,13 +2770,33 @@ def _run_agentic_loop(
         # ── build Hermes-style <tool_response> follow-up ──────────────────────
         response_blocks = []
         stuck_detected = False
-        
+
         for tr in tool_responses:
             if "Stuck detected:" in str(tr["result"]):
                 stuck_detected = True
-                
+
             payload = _json.dumps({"name": tr["name"], "result": tr["result"]}, ensure_ascii=False)
             response_blocks.append(f"<tool_response>\n{payload}\n</tool_response>")
+
+        # Inject the stalemate hint at the END of the tool_response stream so
+        # the model encounters it after seeing all the actual tool outputs.
+        # Most agentic models pay extra attention to the last system-shaped
+        # message in the chain, which is exactly the behaviour we want here.
+        if _pending_stalemate_hint:
+            _hint_payload = _json.dumps(
+                {"name": "stalemate_detector", "result": _pending_stalemate_hint},
+                ensure_ascii=False,
+            )
+            response_blocks.append(f"<tool_response>\n{_hint_payload}\n</tool_response>")
+            print_warning(
+                f"[stalemate] {_turns_since_progress} iterations no progress — "
+                f"injected pivot hint."
+            )
+
+        # Increment the no-progress counter unless this iteration produced
+        # a progress signal (in which case _track_for_stalemate already
+        # reset it to 0). Done after dispatch + before next chat call.
+        _turns_since_progress += 1
 
         follow_up = "\n\n".join(response_blocks)
         
