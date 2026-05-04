@@ -1097,7 +1097,7 @@ def _extract_tool_calls(text: str) -> list[dict]:
                     args = {}
                 if isinstance(args, dict):
                     calls.append({"name": candidate, "arguments": args})
-                    break
+                    continue  # keep scanning subsequent lines for more bare calls
 
             # "bash <native_tool>" misrouting
             if candidate.lower() in ("bash", "sh") and rest:
@@ -1111,7 +1111,7 @@ def _extract_tool_calls(text: str) -> list[dict]:
                         args = {}
                     if isinstance(args, dict):
                         calls.append({"name": native_candidate, "arguments": args})
-                        break
+                        continue
 
     # 5. Plain command fallback: recover when model emits raw commands without
     # <tool_call> wrappers (common with long reasoning outputs).

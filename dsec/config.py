@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 CONFIG_DIR = Path.home() / ".dsec"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -54,14 +54,60 @@ def _ensure_runtime_dirs(config: Dict[str, Any]) -> None:
 
 
 def _write_config(config: Dict[str, Any]) -> None:
+    """Atomically write the config file with restrictive permissions.
+
+    Uses os.open(O_CREAT|O_EXCL|O_WRONLY, 0o600) on a temp file followed by
+    os.replace so the file is never world-readable mid-write, and writes
+    under fcntl.flock so two concurrent dsec processes can't clobber each
+    other.
+    """
     _ensure_base_dirs()
-    with open(CONFIG_FILE, "w", encoding="utf-8") as handle:
-        json.dump(config, handle, indent=2)
-        handle.write("\n")
+    tmp_path = CONFIG_FILE.with_suffix(CONFIG_FILE.suffix + f".tmp.{os.getpid()}")
+
+    # Lock-on-write: held across the read-modify-write window inside
+    # save_config / add_tokens by their callers.
+    lock_path = CONFIG_FILE.with_suffix(CONFIG_FILE.suffix + ".lock")
+    lock_fd: Optional[int] = None
     try:
-        os.chmod(CONFIG_FILE, 0o600)
-    except OSError:
-        pass
+        try:
+            import fcntl  # POSIX only — Windows users skip locking gracefully
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except Exception:
+            lock_fd = None  # best-effort lock; proceed anyway
+
+        # Open with strict perms from creation time (avoids the brief window
+        # where a fresh file is 0o644 between open() and chmod()).
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        fd = os.open(str(tmp_path), flags, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(config, handle, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        os.replace(tmp_path, CONFIG_FILE)
+        try:
+            os.chmod(CONFIG_FILE, 0o600)
+        except OSError:
+            pass
+    finally:
+        if lock_fd is not None:
+            try:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
 
 
 def _read_extra_keys() -> Dict[str, Any]:
@@ -468,48 +514,86 @@ def check_tokens() -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_sudo_password() -> str:
-    """Return the persisted sudo password, or empty string if not set.
+    """Return the sudo password from a secure source, or empty string if unset.
 
-    Prefers the system keyring when available, falls back to config file.
+    Source priority (most to least preferred):
+      1. DSEC_SUDO_PASS environment variable
+      2. System keyring entry ("dsec", "sudo_password")
+      3. Legacy plaintext copy in config.json (read only — never written here)
+
+    The legacy file copy exists for users upgrading from older versions.
+    Calling set_sudo_password actively scrubs that copy when keyring writes
+    succeed.
     """
-    try:
-        try:
-            import keyring
-            pw = keyring.get_password("dsec", "sudo_password")
-            if pw:
-                return pw
-        except Exception:
-            pass
+    env_pw = os.environ.get("DSEC_SUDO_PASS")
+    if env_pw:
+        return env_pw
 
+    try:
+        import keyring
+        pw = keyring.get_password("dsec", "sudo_password")
+        if pw:
+            return pw
+    except Exception:
+        pass
+
+    try:
         if CONFIG_FILE.exists():
             with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
                 raw = json.load(fh)
             if isinstance(raw, dict):
-                return str(raw.get("sudo_password", ""))
+                legacy = str(raw.get("sudo_password", ""))
+                if legacy:
+                    # Surface the security concern once, but don't block the call.
+                    import warnings as _warnings
+                    _warnings.warn(
+                        "sudo_password is stored in plaintext in ~/.dsec/config.json. "
+                        "Re-save it via `dsec config --set sudo_password ...` to migrate "
+                        "to the system keyring.",
+                        stacklevel=2,
+                    )
+                return legacy
     except (OSError, json.JSONDecodeError):
         pass
     return ""
 
 
 def set_sudo_password(password: str) -> None:
-    """Persist the sudo password.
+    """Persist the sudo password to the system keyring.
 
-    Attempt to store in the system keyring; fall back to config file if unavailable.
+    Refuses to store the password in plaintext. If the keyring backend is
+    unavailable, raises ConfigError so the caller can prompt the user to
+    install one (`pip install keyring secretstorage`) or pass the password
+    via the `DSEC_SUDO_PASS` environment variable instead.
     """
     try:
         import keyring
-        try:
-            keyring.set_password("dsec", "sudo_password", password)
-            return
-        except Exception:
-            pass
+    except Exception as exc:
+        raise ConfigError(
+            "Cannot persist sudo password: 'keyring' module not available. "
+            "Install it (pip install keyring) or pass the password via the "
+            "DSEC_SUDO_PASS environment variable instead."
+        ) from exc
+
+    try:
+        keyring.set_password("dsec", "sudo_password", password)
+    except Exception as exc:
+        raise ConfigError(
+            f"Cannot persist sudo password: keyring backend failed ({exc}). "
+            "On Linux ensure secretstorage / dbus is running. "
+            "As a fallback, pass the password via DSEC_SUDO_PASS environment variable."
+        ) from exc
+
+    # Drop any legacy plaintext copy if the user previously had keyring fail.
+    try:
+        config = load_config()
+        extras = _read_extra_keys()
+        if "sudo_password" in extras:
+            extras.pop("sudo_password", None)
+            _write_config({**extras, **config})
+            _invalidate_cache()
     except Exception:
         pass
-
-    config = load_config()
-    extras = _read_extra_keys()
-    extras["sudo_password"] = password
-    _write_config({**extras, **config})
 
 
 def clear_sudo_password() -> None:

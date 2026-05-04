@@ -2,7 +2,7 @@ import time
 import logging
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional
 import re
@@ -10,6 +10,23 @@ import re
 from dsec.cron.jobs import load_jobs, save_jobs, update_job
 
 logger = logging.getLogger(__name__)
+
+
+def _now_utc() -> datetime:
+    """Aware UTC timestamp. All scheduler comparisons use UTC to avoid DST and
+    timezone-shift bugs that would fire jobs twice or skip them entirely."""
+    return datetime.now(timezone.utc)
+
+
+def _parse_iso(s: str) -> Optional[datetime]:
+    """Parse an ISO timestamp; coerce naive values to UTC for comparison safety."""
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 def parse_duration(s: str) -> Optional[int]:
     """Parse duration like '30m', '2h', '1d' into minutes."""
@@ -23,8 +40,8 @@ def parse_duration(s: str) -> Optional[int]:
     return value * multipliers[unit]
 
 def calculate_next_run(schedule: str, last_run_at: Optional[str] = None) -> Optional[datetime]:
-    """Calculate the next run time based on the schedule string."""
-    now = datetime.now()
+    """Calculate the next run time based on the schedule string. Returns aware UTC."""
+    now = _now_utc()
     schedule = schedule.strip().lower()
 
     # Interval: "every 30m"
@@ -33,28 +50,27 @@ def calculate_next_run(schedule: str, last_run_at: Optional[str] = None) -> Opti
         minutes = parse_duration(duration_str)
         if minutes is None:
             return None
-        
+
         if last_run_at:
-            last_run = datetime.fromisoformat(last_run_at)
+            last_run = _parse_iso(last_run_at)
+            if last_run is None:
+                return now
             return last_run + timedelta(minutes=minutes)
-        else:
-            return now # Run immediately on creation if never run
+        return now  # Run immediately on creation if never run
 
     # One-shot duration: "30m" (run once in 30 minutes)
     minutes = parse_duration(schedule)
     if minutes is not None:
         if last_run_at:
-            return None # Already run once
+            return None  # Already run once
         return now + timedelta(minutes=minutes)
 
     # Specific ISO timestamp
-    try:
-        dt = datetime.fromisoformat(schedule)
+    parsed = _parse_iso(schedule)
+    if parsed is not None:
         if last_run_at:
             return None
-        return dt
-    except ValueError:
-        pass
+        return parsed
 
     return None
 
@@ -68,16 +84,16 @@ def run_job(job: Dict[str, Any]):
     
     try:
         # Update status to running
-        update_job(job["id"], {"status": "running", "last_run_at": datetime.now().isoformat()})
-        
+        update_job(job["id"], {"status": "running", "last_run_at": _now_utc().isoformat()})
+
         # Execute
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        
+
         status = "ok" if result.returncode == 0 else "error"
         error_msg = result.stderr if result.returncode != 0 else None
-        
+
         # Calculate next run
-        next_run = calculate_next_run(job["schedule"], datetime.now().isoformat())
+        next_run = calculate_next_run(job["schedule"], _now_utc().isoformat())
         
         update_job(job["id"], {
             "status": status,
@@ -95,8 +111,8 @@ def run_job(job: Dict[str, Any]):
 def tick():
     """Check all jobs and run those that are due."""
     jobs = load_jobs()
-    now = datetime.now()
-    
+    now = _now_utc()
+
     for job in jobs:
         if not job.get("enabled", True):
             continue
@@ -113,7 +129,9 @@ def tick():
             else:
                 continue
 
-        next_run_dt = datetime.fromisoformat(next_run_str)
+        next_run_dt = _parse_iso(next_run_str)
+        if next_run_dt is None:
+            continue
         if next_run_dt <= now:
             run_job(job)
 

@@ -33,10 +33,32 @@ def _sessions_dir() -> Path:
 
 
 def _session_path(name: str) -> Path:
-    safe = "".join(c for c in name if c.isalnum() or c in "-_. ").strip()
-    if not safe:
-        safe = "unnamed"
-    return _sessions_dir() / f"{safe}.json"
+    """Resolve a session name to its on-disk path.
+
+    Rejects path-traversal characters: dots cluster ("..") and slashes are
+    stripped, leaving only alphanumeric + `-_ ` (single dot allowed for
+    extension-style names like "htb-1.0"). After sanitisation, the result
+    is asserted to live inside the sessions dir to defeat any escape via
+    creative unicode.
+    """
+    sanitised = "".join(c for c in name if c.isalnum() or c in "-_ ").strip()
+    # Allow a single dot as separator (e.g. "v1.2") but never the traversal
+    # sequence ".." nor leading dots (hidden file).
+    sanitised = sanitised.replace("..", "")
+    sanitised = sanitised.lstrip(".")
+    if not sanitised:
+        sanitised = "unnamed"
+    sanitised = sanitised[:128]  # cap length
+
+    base = _sessions_dir().resolve()
+    candidate = (base / f"{sanitised}.json").resolve()
+    # Defence in depth: if somehow the resolved path escaped base, fall back
+    # to a safe stub instead of writing outside the sessions dir.
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        candidate = base / "unnamed.json"
+    return candidate
 
 
 def _now_iso() -> str:

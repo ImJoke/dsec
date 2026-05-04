@@ -117,6 +117,12 @@ def call_tool(
                 f"Allowed roles: {list(allowed)}]"
             )
 
+    # Defensive: model occasionally emits arguments as a string ("{}" without
+    # parsing), a list, or None. Coerce to {} so the alias/required logic
+    # below doesn't crash with AttributeError on .keys() / TypeError on dict().
+    if not isinstance(arguments, dict):
+        arguments = {}
+
     # Resolve common argument aliases before dispatch so the AI doesn't have
     # to remember exact parameter names for every tool.
     # Maps alias → canonical name (only applied when canonical is missing).
