@@ -1357,6 +1357,11 @@ def _run_agentic_loop(
     _MCP_SERVER_FAIL_THRESHOLD = 3  # after this many consecutive errors, inject pivot hint
     _STUCK_THRESHOLD = 3
     _TECHNIQUE_THRESHOLD = 2  # abandon a technique after this many conceptual failures
+    # Track repeated `background read` polling on the same job_id across turns.
+    # When the same poll returns "no new output" 3+ iterations in a row we
+    # rewrite the tool result to nudge the agent to do something else instead
+    # of burning iterations on a hot-loop poll.
+    _bg_read_streak: Dict[str, int] = {}
     _no_tool_streak = 0
     _no_tool_error_streak = 0   # non-server no-tool turns (AI chose not to call tools)
     _server_error_streak = 0    # consecutive transient server errors ("服务暂时不可用")
@@ -2347,6 +2352,36 @@ def _run_agentic_loop(
                         # Truncate very long results for the AI context
                         if len(result_text) > 10000:
                             result_text = result_text[:10000] + "\n... [truncated]"
+
+                        # Detect background-read polling streak: same job, same
+                        # "no new output" response across consecutive iterations.
+                        # After 3+ in a row, replace the result with a hint
+                        # telling the agent to stop polling and pivot.
+                        if (
+                            tool_name == "background"
+                            and isinstance(arguments, dict)
+                            and arguments.get("action") == "read"
+                            and "no new output" in result_text
+                        ):
+                            _job = str(arguments.get("job_id", ""))
+                            _bg_read_streak[_job] = _bg_read_streak.get(_job, 0) + 1
+                            if _bg_read_streak[_job] >= 3:
+                                result_text = (
+                                    f"[hint: '{_job}' has been polled with no new output "
+                                    f"{_bg_read_streak[_job]} iterations in a row. STOP polling "
+                                    f"this job. Either (a) work on a different task — enumerate "
+                                    f"another service, search notes, run an alternate exploit "
+                                    f"chain — or (b) kill it if it's been minutes without progress: "
+                                    f"background(action='kill', job_id='{_job}'). Do not call "
+                                    f"`background read {_job}` again on the next turn.]"
+                                )
+                        else:
+                            # Reset streak when the agent does something else
+                            # for this job (run, exec, kill) or for a different job.
+                            if tool_name == "background" and isinstance(arguments, dict):
+                                _job = str(arguments.get("job_id", ""))
+                                _bg_read_streak.pop(_job, None)
+
                         tool_responses.append({"name": tool_name, "result": result_text})
                         console.print(f"  [bold green]✔ {tool_name}[/bold green] [#888888]{args_str}[/]")
                         if session_name:
