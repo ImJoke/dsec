@@ -5,6 +5,7 @@ Run local shell commands with streaming output and interrupt support.
 from __future__ import annotations
 
 import os
+import signal
 import re as _re
 import shlex
 import subprocess
@@ -119,13 +120,17 @@ class CommandRunner:
             return self._proc is not None and self._proc.poll() is None
 
     def interrupt(self) -> bool:
-        """Send SIGTERM to the running process.  Returns True if something was running."""
+        """Send SIGTERM to the entire process group of the running process.
+        Returns True if something was running."""
         with self._lock:
             if self._proc and self._proc.poll() is None:
                 try:
-                    self._proc.terminate()
-                except OSError:
-                    pass
+                    os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
+                except (OSError, ProcessLookupError):
+                    try:
+                        self._proc.terminate()
+                    except OSError:
+                        pass
                 return True
         return False
 
@@ -182,6 +187,11 @@ class CommandRunner:
         try:
             env = os.environ.copy()
             env.pop("DSEC_SUDO_PASS", None)
+            # Run the child in its own process group so we can kill the entire
+            # group (shell + spawned children + orphans) on timeout. Without
+            # this, a `trap '' TERM; sleep 30` shell ignores SIGTERM, the
+            # spawned `sleep` survives the SIGKILL on the shell parent, and
+            # our pipe-reader threads block until the orphaned child exits.
             with self._lock:
                 self._proc = subprocess.Popen(
                     argv,
@@ -193,6 +203,7 @@ class CommandRunner:
                     shell=shell,
                     cwd=cwd or None,
                     env=env,
+                    start_new_session=True,
                 )
             proc = self._proc
 
@@ -240,16 +251,39 @@ class CommandRunner:
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                proc.terminate()
+                # Kill the WHOLE process group so trap-ignoring shells +
+                # spawned-but-unreaped children all die. Without group-kill,
+                # a `trap '' TERM; sleep 30` would let the sleep keep our
+                # stdout pipe open for 30s and stall the reader threads.
+                _killed_group = False
                 try:
-                    proc.wait(timeout=5)
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGTERM)
+                    _killed_group = True
+                except (OSError, ProcessLookupError):
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                    if _killed_group:
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        except (OSError, ProcessLookupError):
+                            proc.kill()
+                    else:
+                        proc.kill()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
                 interrupted = True
 
-            t_out.join(timeout=10)
-            t_err.join(timeout=10)
+            # Reader threads should exit within 1-2s after the process group
+            # is fully dead (pipes EOF). Cap at 3s — beyond that the threads
+            # are stuck on a fd held open by an unkillable orphan, and the
+            # explicit pipe-close below handles that.
+            t_out.join(timeout=3)
+            t_err.join(timeout=3)
 
             # If a reader thread is still alive (rare: shell spawned a child
             # that holds the pipe open), force-close the pipe so the thread

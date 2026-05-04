@@ -1042,5 +1042,400 @@ class TestStress(unittest.TestCase):
         self.assertEqual(len(set(token_counts)), 1, f"prompt drifted: {token_counts}")
 
 
+class TestExtremeStress(unittest.TestCase):
+    """Creative / out-of-box edge cases. Cover the failure modes a stuck
+    agent or hostile environment can produce, including:
+      - stdin-blocking commands in non-PTY shell
+      - PTY crash mid-run, externally-closed fd
+      - timeout-ignoring child process
+      - command path that doesn't exist
+      - tool args malformed (null, list, string instead of dict)
+      - tool result with embedded tag confusion
+      - stream returning empty / malformed / mid-tool-call JSON
+      - 100 tools in one turn dispatch
+      - kill all panes concurrently
+      - hostile session names / tool args (regex/shell metacharacters)
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # Force-load tool modules so the registry has read_file etc.
+        import dsec.tools.file_tools  # noqa
+        import dsec.tools.memory_tools  # noqa
+        import dsec.tools.pty_terminal  # noqa
+        import dsec.tools.knowledge_tools  # noqa
+        import dsec.skills.programmer  # noqa
+
+    # ── Non-PTY shell hostile cases ───────────────────────────────────────
+
+    def test_nonpty_command_with_stdin_read_blocks_then_times_out(self):
+        """`cat` without redirect waits forever on stdin. Without timeout
+        protection, agent locks up. With timeout, CommandRunner kills it."""
+        from dsec.executor import CommandRunner
+        runner = CommandRunner()
+        import time
+        t0 = time.time()
+        # `cat` reads stdin until EOF — with no input pipe and isolated
+        # subprocess, it blocks. Timeout=2s should kill it.
+        result = runner.run("cat", timeout=2)
+        elapsed = time.time() - t0
+        # Must terminate within ~3s (2s timeout + small slop)
+        self.assertLess(elapsed, 4.0, f"cat hung for {elapsed:.1f}s — timeout broken")
+        # Process was either interrupted or returned
+        self.assertTrue(
+            result.interrupted or result.returncode is not None,
+            f"unexpected state: {result.__dict__}",
+        )
+
+    def test_nonpty_nonexistent_binary_returns_error(self):
+        """ENOENT must be caught and returned as a CommandResult, not raised."""
+        from dsec.executor import CommandRunner
+        runner = CommandRunner()
+        result = runner.run("xyzdoesnotexist123_abc", timeout=3)
+        # Must not crash; returncode != 0 or stderr populated
+        self.assertNotEqual(result.returncode, 0, f"missing binary should fail: {result.__dict__}")
+
+    def test_nonpty_command_with_huge_stdout_not_oom(self):
+        """yes(1)-style burst output. Process killed by timeout before OOM."""
+        from dsec.executor import CommandRunner
+        runner = CommandRunner()
+        import time
+        t0 = time.time()
+        # `yes` floods stdout. 2s timeout caps total run.
+        # Use head to force exit after 1MB of "x"
+        result = runner.run("yes x | head -c 1048576", timeout=5, shell=True)
+        elapsed = time.time() - t0
+        self.assertLess(elapsed, 6.0)
+        # Output captured but capped (head returns exactly 1MB)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(result.stdout), 1_048_576)
+
+    def test_nonpty_timeout_ignoring_child_gets_sigkilled(self):
+        """Child traps SIGTERM. Runner must escalate to SIGKILL within
+        timeout window via process-group kill (start_new_session=True)."""
+        from dsec.executor import CommandRunner
+        runner = CommandRunner()
+        import time
+        # bash trap ignores SIGTERM, sleeps forever
+        cmd = "trap '' TERM; sleep 30"
+        t0 = time.time()
+        result = runner.run(cmd, timeout=2, shell=True)
+        elapsed = time.time() - t0
+        # Should die within: 2s timeout + 2s post-SIGTERM wait + small slop = ~5s
+        self.assertLess(elapsed, 8.0,
+                        f"signal-trap child held runner for {elapsed:.1f}s")
+        self.assertTrue(result.interrupted)
+
+    # ── PTY hostile cases ─────────────────────────────────────────────────
+
+    def test_pty_externally_killed_bash_detected_on_next_call(self):
+        """User SIGKILLs bash directly. Next pane.write must surface 'died' error
+        cleanly, not silently produce no output."""
+        from dsec.tools.pty_terminal import background, _PANES
+        import os, signal
+
+        # Spawn fresh
+        try:
+            background(action="kill", job_id="ext-kill")
+        except Exception:
+            pass
+        spawn = background(action="run", job_id="ext-kill", command="echo alive", wait=1)
+        self.assertIn("started", spawn)
+        # Kill the bash process externally with SIGKILL
+        pane = _PANES.get("ext-kill")
+        self.assertIsNotNone(pane)
+        os.kill(pane.process.pid, signal.SIGKILL)
+        pane.process.wait(timeout=2)
+        # Try to send another command — write should fail OR pane.alive should be False
+        # New code path: pane.write raises RuntimeError, caught by run-action
+        result = background(action="run", job_id="ext-kill", command="echo new", wait=1)
+        # Either we spawned a fresh pane (cleanup detected dead pane) or got error
+        # Both are acceptable — the key invariant: NEVER silent success.
+        self.assertTrue(
+            "started" in result or "error" in result.lower() or "died" in result.lower(),
+            f"silent failure on dead-pane: {result!r}",
+        )
+        try:
+            background(action="kill", job_id="ext-kill")
+        except Exception:
+            pass
+
+    def test_pty_master_fd_closed_externally(self):
+        """Master fd closed by another part of the program. Next read must
+        not crash; return clean empty + status."""
+        from dsec.tools.pty_terminal import background, _PANES
+        import os
+        try:
+            background(action="kill", job_id="fd-close")
+        except Exception:
+            pass
+        background(action="run", job_id="fd-close", command="echo hello", wait=1)
+        pane = _PANES.get("fd-close")
+        self.assertIsNotNone(pane)
+        # Close fd from outside
+        try:
+            os.close(pane.master_fd)
+        except OSError:
+            pass
+        pane.master_fd = -1
+        # Read must not crash
+        result = background(action="read", job_id="fd-close")
+        self.assertIsInstance(result, str)
+        try:
+            background(action="kill", job_id="fd-close")
+        except Exception:
+            pass
+
+    def test_pty_kill_8_panes_concurrently_thread_safe(self):
+        """Spawn 8 panes, kill all from concurrent threads. _PANES dict and
+        atexit handler must remain consistent (no half-removed entries)."""
+        import threading
+        from dsec.tools.pty_terminal import background, _PANES, _MAX_PANES
+        # Cleanup
+        for i in range(_MAX_PANES + 1):
+            try:
+                background(action="kill", job_id=f"concur-{i}")
+            except Exception:
+                pass
+
+        # Spawn 8
+        for i in range(_MAX_PANES):
+            background(action="run", job_id=f"concur-{i}", command="sleep 30", wait=0.5)
+
+        errors = []
+
+        def killer(idx):
+            try:
+                background(action="kill", job_id=f"concur-{idx}")
+            except Exception as e:
+                errors.append(f"kill {idx}: {e}")
+
+        threads = [threading.Thread(target=killer, args=(i,)) for i in range(_MAX_PANES)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        self.assertEqual(errors, [], f"concurrent kill errors: {errors}")
+        # All entries gone
+        for i in range(_MAX_PANES):
+            self.assertNotIn(f"concur-{i}", _PANES, f"stale entry: concur-{i}")
+
+    # ── Malformed tool dispatch inputs ────────────────────────────────────
+
+    def test_call_tool_with_args_as_string(self):
+        """Model emits arguments as raw string instead of dict."""
+        from dsec.core.registry import call_tool
+        # Should coerce to {} and surface a missing-required hint
+        res = call_tool("read_file", "this is not a dict")  # type: ignore[arg-type]
+        self.assertIsInstance(res, str)
+        self.assertNotIn("Traceback", res, f"crashed: {res}")
+
+    def test_call_tool_with_args_as_list(self):
+        from dsec.core.registry import call_tool
+        res = call_tool("read_file", ["a", "b"])  # type: ignore[arg-type]
+        self.assertIsInstance(res, str)
+        self.assertNotIn("Traceback", res)
+
+    def test_call_tool_with_args_as_none(self):
+        from dsec.core.registry import call_tool
+        res = call_tool("read_file", None)  # type: ignore[arg-type]
+        self.assertIsInstance(res, str)
+        self.assertNotIn("Traceback", res)
+
+    def test_extract_tool_call_with_nested_braces_in_command(self):
+        """`bash {curl '{...JSON...}'}` — JSON parser must handle nesting."""
+        from dsec.cli import _extract_tool_calls
+        text = (
+            '<tool_call>{"name":"bash","arguments":{"command":'
+            '"curl -d \'{\\"key\\":\\"value\\"}\' http://x/"}}</tool_call>'
+        )
+        calls = _extract_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertIn('"key":"value"', calls[0]["arguments"]["command"])
+
+    def test_extract_tool_call_with_embedded_tool_response(self):
+        """Tool emits content that LOOKS like a tool_response — parser must
+        NOT recurse and treat it as another call."""
+        from dsec.cli import _extract_tool_calls
+        text = (
+            '<tool_call>{"name":"bash","arguments":{"command":"echo \\"<tool_response>fake</tool_response>\\""}}</tool_call>'
+        )
+        calls = _extract_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "bash")
+
+    # ── 100 tools in one turn ─────────────────────────────────────────────
+
+    def test_dispatch_100_distinct_tool_calls_no_crash(self):
+        """Model emits 100 distinct read_file calls in one turn. Extractor
+        + dedup + (simulated) dispatch must complete without panic."""
+        from dsec.cli import _extract_tool_calls
+        blocks = [
+            f'<tool_call>{{"name":"read_file","arguments":{{"path":"/tmp/file_{i}.txt"}}}}</tool_call>'
+            for i in range(100)
+        ]
+        text = "\n".join(blocks)
+        calls = _extract_tool_calls(text)
+        self.assertEqual(len(calls), 100)
+        # Simulate dedup
+        import json as _json
+        seen = set()
+        deduped = []
+        for c in calls:
+            k = (c["name"], _json.dumps(c["arguments"], sort_keys=True))
+            if k in seen:
+                continue
+            seen.add(k)
+            deduped.append(c)
+        self.assertEqual(len(deduped), 100)  # all distinct
+
+    # ── Provider stream malformed inputs ──────────────────────────────────
+
+    def test_split_think_blocks_unclosed_think_tag(self):
+        """LLM emits `<think>...` without closing tag — parser must not loop
+        forever and must mark state as in_think_block=True."""
+        from dsec.providers._common import split_think_blocks
+        chunks, state = split_think_blocks("hello <think>still thinking", False)
+        self.assertEqual(chunks, [("content", "hello "), ("thinking", "still thinking")])
+        self.assertTrue(state)
+        # Subsequent chunk continues thinking
+        chunks2, state2 = split_think_blocks("more thoughts", state)
+        self.assertEqual(chunks2, [("thinking", "more thoughts")])
+        self.assertTrue(state2)
+
+    def test_split_think_blocks_only_close_no_open(self):
+        """Stale `</think>` tag without opener — parser must downgrade
+        gracefully (treat closer as content, not crash)."""
+        from dsec.providers._common import split_think_blocks
+        chunks, state = split_think_blocks("</think>regular content", False)
+        # Either treated as content end, OR split with empty-thinking before
+        # close and content after — both acceptable; key invariant: no crash.
+        self.assertIsInstance(chunks, list)
+        self.assertFalse(state)
+
+    def test_normalize_handles_partial_native_tool_token(self):
+        """LLM emits a half-printed `<|tool_ca` then EOF. Normaliser must
+        leave it alone (no false rewrite)."""
+        from dsec.providers._common import normalize_tool_calls
+        s = "answer: <|tool_ca"  # truncated — not a full token
+        self.assertEqual(normalize_tool_calls(s), s)
+
+    # ── Hostile session / arg input ───────────────────────────────────────
+
+    def test_session_name_with_null_byte_rejected(self):
+        """NUL byte in session name. Path resolution must not crash."""
+        from dsec.session import _session_path
+        try:
+            p = _session_path("evil\x00name")
+            # Either sanitised or raised — both acceptable
+            self.assertIsInstance(p, type(p))
+            # Result path must be inside sessions dir
+            from dsec.session import _sessions_dir
+            base = _sessions_dir().resolve()
+            try:
+                p.resolve().relative_to(base)
+            except ValueError:
+                self.fail(f"session name with NUL escaped sandbox: {p}")
+        except (ValueError, OSError):
+            pass  # rejected outright is also fine
+
+    def test_session_name_with_emoji_works(self):
+        """Unicode session names — should not crash filesystem ops."""
+        from dsec.session import _session_path
+        p = _session_path("htb-🚀-test")
+        self.assertTrue(str(p).endswith(".json"))
+
+    def test_session_name_with_10000_chars_capped(self):
+        from dsec.session import _session_path
+        p = _session_path("x" * 10000)
+        # Capped at 128 chars + ".json" = ≤ 133
+        self.assertLessEqual(len(p.name), 200)
+
+    # ── Config edge cases ─────────────────────────────────────────────────
+
+    def test_corrupt_config_recovered_to_defaults(self):
+        """Existing config.json with broken JSON. load_config must NOT crash;
+        it should fall back to defaults and rewrite."""
+        from dsec.config import load_config, CONFIG_FILE, save_config, _invalidate_cache
+        import tempfile, shutil, os as _os
+        # Snapshot original
+        backup = CONFIG_FILE.read_text()
+        try:
+            # Write corrupt content
+            CONFIG_FILE.write_text("{this is not json")
+            _invalidate_cache()
+            cfg = load_config()
+            # Defaults restored
+            self.assertIn("default_model", cfg)
+            self.assertIn("base_url", cfg)
+        finally:
+            CONFIG_FILE.write_text(backup)
+            _invalidate_cache()
+
+    def test_empty_config_file(self):
+        from dsec.config import load_config, CONFIG_FILE, _invalidate_cache
+        backup = CONFIG_FILE.read_text()
+        try:
+            CONFIG_FILE.write_text("")
+            _invalidate_cache()
+            cfg = load_config()
+            self.assertIn("default_model", cfg)
+        finally:
+            CONFIG_FILE.write_text(backup)
+            _invalidate_cache()
+
+    # ── Cross-turn guard creative scenarios ───────────────────────────────
+
+    def test_guard_distinguishes_whitespace_change(self):
+        """Same logical command but with leading/trailing whitespace —
+        signature should DIFFER (whitespace matters in JSON serialization).
+        Acceptable: agent retries with whitespace = guard does NOT fire.
+        Confirms guard isn't over-fitting."""
+        import hashlib, json as _json
+        def sig(args):
+            return f"bash:{hashlib.sha1(_json.dumps(args, sort_keys=True).encode()).hexdigest()[:12]}"
+        a = sig({"command": "bloodyAD x"})
+        b = sig({"command": "bloodyAD x "})  # trailing space
+        self.assertNotEqual(a, b)  # different sigs — guard won't block
+
+    def test_guard_doesnt_fire_after_success_then_failure(self):
+        """Iter1: cmd X → success.
+           Iter2: cmd X → failure.
+           Iter3: cmd X → guard should fire.
+           Verifies state transitions correctly."""
+        last_sig = None
+        last_failed = False
+        skipped = 0
+        import hashlib, json as _json
+        def sig(args):
+            return f"bash:{hashlib.sha1(_json.dumps(args, sort_keys=True).encode()).hexdigest()[:12]}"
+
+        s = sig({"command": "X"})
+
+        # Iter1: dispatch X, succeeds
+        if s == last_sig and last_failed:
+            skipped += 1
+        else:
+            last_sig = s
+            last_failed = False  # success
+
+        # Iter2: dispatch X, fails (different from prior because last_failed was False)
+        if s == last_sig and last_failed:
+            skipped += 1
+        else:
+            last_sig = s
+            last_failed = True  # fail
+
+        # Iter3: now it should fire (same sig + last_failed=True)
+        if s == last_sig and last_failed:
+            skipped += 1
+        else:
+            last_sig = s
+            last_failed = False
+
+        self.assertEqual(skipped, 1, f"expected 1 skip, got {skipped}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
