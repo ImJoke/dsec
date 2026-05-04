@@ -32,18 +32,60 @@ TEXT:
     try:
         res = chat(prompt, model=model, token=token)
         content = res.get("content", "")
-        # Basic JSON extraction
-        if "[" in content and "]" in content:
-            json_str = content[content.find("["):content.rfind("]")+1]
-            return json.loads(json_str)
+        # Try parsing whole response first (model may return clean JSON)
+        try:
+            parsed = json.loads(content.strip())
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        # Walk each "[" position and try to parse a valid array from there
+        # (rfind("]") is wrong — it grabs the LAST bracket which may be in trailing text)
+        pos = 0
+        while True:
+            start = content.find("[", pos)
+            if start == -1:
+                break
+            depth = 0
+            end = -1
+            for i in range(start, len(content)):
+                if content[i] == "[":
+                    depth += 1
+                elif content[i] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+            if end == -1:
+                break
+            try:
+                parsed = json.loads(content[start:end + 1])
+                if isinstance(parsed, list):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+            pos = start + 1
     except Exception:
         pass
     return []
+
+_MAX_SUMMARIZE_CHARS = 28_000  # ~7k tokens — safe for any DeepSeek model variant
+
 
 def llm_summarize(text: str, focus: str = "general") -> str:
     """
     Generate a dense, information-rich summary of the provided text.
     """
+    # Hard cap: sending >28k chars to the API causes 服务暂时不可用 / context-too-large errors
+    # which then cascade into the server-error retry loop.
+    # Keep the START (credentials/targets established early) and END (most recent state).
+    if len(text) > _MAX_SUMMARIZE_CHARS:
+        half = _MAX_SUMMARIZE_CHARS // 2
+        text = (
+            text[:half]
+            + f"\n\n...[{len(text) - _MAX_SUMMARIZE_CHARS:,} chars omitted for length]...\n\n"
+            + text[-half:]
+        )
     model = get_best_model()
     prompt = f"""You are summarizing a penetration testing session for context compression.
 The summary will be injected back as a system message so the AI can continue the attack seamlessly.

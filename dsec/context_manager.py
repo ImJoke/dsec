@@ -172,7 +172,7 @@ class ContextManager:
         # Build intelligent agentic summary using LLM
         from dsec.llm_utils import llm_summarize
         
-        raw_text = "\n".join([f"{t.role.upper()}: {t.content}" for t in old_turns])
+        raw_text = "\n".join([f"{t.role.upper()}: {t.content[:600]}" for t in old_turns])
         try:
             summary = llm_summarize(raw_text, focus="HTB attack progress: preserve all credentials/hashes, IPs, current foothold, exact next step")
         except Exception as _sum_exc:
@@ -259,10 +259,18 @@ class ContextManager:
             from dsec.formatter import print_info
             print_info(f"Generating LLM summary for {len(discarded_turns)} discarded turns...")
 
-            from dsec.llm_utils import llm_summarize
-            raw_text = "\n".join(
-                f"{t.role.upper()}: {t.content[:800]}" for t in discarded_turns
-            )
+            from dsec.llm_utils import llm_summarize, _MAX_SUMMARIZE_CHARS
+            # Per-turn cap + total cap: prefer recent turns (walk backwards, fill budget)
+            per_turn_cap = 500
+            budget = _MAX_SUMMARIZE_CHARS
+            chunks: list = []
+            for t in reversed(discarded_turns):
+                piece = f"{t.role.upper()}: {t.content[:per_turn_cap]}"
+                if budget - len(piece) < 0:
+                    break
+                chunks.append(piece)
+                budget -= len(piece) + 1
+            raw_text = "\n".join(reversed(chunks))
             try:
                 summary_text = llm_summarize(raw_text, focus="HTB attack progress: preserve all credentials/hashes, IPs, current foothold, exact next step")
             except Exception as _sum_exc:

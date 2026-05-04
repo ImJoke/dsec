@@ -908,7 +908,17 @@ def _extract_tool_calls(text: str) -> list[dict]:
                         # Normalize "tool" -> "name"
                         if "tool" in call_data and "name" not in call_data:
                             call_data["name"] = call_data["tool"]
-                        
+
+                        # Unwrap double-nested arguments: model sometimes emits
+                        # {"name":"bash","arguments":{"arguments":{"command":"..."}}}
+                        args = call_data.get("arguments")
+                        if (
+                            isinstance(args, dict)
+                            and tuple(args.keys()) == ("arguments",)
+                            and isinstance(args.get("arguments"), dict)
+                        ):
+                            call_data["arguments"] = args["arguments"]
+
                         if "name" in call_data:
                             calls.append(call_data)
                             break
@@ -1776,6 +1786,11 @@ def _run_agentic_loop(
         for idx, call in sequential_calls:
             tool_name: str = call["name"]
             arguments: Dict[str, Any] = call.get("arguments", {})
+            # Coerce non-dict and unwrap any double-nesting that slipped past extraction
+            if not isinstance(arguments, dict):
+                arguments = {}
+            elif tuple(arguments.keys()) == ("arguments",) and isinstance(arguments.get("arguments"), dict):
+                arguments = arguments["arguments"]
 
             # Backward compatibility: old tool names → new `background` tool.
             if tool_name in {"shell", "terminal", "pty"}:
