@@ -572,14 +572,21 @@ def background(
     if action == "read":
         if not job_id:
             return "Error: 'job_id' is required for action='read'."
-        if job_id not in _PANES:
-            return _RESUME_ERR.format(job_id)
-        pane = _PANES[job_id]
-        output = strip_ansi(pane.read(timeout=1.0))
+        with _PANES_LOCK:
+            if job_id not in _PANES:
+                return _RESUME_ERR.format(job_id)
+            pane = _PANES[job_id]
+        # Hard wall-clock cap of 2s. Without max_total, a continuously
+        # printing process (feroxbuster, hashcat) keeps resetting the
+        # idle timer on every chunk and `read` blocks until the process
+        # itself goes quiet — which for an active scan can be minutes.
+        # 2s is enough to drain whatever's queued in the kernel buffer
+        # for the agent to act on.
+        output = strip_ansi(pane.read(timeout=0.5, max_total=2.0))
         status = "running" if pane.alive else f"exited({pane.process.returncode})"
         if not output:
             return f"[job '{job_id}' — {status} — no new output]"
-        return f"[job '{job_id}' — {status}]\n{output}"
+        return f"[job '{job_id}' — {status}]\n{_maybe_save_output(job_id, output)}"
 
     # ── send ─────────────────────────────────────────────────────────────────
     if action == "send":

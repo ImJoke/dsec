@@ -1516,6 +1516,22 @@ class TestBackgroundFireAndForget(unittest.TestCase):
                             command="echo HELLO_WORLD_MARKER", wait=2)
         self.assertIn("HELLO_WORLD_MARKER", result)
 
+    def test_read_capped_at_2s_on_continuous_output(self):
+        """`background read` on a job spewing burst output (yes, hashcat
+        progress) must NOT block beyond ~2s wall cap. Without the cap,
+        the idle timer kept resetting on every chunk and read held until
+        the process itself went quiet — minutes for an active scan."""
+        from dsec.tools.pty_terminal import background
+        import time
+        background(action="run", job_id="ff-burst",
+                   command="yes BURST_LINE", wait=0)
+        time.sleep(0.3)  # let it warm up
+        t0 = time.time()
+        result = background(action="read", job_id="ff-burst")
+        elapsed = time.time() - t0
+        self.assertLess(elapsed, 3.5, f"read blocked for {elapsed:.1f}s")
+        self.assertIn("ff-burst", result)
+
 
 class TestAuditReplayPersistence(unittest.TestCase):
     """Regression: state vars (_last_cmd_signature, _fail_history) were
