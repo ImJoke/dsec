@@ -90,7 +90,7 @@ class Pane:
     COLS: int = 220
     ROWS: int = 50
 
-    def __init__(self, pane_id: str, init_timeout: float = 5.0):
+    def __init__(self, pane_id: str, init_timeout: float = 1.5):
         self.pane_id = pane_id
         self.master_fd, self.slave_fd = pty.openpty()
 
@@ -143,7 +143,10 @@ class Pane:
 
         time.sleep(0.3)
         try:
-            self.read(timeout=init_timeout)
+            # Use a hard wall-clock cap during init so a verbose .bashrc
+            # (printing MOTD, fortune, etc.) can't block the spawn for
+            # init_timeout * N seconds.
+            self.read(timeout=init_timeout, max_total=init_timeout * 1.2)
         except Exception:
             try:
                 self.close()
@@ -162,10 +165,21 @@ class Pane:
             raise RuntimeError(f"Job '{self.pane_id}' process has exited.")
         os.write(self.master_fd, data.encode("utf-8"))
 
-    def read(self, timeout: float = 0.5) -> str:
-        """Read all available output until no new data for `timeout` seconds."""
+    def read(self, timeout: float = 0.5, *, max_total: Optional[float] = None) -> str:
+        """Read available output until no new data for `timeout` seconds.
+
+        `timeout` is the IDLE timeout (default behavior — needed by
+        prompt-aware shells like evil-winrm where we wait for the next
+        prompt to appear).
+
+        `max_total`, when set, is an additional HARD wall-clock cap. Use
+        this for `background run` where a continuously-printing process
+        (feroxbuster, hashcat, etc.) would otherwise reset the idle timer
+        on every chunk and block the entire wait window.
+        """
         output = b""
-        start_time = time.time()
+        idle_start = time.time()
+        wall_start = time.time()
         while True:
             fd = self.master_fd  # snapshot — close() may race
             if fd < 0:
@@ -180,12 +194,14 @@ class Pane:
                     if not chunk:
                         break
                     output += chunk
-                    start_time = time.time()  # reset idle timer on new data
+                    idle_start = time.time()  # reset idle timer on new data
                 except OSError:
                     break
             else:
-                if time.time() - start_time > timeout:
+                if time.time() - idle_start > timeout:
                     break
+            if max_total is not None and time.time() - wall_start > max_total:
+                break
         return output.decode("utf-8", errors="replace")
 
     def read_until_prompt(self, patterns: List[str], timeout: float = 15.0) -> str:
@@ -485,14 +501,30 @@ def background(
                 f"Retry with action='run' to spawn a fresh pane.]"
             )
 
-        # Cap wait at 10s for background runs — anything longer should poll via
-        # action='read'. Previously up to 30s; that turned `background run` into
-        # a near-blocking call when the model picked wait=20-30.
-        wait_clamped = max(0.5, min(float(wait), 10.0))
-        try:
-            output = strip_ansi(pane.read(timeout=wait_clamped))
-        except (OSError, ValueError) as exc:
-            output = f"[read error: {type(exc).__name__}: {exc}]"
+        # Two modes for `background run`:
+        #   wait=0       → fire-and-forget. Skip the initial read entirely;
+        #                  return as soon as the command is written. Use this
+        #                  for long-running enumeration (feroxbuster, hashcat)
+        #                  that you'll poll via action='read' later.
+        #   wait>0 (default 3.0) → read initial output with TWO caps:
+        #                  - idle timeout = `wait` (returns when output goes idle)
+        #                  - hard wall-clock cap = `wait * 1.5` (prevents
+        #                    continuously-printing tools from holding the
+        #                    runner forever — they reset the idle timer on
+        #                    every chunk).
+        #                  Capped at 10s of wall-clock total.
+        wait_f = float(wait)
+        if wait_f <= 0:
+            output = ""  # fire-and-forget
+        else:
+            wait_clamped = max(0.5, min(wait_f, 10.0))
+            wall_cap = min(wait_clamped * 1.5, 10.0)
+            try:
+                output = strip_ansi(
+                    pane.read(timeout=wait_clamped, max_total=wall_cap)
+                )
+            except (OSError, ValueError) as exc:
+                output = f"[read error: {type(exc).__name__}: {exc}]"
 
         status = "running" if pane.alive else f"exited({pane.process.returncode})"
         pane._history.append({"cmd": command, "output": output})
