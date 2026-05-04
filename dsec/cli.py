@@ -1366,7 +1366,8 @@ def _run_agentic_loop(
     # DeepSeek-only routing — no provider fallback. Inner retry handles
     # transient errors via exponential backoff with token rotation
     # (get_next_token rotates on each call).
-    _SERVER_ERROR_RETRY_LIMIT = 12    # transient DeepSeek errors before extended cooldown
+    _SERVER_ERROR_RETRY_LIMIT = 5    # transient DeepSeek errors before extended cooldown
+    _SERVER_ERROR_FORCE_COMPACT_AT = 3  # on retry N, drop conv_id + send pruned history
     _server_cooldown_used = False     # only allow one extended cooldown per loop
 
     # Patterns in tool output that indicate a technique conceptually failed
@@ -1521,10 +1522,10 @@ def _run_agentic_loop(
                                 _server_cooldown_used = True
                                 print_warning(
                                     f"Server unavailable after {_server_error_streak} retries. "
-                                    "Waiting 120s for recovery…"
+                                    "Waiting 60s for recovery…"
                                 )
-                                _time.sleep(120)
-                                _server_error_streak = _SERVER_ERROR_RETRY_LIMIT - 5
+                                _time.sleep(60)
+                                _server_error_streak = 0
                                 print_info("Resuming after extended cooldown.")
                             else:
                                 stop_reason = (
@@ -1543,6 +1544,13 @@ def _run_agentic_loop(
                                     print_warning(f"Autopilot bug finder wrote issue report to {issue_path}")
                                 _server_stop = True
                                 break
+
+                        # On retry 3+, force-compact context: maybe upstream is rejecting
+                        # because of stored conv_id state size, not its own load.
+                        if _server_error_streak >= _SERVER_ERROR_FORCE_COMPACT_AT and current_conv_id is not None:
+                            print_info("Force-compacting context — dropping conv_id and pruning history.")
+                            _compact_loop_context(reason="server-error retry compaction", force=True)
+                            current_conv_id = None  # ensure fresh server-side state
 
                         thinking = ""
                         new_content = None
@@ -2501,13 +2509,20 @@ def _run_agentic_loop(
                     if _server_error_streak >= _SERVER_ERROR_RETRY_LIMIT:
                         if not _server_cooldown_used:
                             _server_cooldown_used = True
-                            print_warning(f"Server unavailable after {_server_error_streak} retries. Waiting 120s…")
-                            _time.sleep(120)
-                            _server_error_streak = _SERVER_ERROR_RETRY_LIMIT - 5
+                            print_warning(f"Server unavailable after {_server_error_streak} retries. Waiting 60s…")
+                            _time.sleep(60)
+                            _server_error_streak = 0
                             print_info("Resuming after extended cooldown.")
                         else:
                             new_content = None  # force break below
                             break
+
+                    # On retry 3+, force-compact context: maybe upstream is rejecting
+                    # because of stored conv_id state size, not its own load.
+                    if _server_error_streak >= _SERVER_ERROR_FORCE_COMPACT_AT and current_conv_id is not None:
+                        print_info("Force-compacting context — dropping conv_id and pruning history.")
+                        _compact_loop_context(reason="server-error retry compaction", force=True)
+                        current_conv_id = None
 
                     thinking = ""
                     new_content = None
