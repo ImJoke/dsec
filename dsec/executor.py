@@ -200,9 +200,15 @@ class CommandRunner:
                 try:
                     proc.stdin.write(_sudo_stdin)
                     proc.stdin.flush()
-                    proc.stdin.close()
                 except OSError:
                     pass
+                finally:
+                    # close() must run even if write/flush failed; otherwise the
+                    # child blocks forever waiting for stdin EOF on sudo prompts.
+                    try:
+                        proc.stdin.close()
+                    except OSError:
+                        pass
 
             exception_holder = {"out": None, "err": None}
 

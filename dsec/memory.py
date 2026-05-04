@@ -433,9 +433,9 @@ def auto_extract_memories_llm(
     from dsec.llm_utils import llm_extract_facts
     
     facts = llm_extract_facts(response)
-    if not facts:
+    if not facts or not isinstance(facts, list):
         return []
-        
+
     stored_ids: List[str] = []
     for item in facts:
         if not isinstance(item, dict):

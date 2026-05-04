@@ -256,7 +256,10 @@ class Pane:
         self.master_fd = -1
 
 
+import threading as _threading
+
 _PANES: Dict[str, Pane] = {}
+_PANES_LOCK = _threading.Lock()
 _MAX_PANES = 8
 _RESUME_ERR = (
     "Job '{}' does not exist — background jobs are in-memory and do not survive "
@@ -266,28 +269,57 @@ _RESUME_ERR = (
 
 
 def _cleanup_all_panes():
-    for pane in list(_PANES.values()):
+    with _PANES_LOCK:
+        panes = list(_PANES.values())
+        _PANES.clear()
+    for pane in panes:
         try:
             pane.close()
         except Exception:
             pass
-    _PANES.clear()
 
 
 atexit.register(_cleanup_all_panes)
 
 
 def _get_or_create(job_id: str) -> Pane:
-    if job_id in _PANES:
-        pane = _PANES[job_id]
-        if not pane.alive:
-            pane.close()
-            _PANES[job_id] = Pane(job_id)
-        return _PANES[job_id]
-    if len(_PANES) >= _MAX_PANES:
-        raise RuntimeError(f"Max {_MAX_PANES} background jobs reached. Kill one first.")
-    _PANES[job_id] = Pane(job_id)
-    return _PANES[job_id]
+    """Atomically look up or create a pane for the given job_id.
+
+    Lock scope intentionally narrow: spawn the new Pane (which opens a PTY
+    and forks bash) outside the lock so other callers can still read/list
+    while a slow spawn is in progress.
+    """
+    with _PANES_LOCK:
+        existing = _PANES.get(job_id)
+        if existing and existing.alive:
+            return existing
+
+    # Either new id, or stale dead pane — spawn a fresh one outside the lock.
+    new_pane = Pane(job_id)
+
+    with _PANES_LOCK:
+        # Re-check inside the lock in case another thread won the race.
+        existing = _PANES.get(job_id)
+        if existing and existing.alive:
+            # Lost the race — discard our spare and use the winner.
+            try:
+                new_pane.close()
+            except Exception:
+                pass
+            return existing
+        if existing and not existing.alive:
+            try:
+                existing.close()
+            except Exception:
+                pass
+        if len(_PANES) >= _MAX_PANES and job_id not in _PANES:
+            try:
+                new_pane.close()
+            except Exception:
+                pass
+            raise RuntimeError(f"Max {_MAX_PANES} background jobs reached. Kill one first.")
+        _PANES[job_id] = new_pane
+        return new_pane
 
 
 def _clean_exec_output(raw: str, command: str) -> str:
