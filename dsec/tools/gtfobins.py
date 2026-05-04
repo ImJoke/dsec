@@ -226,7 +226,7 @@ _LOLBAS_DB: Dict[str, Dict[str, List[str]]] = {
 # Registered Tools
 # ---------------------------------------------------------------------------
 
-@register("gtfobins_search", "Search for GTFOBins exploitation commands for a specific binary (e.g., find, vim, nmap). Returns SUID, Sudo, and Shell escape vectors.")
+@register("gtfobins_search", "Search for GTFOBins exploitation commands for a specific binary (e.g., find, vim, nmap). Returns SUID, Sudo, and Shell escape vectors.", roles=("brain", "research"))
 def gtfobins_search(binary: str) -> str:
     """Search the GTFOBins database for exploitation techniques."""
     binary = binary.strip().lower()
@@ -268,7 +268,7 @@ def gtfobins_search(binary: str) -> str:
     return f"No GTFOBins entry found for '{binary}'. Try common binaries like: python, vim, find, nmap, docker, tar, etc."
 
 
-@register("gtfobins_list", "List all available GTFOBins entries, optionally filtered by exploitation category (shell, suid, sudo, reverse_shell, file_read, file_write).")
+@register("gtfobins_list", "List all available GTFOBins entries, optionally filtered by exploitation category (shell, suid, sudo, reverse_shell, file_read, file_write).", roles=("brain", "research"))
 def gtfobins_list(category: str = "") -> str:
     """List GTFOBins entries, optionally filtered by category."""
     category = category.strip().lower()

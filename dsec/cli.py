@@ -99,6 +99,7 @@ def _ensure_native_tools_loaded():
         import dsec.skills.persistence  # noqa: F401
         import dsec.tools.payload_tools # noqa: F401
         import dsec.tools.knowledge_tools # noqa: F401
+        import dsec.agents.brain_tools  # noqa: F401  # registers `executor` brain tool
     except ImportError:
         pass
     try:
@@ -1447,6 +1448,22 @@ def _run_agentic_loop(
             f"{_cm.usage_percent}% → pruned to {_kept} turns."
         )
 
+    # Multi-agent feature flag — when True, brain delegates bash + executor-only
+    # tools to the executor sub-agent. Reads config once per loop entry.
+    _multi_agent_active = bool(config.get("enable_multi_agent"))
+    _brain_caller_role: Optional[str] = "brain" if _multi_agent_active else None
+
+    # Surface the brain's running context to any worker spawned mid-loop.
+    try:
+        from dsec.agents import brain_context_var
+        _brain_context_token = brain_context_var.set({
+            "cumulative_summary": (session_data or {}).get("cumulative_summary", "") if session_data else "",
+            "domain": domain,
+            "session_name": session_name,
+        })
+    except Exception:
+        _brain_context_token = None
+
     for iteration in range(1, max_iterations + 1):
         tool_calls = _extract_tool_calls(current_response)
         if not tool_calls:
@@ -1538,6 +1555,7 @@ def _run_agentic_loop(
                                 base_url=config.get("base_url", "http://localhost:8000"),
                                 token=get_next_token(),
                                 history=_loop_pruned_history,
+                                role="brain",
                             )
                             _loop_pruned_history = None
                             thinking, new_content, new_conv_id = stream_response(
@@ -1630,6 +1648,7 @@ def _run_agentic_loop(
                         base_url=config.get("base_url", "http://localhost:8000"),
                         token=get_next_token(),
                         history=_loop_pruned_history,
+                        role="brain",
                     )
                     _loop_pruned_history = None
                     thinking, new_content, new_conv_id = stream_response(
@@ -1834,6 +1853,14 @@ def _run_agentic_loop(
 
             # ── bash tool ─────────────────────────────────────────────────────
             if tool_name == "bash":
+                if _multi_agent_active:
+                    deny_msg = (
+                        "[denied: brain cannot run bash directly when enable_multi_agent=true. "
+                        "Delegate execution via <tool_call>{\"name\":\"executor\","
+                        "\"arguments\":{\"plan\":\"...\"}}</tool_call> instead.]"
+                    )
+                    tool_responses.append({"name": tool_name, "result": deny_msg})
+                    continue
                 cmd = arguments.get("command", "").strip()
                 # Preserve internal newlines — heredocs and python3 -c "..." multiline
                 # scripts need them. Only normalize tabs and strip edges.
@@ -2284,7 +2311,7 @@ def _run_agentic_loop(
                 if len(args_str) > 100: args_str = args_str[:100] + "…"
                 with console.status(f"[bold magenta]⚙ {tool_name}[/bold magenta] [#888888]{args_str}[/]", spinner="dots") as status:
                     try:
-                        result = registry_call_tool(tool_name, arguments)
+                        result = registry_call_tool(tool_name, arguments, caller_role=_brain_caller_role)
                         result_text = str(result) if result is not None else "(no output)"
                         # Truncate very long results for the AI context
                         if len(result_text) > 10000:
@@ -2425,6 +2452,7 @@ def _run_agentic_loop(
                 base_url=config.get("base_url", "http://localhost:8000"),
                 token=get_next_token(),
                 history=_loop_pruned_history,  # non-None only after mid-loop compaction
+                role="brain",
             )
             _loop_pruned_history = None  # consumed — clear so next iteration uses conv_id
             thinking, new_content, new_conv_id = stream_response(
@@ -2492,6 +2520,7 @@ def _run_agentic_loop(
                             base_url=config.get("base_url", "http://localhost:8000"),
                             token=get_next_token(),
                             history=_loop_pruned_history,
+                            role="brain",
                         )
                         _loop_pruned_history = None
                         thinking, new_content, new_conv_id = stream_response(
@@ -2537,6 +2566,7 @@ def _run_agentic_loop(
                         base_url=config.get("base_url", "http://localhost:8000"),
                         token=get_next_token(),
                         history=_loop_pruned_history,
+                        role="brain",
                     )
                     _loop_pruned_history = None
                     thinking, new_content, new_conv_id = stream_response(
@@ -3760,6 +3790,7 @@ def _run_chat(
         base_url=config.get("base_url", "http://localhost:8000"),
         token=get_next_token(),
         history=history,
+        role="brain",
     )
 
     thinking, response_content, new_conv_id = stream_response(
@@ -3811,6 +3842,7 @@ def _run_chat(
                 base_url=config.get("base_url", "http://localhost:8000"),
                 token=get_next_token(),
                 history=_retry_history,
+                role="brain",
             )
             thinking, response_content, new_conv_id = stream_response(
                 generator=generator,
@@ -3852,6 +3884,7 @@ def _run_chat(
             base_url=config.get("base_url", "http://localhost:8000"),
             token=get_next_token(),
             history=_pruned_history,
+            role="brain",
         )
         thinking, response_content, new_conv_id = stream_response(
             generator=generator,
@@ -4258,6 +4291,142 @@ def config_cmd(set_kv):
             console.print(f"  [bold]{key}[/bold]: {len(value)} token(s) stored")
         else:
             console.print(f"  [bold]{key}[/bold]: {value!r}")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# providers / roles subcommands (multi-agent + Ollama VPS pool)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@cli.command("providers")
+@click.argument("action", type=click.Choice(["list", "add", "remove"]), default="list")
+@click.argument("key", required=False)
+@click.option("--type", "ptype", type=click.Choice(["ollama", "deepseek"]), default="ollama")
+@click.option("--model", default=None, help="Model name (Ollama only).")
+@click.option("--endpoints", default=None, help="Comma-separated endpoint URLs (Ollama only).")
+@click.option("--auth-headers", default=None, help="Comma-separated Authorization headers aligned to --endpoints.")
+@click.option("--fallback", default=None, help="Provider key to fall back to when this pool is exhausted.")
+@click.option("--base-url", default=None, help="DeepSeek base URL (deepseek type only).")
+def providers_cmd(action, key, ptype, model, endpoints, auth_headers, fallback, base_url):
+    """Manage multi-provider routing (Ollama VPS pools, DeepSeek)."""
+    cfg = load_config()
+    providers = dict(cfg.get("providers") or {})
+
+    if action == "list":
+        if not providers:
+            print_info("No providers configured. Default: implicit DeepSeek at base_url.")
+            return
+        for k, v in providers.items():
+            descr = v.get("model") or v.get("base_url") or v.get("type")
+            eps = v.get("endpoints") or []
+            ep_str = f" ({len(eps)} endpoints)" if eps else ""
+            console.print(f"  [bold]{k}[/bold] [{v.get('type','?')}] {descr}{ep_str}")
+            if v.get("fallback"):
+                console.print(f"      fallback → {v['fallback']}")
+        return
+
+    if not key:
+        print_error("provider key is required for add/remove.")
+        return
+
+    if action == "remove":
+        if key not in providers:
+            print_warning(f"Provider '{key}' not found.")
+            return
+        del providers[key]
+        try:
+            save_config("providers", providers)
+        except ConfigError as exc:
+            print_error(str(exc))
+            return
+        print_success(f"Removed provider '{key}'.")
+        return
+
+    # action == "add"
+    entry: Dict[str, Any] = {"type": ptype}
+    if ptype == "ollama":
+        if not model:
+            print_error("--model is required for ollama providers.")
+            return
+        if not endpoints:
+            print_error("--endpoints is required for ollama providers.")
+            return
+        entry["model"] = model
+        entry["endpoints"] = [e.strip().rstrip("/") for e in endpoints.split(",") if e.strip()]
+        if auth_headers:
+            entry["auth_headers"] = [h.strip() for h in auth_headers.split(",")]
+    else:  # deepseek
+        if base_url:
+            entry["base_url"] = base_url
+    if fallback:
+        entry["fallback"] = fallback
+
+    providers[key] = entry
+    try:
+        save_config("providers", providers)
+    except ConfigError as exc:
+        print_error(str(exc))
+        return
+    print_success(f"Provider '{key}' saved: {entry}")
+
+
+@cli.command("roles")
+@click.argument("action", type=click.Choice(["list", "set", "remove"]), default="list")
+@click.argument("role", required=False)
+@click.option("--provider", default=None, help="Provider key for the role.")
+@click.option("--model", default=None, help="Optional model override (otherwise uses provider's model).")
+@click.option("--fallback", default=None, help="Optional fallback provider key.")
+def roles_cmd(action, role, provider, model, fallback):
+    """Manage per-role provider mapping (brain / research / executor / utility)."""
+    cfg = load_config()
+    roles = dict(cfg.get("roles") or {})
+
+    if action == "list":
+        if not roles:
+            print_info("No roles configured. Single-agent mode uses default_model + base_url.")
+            return
+        for k, v in roles.items():
+            tail = ""
+            if v.get("model"):
+                tail += f" model={v['model']}"
+            if v.get("fallback"):
+                tail += f" fallback={v['fallback']}"
+            console.print(f"  [bold]{k}[/bold] → {v['provider']}{tail}")
+        return
+
+    if not role:
+        print_error("role name is required for set/remove.")
+        return
+
+    if action == "remove":
+        if role not in roles:
+            print_warning(f"Role '{role}' not configured.")
+            return
+        del roles[role]
+        try:
+            save_config("roles", roles)
+        except ConfigError as exc:
+            print_error(str(exc))
+            return
+        print_success(f"Removed role '{role}'.")
+        return
+
+    # action == "set"
+    if not provider:
+        print_error("--provider is required.")
+        return
+    entry: Dict[str, Any] = {"provider": provider}
+    if model:
+        entry["model"] = model
+    if fallback:
+        entry["fallback"] = fallback
+    roles[role] = entry
+    try:
+        save_config("roles", roles)
+    except ConfigError as exc:
+        print_error(str(exc))
+        return
+    print_success(f"Role '{role}' → {entry}")
 
 
 # ────────────────────────────────────────────────────────────────────────────

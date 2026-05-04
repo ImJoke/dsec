@@ -1,21 +1,35 @@
 import inspect
 import json
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _REGISTRY: Dict[str, Dict[str, Any]] = {}
 
-def register(name: str, description: str):
+# Default role membership when a tool is registered without an explicit
+# `roles=` argument. Keeps the legacy single-agent flow seeing every tool.
+_DEFAULT_ROLES: Tuple[str, ...] = ("brain", "research", "executor")
+
+
+def register(
+    name: str,
+    description: str,
+    *,
+    roles: Optional[Tuple[str, ...]] = None,
+):
     """
     Decorator to register a Python function as a tool for the agent.
-    
+
     The function's docstring and type hints are automatically parsed to build
-    the JSON schema for the tool.
+    the JSON schema for the tool. The optional `roles` argument restricts
+    which agent roles (brain / research / executor) can see and call this
+    tool. Default = all three roles.
     """
+    role_set: Tuple[str, ...] = tuple(roles) if roles else _DEFAULT_ROLES
+
     def decorator(func: Callable) -> Callable:
         sig = inspect.signature(func)
         properties = {}
         required = []
-        
+
         for param_name, param in sig.parameters.items():
             if param_name == "self":
                 continue
@@ -42,18 +56,19 @@ def register(name: str, description: str):
 
             if param.default is inspect.Parameter.empty:
                 required.append(param_name)
-                
+
         schema = {
             "type": "object",
             "properties": properties,
             "required": required
         }
-        
+
         _REGISTRY[name] = {
             "name": name,
             "description": description,
             "schema": schema,
-            "func": func
+            "func": func,
+            "roles": role_set,
         }
         return func
     return decorator
@@ -63,6 +78,12 @@ def get_tool(name: str) -> Optional[Dict[str, Any]]:
 
 def list_tools() -> List[Dict[str, Any]]:
     return list(_REGISTRY.values())
+
+
+def list_tools_for_role(role: str) -> List[Dict[str, Any]]:
+    """Return tools whose role-set includes `role`."""
+    return [t for t in _REGISTRY.values() if role in t.get("roles", _DEFAULT_ROLES)]
+
 
 def get_registry_as_openai() -> List[Dict[str, Any]]:
     """Returns the tools formatted as OpenAI function definitions."""
@@ -78,10 +99,23 @@ def get_registry_as_openai() -> List[Dict[str, Any]]:
         })
     return tools
 
-def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
+def call_tool(
+    name: str,
+    arguments: Dict[str, Any],
+    *,
+    caller_role: Optional[str] = None,
+) -> Any:
     tool = get_tool(name)
     if not tool:
         raise ValueError(f"Unknown tool: {name}")
+
+    if caller_role is not None:
+        allowed = tool.get("roles", _DEFAULT_ROLES)
+        if caller_role not in allowed:
+            return (
+                f"[error: tool '{name}' is not available to role '{caller_role}'. "
+                f"Allowed roles: {list(allowed)}]"
+            )
 
     # Resolve common argument aliases before dispatch so the AI doesn't have
     # to remember exact parameter names for every tool.
@@ -120,9 +154,24 @@ def build_tools_system_prompt() -> str:
     """Builds a system prompt string explaining the available Python tools."""
     if not _REGISTRY:
         return ""
-        
+
     lines = ["[AVAILABLE NATIVE TOOLS]"]
     for tool in _REGISTRY.values():
+        lines.append(f"  {tool['name']}: {tool['description']}")
+        if tool["schema"]["properties"]:
+            lines.append(f"    params: {json.dumps(tool['schema']['properties'])}")
+    lines.append("[END NATIVE TOOLS]")
+    return "\n".join(lines)
+
+
+def build_tools_system_prompt_for_role(role: str) -> str:
+    """Builds the system prompt section listing only tools available to the given role."""
+    tools_for_role = list_tools_for_role(role)
+    if not tools_for_role:
+        return ""
+
+    lines = [f"[AVAILABLE NATIVE TOOLS — role={role}]"]
+    for tool in tools_for_role:
         lines.append(f"  {tool['name']}: {tool['description']}")
         if tool["schema"]["properties"]:
             lines.append(f"    params: {json.dumps(tool['schema']['properties'])}")

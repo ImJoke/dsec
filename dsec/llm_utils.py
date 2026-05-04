@@ -2,13 +2,47 @@
 DSEC LLM Utils – Intelligent extraction and summarization helpers.
 """
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dsec.client import chat
 from dsec.config import load_config
 
 def get_best_model() -> str:
     cfg = load_config()
     return cfg.get("default_model", "deepseek-expert-r1")
+
+
+def get_model_for_role(role: str) -> Tuple[str, str, Optional[str]]:
+    """Resolve (provider_key, model, fallback_provider_key) for a given role.
+
+    Resolution order for the model:
+      1. roles[role].model — explicit override on the role entry
+      2. The provider entry's `model` field (Ollama pools)
+      3. config["default_model"] (legacy fallback)
+
+    Returns ("deepseek", default_model, None) when the role is not
+    configured. Always returns a usable (provider_key, model) pair so
+    callers can pass the result straight to chat_stream.
+    """
+    cfg = load_config()
+    default_model = cfg.get("default_model", "deepseek-expert-r1")
+    roles = cfg.get("roles") or {}
+    entry = roles.get(role)
+    if not isinstance(entry, dict):
+        return ("deepseek", default_model, None)
+
+    provider_key = entry.get("provider", "deepseek")
+    fallback = entry.get("fallback")
+    model = entry.get("model")
+
+    if not model:
+        from dsec.providers.pool import get_pool
+        pool = get_pool(provider_key)
+        if pool and pool.get("type") == "ollama":
+            model = pool.get("model") or default_model
+        else:
+            model = default_model
+
+    return (provider_key, model, fallback if isinstance(fallback, str) else None)
 
 def llm_extract_facts(text: str) -> List[Dict[str, Any]]:
     """
@@ -30,7 +64,7 @@ TEXT:
     from dsec.config import get_next_token
     token = get_next_token()
     try:
-        res = chat(prompt, model=model, token=token)
+        res = chat(prompt, model=model, token=token, role="utility")
         content = res.get("content", "")
         # Try parsing whole response first (model may return clean JSON)
         try:
@@ -110,7 +144,7 @@ CONVERSATION TO SUMMARIZE:
     from dsec.config import get_next_token
     token = get_next_token()
     try:
-        res = chat(prompt, model=model, token=token)
+        res = chat(prompt, model=model, token=token, role="utility")
         return res.get("content", "Summary failed.")
     except Exception:
         return "Summary failed."
