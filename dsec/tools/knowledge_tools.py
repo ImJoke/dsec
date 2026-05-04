@@ -47,6 +47,7 @@ _WRITEUP_QUERY_RE = __import__("re").compile(
     "impacket usage, tool syntax, attack patterns, enumeration references. "
     "ONLY search for TECHNIQUES and TOOLS — never search for a specific machine name "
     "or 'writeup'/'walkthrough' — that would be cheating and is blocked.",
+    roles=("brain", "research"),
 )
 def notes_search(query: str, tags: Optional[str] = None, limit: int = 5) -> str:
     # Block writeup/solution searches — agent must solve independently
@@ -89,6 +90,7 @@ def notes_search(query: str, tags: Optional[str] = None, limit: int = 5) -> str:
     "notes_get",
     "Fetch the full content of a note by exact title (e.g. 'ADCS - ESC15 Exploitation'). "
     "Use after notes_search when you need the complete writeup.",
+    roles=("brain", "research"),
 )
 def notes_get(title: str) -> str:
     note = kb_get(title)
@@ -107,6 +109,7 @@ def notes_get(title: str) -> str:
 @register(
     "notes_tags",
     "List all available note tags with counts. Useful to discover what topics are documented.",
+    roles=("brain", "research"),
 )
 def notes_tags(min_count: int = 2) -> str:
     tags = kb_tags(min_count=int(min_count))
@@ -122,6 +125,7 @@ def notes_tags(min_count: int = 2) -> str:
 @register(
     "notes_reload",
     "Re-scan the notes vault after manual additions or edits.",
+    roles=("brain", "research"),
 )
 def notes_reload() -> str:
     state = kb_reload()

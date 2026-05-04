@@ -398,6 +398,11 @@ def stream_response(
                     conv_id = chunk.get("conversation_id")
                     live.update(_render(False))
 
+                elif ctype == "info":
+                    notice = chunk.get("text", "")
+                    if notice:
+                        console.print(f"[dim cyan]ℹ  {notice}[/dim cyan]")
+
                 elif ctype == "error":
                     error_panel = Panel(
                         Text(f"❌  {chunk['text']}", style="bold red"),

@@ -6,7 +6,8 @@ from typing import Optional, List, Dict
 
 @register(
     name="dsec_generate_payload",
-    description="Generate common security payloads (reverse shells, file transfers, etc.) based on target OS and language."
+    description="Generate common security payloads (reverse shells, file transfers, etc.) based on target OS and language.",
+    roles=("executor",),
 )
 def dsec_generate_payload(
     type: str,

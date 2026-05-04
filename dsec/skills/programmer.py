@@ -69,7 +69,7 @@ def programmer_view_file(filepath: str, start_line: int = 0, end_line: int = 0) 
         return f"Error reading file {filepath}: {e}"
 
 
-@register("programmer_edit_file", "Edits a file by replacing an exact old block of code with a new block (Aider SEARCH/REPLACE style).")
+@register("programmer_edit_file", "Edits a file by replacing an exact old block of code with a new block (Aider SEARCH/REPLACE style).", roles=("executor",))
 def programmer_edit_file(filepath: str, old_content: str, new_content: str) -> str:
     try:
         filepath = _safe_path(filepath)
@@ -118,6 +118,7 @@ def programmer_edit_file(filepath: str, old_content: str, new_content: str) -> s
     "Creates a new file with the specified content. "
     "Params: filepath (or 'path'), content (or 'text'). "
     "Prefer write_file for new code — it handles overwrite and parent-dir creation.",
+    roles=("executor",),
 )
 def programmer_create_file(filepath: str = "", content: str = "", **kwargs) -> str:
     # Accept common aliases

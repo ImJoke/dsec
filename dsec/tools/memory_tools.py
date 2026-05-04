@@ -107,7 +107,7 @@ def _scan_content(content: str) -> str:
     return ""
 
 
-@register("core_memory_append", "Appends text to a core memory block (persona, human, project, scratchpad).")
+@register("core_memory_append", "Appends text to a core memory block (persona, human, project, scratchpad).", roles=("brain",))
 def core_memory_append(block: str, content: str) -> str:
     if block not in _VALID_BLOCKS:
         return f"Error: block must be one of {_VALID_BLOCKS}"
@@ -123,7 +123,7 @@ def core_memory_append(block: str, content: str) -> str:
     return f"Appended to core memory block '{block}'. Current length: {len(mem[block])} chars."
 
 
-@register("core_memory_replace", "Replaces the entire content of a core memory block.")
+@register("core_memory_replace", "Replaces the entire content of a core memory block.", roles=("brain",))
 def core_memory_replace(block: str, new_content: str) -> str:
     if block not in _VALID_BLOCKS:
         return f"Error: block must be one of {_VALID_BLOCKS}"
@@ -152,7 +152,7 @@ def core_memory_read(block: str) -> str:
 
 # ── Graph Memory ──────────────────────────────────────────────────────────
 
-@register("graph_memory_insert", "Inserts a relationship (Entity1 -> Relation -> Entity2) into the knowledge graph.")
+@register("graph_memory_insert", "Inserts a relationship (Entity1 -> Relation -> Entity2) into the knowledge graph.", roles=("brain",))
 def graph_memory_insert(source_entity: str, relation: str, target_entity: str) -> str:
     err = _scan_content(source_entity + " " + relation + " " + target_entity)
     if err: return err
@@ -167,7 +167,7 @@ def graph_memory_insert(source_entity: str, relation: str, target_entity: str) -
     return "Failed to insert graph edge."
 
 
-@register("graph_memory_search", "Searches the hybrid memory for entities or relationships.")
+@register("graph_memory_search", "Searches the hybrid memory for entities or relationships.", roles=("brain", "research"))
 def graph_memory_search(query: str) -> str:
     # First try graph entity lookup
     entity_results = graph_query_entity(query)
@@ -193,7 +193,7 @@ def graph_memory_search(query: str) -> str:
     return "\n".join(lines) if lines else "No results found."
 
 
-@register("dsec_archival_search", "Advanced structured search over the historical memory store.")
+@register("dsec_archival_search", "Advanced structured search over the historical memory store.", roles=("brain", "research"))
 def dsec_archival_search(
     query: str, 
     domain: Optional[str] = None, 
@@ -229,7 +229,7 @@ def dsec_archival_search(
     return "\n".join(lines)
 
 
-@register("graph_memory_forget", "Removes an entity and all its relationships from the knowledge graph (intentional forgetting).")
+@register("graph_memory_forget", "Removes an entity and all its relationships from the knowledge graph (intentional forgetting).", roles=("brain",))
 def graph_memory_forget(entity: str) -> str:
     ok = graph_forget_node(entity)
     if ok:
@@ -237,7 +237,7 @@ def graph_memory_forget(entity: str) -> str:
     return f"Entity '{entity}' not found in the knowledge graph."
 
 
-@register("graph_memory_path", "Finds relationship paths between two entities in the knowledge graph (up to 4 hops).")
+@register("graph_memory_path", "Finds relationship paths between two entities in the knowledge graph (up to 4 hops).", roles=("brain", "research"))
 def graph_memory_path(source: str, target: str) -> str:
     paths = graph_query_path(source, target)
     if not paths:

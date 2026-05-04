@@ -377,6 +377,7 @@ def _clean_exec_output(raw: str, command: str) -> str:
         "NOTE: Background jobs are IN-MEMORY. They do NOT survive session compression\n"
         "or resume. If a job 'does not exist', restart it with action='run'.\n"
     ),
+    roles=("executor",),
 )
 def background(
     action: str,

@@ -16,6 +16,7 @@ def chat(
     base_url: str = "http://localhost:8000",
     token: Optional[str] = None,
     provider: str = "deepseek",
+    role: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Non-streaming chat request.
@@ -25,7 +26,16 @@ def chat(
     content_parts = []
     final_conv_id = conversation_id
 
-    for chunk in chat_stream(message, model, conversation_id, base_url, token, provider):
+    for chunk in chat_stream(
+        message,
+        model,
+        conversation_id,
+        base_url,
+        token,
+        provider,
+        history=None,
+        role=role,
+    ):
         ctype = chunk.get("type")
         if ctype == "thinking":
             thinking_parts.append(chunk["text"])

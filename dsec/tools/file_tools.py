@@ -60,6 +60,7 @@ def _safe_path(path: str) -> Path:
         "  - Returns the path and byte size on success\n"
         "  - Use patch_file for targeted edits to avoid re-sending the whole file\n"
     ),
+    roles=("executor",),
 )
 def write_file(path: str, content: str, mode: str = "write") -> str:
     if not path:
@@ -172,6 +173,7 @@ def read_file(path: str, offset: int = 1, limit: int = 200) -> str:
         "    new_string='PORT = 9001'\n"
         "  )\n"
     ),
+    roles=("executor",),
 )
 def patch_file(
     path: str,

@@ -28,6 +28,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "memory_max_inject": 3,
     "tokens": [],
     "current_token_index": 0,
+    # Multi-provider routing. The implicit "deepseek" entry stays available
+    # even when this dict is empty, sourced from top-level base_url.
+    "providers": {},
+    # Per-role provider mapping: roles[role] = {"provider": "<key>", "fallback": "<key>"}
+    "roles": {},
+    # Master switch for the brain/research/executor multi-agent split.
+    "enable_multi_agent": False,
 }
 
 ConfigValidator = Callable[[Any], Any]
@@ -152,6 +159,98 @@ def _coerce_tokens(value: Any) -> List[str]:
     return tokens
 
 
+def _coerce_providers(value: Any) -> Dict[str, Dict[str, Any]]:
+    """Validate config["providers"]: {key: {type, ...}}."""
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError("providers must be an object")
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for key, entry in value.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ConfigError("provider key must be a non-empty string")
+        if not isinstance(entry, dict):
+            raise ConfigError(f"provider '{key}' must be an object")
+
+        ptype = entry.get("type")
+        if ptype not in ("deepseek", "ollama"):
+            raise ConfigError(f"provider '{key}': type must be 'deepseek' or 'ollama'")
+
+        norm: Dict[str, Any] = {"type": ptype}
+        if ptype == "deepseek":
+            base_url = entry.get("base_url")
+            if base_url is not None:
+                norm["base_url"] = _coerce_string(base_url)
+        else:  # ollama
+            model = entry.get("model")
+            if not isinstance(model, str) or not model.strip():
+                raise ConfigError(f"provider '{key}': 'model' is required for ollama")
+            norm["model"] = model.strip()
+
+            endpoints = entry.get("endpoints")
+            if not isinstance(endpoints, list) or not endpoints:
+                raise ConfigError(f"provider '{key}': 'endpoints' must be a non-empty list")
+            cleaned: List[str] = []
+            for ep in endpoints:
+                if not isinstance(ep, str) or not ep.strip():
+                    raise ConfigError(f"provider '{key}': endpoint must be non-empty string")
+                cleaned.append(ep.strip().rstrip("/"))
+            norm["endpoints"] = cleaned
+
+            auth_headers = entry.get("auth_headers")
+            if auth_headers is not None:
+                if not isinstance(auth_headers, list):
+                    raise ConfigError(f"provider '{key}': 'auth_headers' must be a list")
+                if len(auth_headers) > len(cleaned):
+                    raise ConfigError(
+                        f"provider '{key}': 'auth_headers' length must be <= endpoints length"
+                    )
+                norm["auth_headers"] = [str(h) if h is not None else "" for h in auth_headers]
+
+        fallback = entry.get("fallback")
+        if fallback is not None:
+            if not isinstance(fallback, str) or not fallback.strip():
+                raise ConfigError(f"provider '{key}': 'fallback' must be non-empty string")
+            norm["fallback"] = fallback.strip()
+
+        out[key.strip()] = norm
+
+    return out
+
+
+def _coerce_roles(value: Any) -> Dict[str, Dict[str, Any]]:
+    """Validate config["roles"]: {role: {provider: key, fallback?: key}}."""
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError("roles must be an object")
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for role, entry in value.items():
+        if not isinstance(role, str) or not role.strip():
+            raise ConfigError("role key must be a non-empty string")
+        if not isinstance(entry, dict):
+            raise ConfigError(f"role '{role}' must be an object")
+        provider = entry.get("provider")
+        if not isinstance(provider, str) or not provider.strip():
+            raise ConfigError(f"role '{role}': 'provider' is required")
+        norm: Dict[str, Any] = {"provider": provider.strip()}
+        fallback = entry.get("fallback")
+        if fallback is not None:
+            if not isinstance(fallback, str) or not fallback.strip():
+                raise ConfigError(f"role '{role}': 'fallback' must be non-empty string")
+            norm["fallback"] = fallback.strip()
+        model_override = entry.get("model")
+        if model_override is not None:
+            if not isinstance(model_override, str) or not model_override.strip():
+                raise ConfigError(f"role '{role}': 'model' must be non-empty string when set")
+            norm["model"] = model_override.strip()
+        out[role.strip()] = norm
+
+    return out
+
+
 VALIDATORS: Dict[str, ConfigValidator] = {
     "base_url": _coerce_string,
     "default_model": _coerce_string,
@@ -166,6 +265,9 @@ VALIDATORS: Dict[str, ConfigValidator] = {
     "memory_max_inject": lambda value: _coerce_int(value, minimum=1),
     "tokens": _coerce_tokens,
     "current_token_index": lambda value: _coerce_int(value, minimum=0),
+    "providers": _coerce_providers,
+    "roles": _coerce_roles,
+    "enable_multi_agent": _coerce_bool,
 }
 
 # ── In-memory config cache (avoids re-reading disk on every call) ────────

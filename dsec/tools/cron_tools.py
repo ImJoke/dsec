@@ -5,7 +5,8 @@ from typing import Optional
 
 @register(
     name="dsec_cron_create",
-    description="Schedule a new background task (routine). Schedule can be 'every 1h', 'every 30m', '2h' (one-shot), or ISO timestamp."
+    description="Schedule a new background task (routine). Schedule can be 'every 1h', 'every 30m', '2h' (one-shot), or ISO timestamp.",
+    roles=("brain",),
 )
 def dsec_cron_create(prompt: str, schedule: str, name: Optional[str] = None, deliver: str = "local"):
     try:
@@ -16,7 +17,8 @@ def dsec_cron_create(prompt: str, schedule: str, name: Optional[str] = None, del
 
 @register(
     name="dsec_cron_list",
-    description="List all scheduled background tasks."
+    description="List all scheduled background tasks.",
+    roles=("brain",),
 )
 def dsec_cron_list():
     try:
@@ -27,7 +29,8 @@ def dsec_cron_list():
 
 @register(
     name="dsec_cron_remove",
-    description="Remove a scheduled background task by its ID."
+    description="Remove a scheduled background task by its ID.",
+    roles=("brain",),
 )
 def dsec_cron_remove(job_id: str):
     try:
