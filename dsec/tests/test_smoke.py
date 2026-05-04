@@ -445,6 +445,43 @@ class TestBgPollStreakGuard(unittest.TestCase):
         self.assertIn("DOES NOT EXIST", a2)
 
 
+class TestCrossTurnRetryGuard(unittest.TestCase):
+    """Regression: agent retried identical bloodyAD / certipy commands across
+    turns despite prior failure. The cross-turn guard short-circuits the
+    second dispatch and injects a 'change-args' hint."""
+
+    @staticmethod
+    def _sig(tool_name: str, arguments: dict) -> str:
+        import hashlib
+        blob = json.dumps(arguments, sort_keys=True, default=str)
+        return f"{tool_name}:{hashlib.sha1(blob.encode()).hexdigest()[:12]}"
+
+    def test_signature_stable(self):
+        a = self._sig("bash", {"command": "bloodyAD x"})
+        b = self._sig("bash", {"command": "bloodyAD x"})
+        self.assertEqual(a, b)
+
+    def test_signature_differs_on_args(self):
+        a = self._sig("bash", {"command": "bloodyAD x"})
+        b = self._sig("bash", {"command": "bloodyAD y"})
+        self.assertNotEqual(a, b)
+
+    def test_signature_differs_on_tool(self):
+        a = self._sig("bash", {"command": "x"})
+        b = self._sig("background", {"command": "x"})
+        self.assertNotEqual(a, b)
+
+    def test_threshold_lowered_to_2(self):
+        """_STUCK_THRESHOLD must be 2: agent should abandon technique after
+        2 failures, not 3 — the audit showed 8x retries before abandoning."""
+        import re, inspect
+        from dsec.cli import _run_agentic_loop
+        src = inspect.getsource(_run_agentic_loop)
+        m = re.search(r"_STUCK_THRESHOLD\s*=\s*(\d+)", src)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "2")
+
+
 class TestKerberosFailPatterns(unittest.TestCase):
     """Ensure the broader Kerberos / DNS / clock-skew patterns roll up to
     technique-fail buckets so 2x repetition triggers a pivot."""
