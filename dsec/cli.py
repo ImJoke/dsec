@@ -1920,9 +1920,26 @@ def _run_agentic_loop(
                 cmd = arguments.get("command", "").strip()
                 # Preserve internal newlines — heredocs and python3 -c "..." multiline
                 # scripts need them. Only normalize tabs and strip edges.
-                
+
                 if not cmd:
                     tool_responses.append({"name": tool_name, "result": "[error: empty command]"})
+                    continue
+
+                # ── Cross-turn identical-cmd guard (mirrors registry path) ────
+                # If the agent emits a bash call with the SAME args as last turn
+                # AND the prior outcome was a failure, skip dispatch and inject
+                # a hint instead. Catches `bloodyAD ... -p X` retried verbatim.
+                import hashlib as _hashlib
+                _bash_sig_pre = f"bash:{_hashlib.sha1(_json.dumps(arguments, sort_keys=True, default=str).encode()).hexdigest()[:12]}"
+                if _bash_sig_pre == _last_cmd_signature and _last_cmd_failed:
+                    _retry_hint = (
+                        f"[hint: you just ran this exact bash command in the previous turn "
+                        f"and it FAILED. Re-running it will produce the same error. Either "
+                        f"change the arguments (different target, auth, syntax) or pivot to "
+                        f"a different tool. Inspect the prior error and ADAPT.]"
+                    )
+                    tool_responses.append({"name": tool_name, "result": _retry_hint})
+                    console.print(f"  [bold yellow]⏭ bash[/bold yellow] (skipped — identical retry)")
                     continue
 
                 # ── Wrong format detection ────────────────────────────────────

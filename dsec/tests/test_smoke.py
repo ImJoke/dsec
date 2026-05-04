@@ -482,6 +482,95 @@ class TestCrossTurnRetryGuard(unittest.TestCase):
         self.assertEqual(m.group(1), "2")
 
 
+class TestCrossTurnGuardSimulation(unittest.TestCase):
+    """End-to-end simulation of the bloodyAD-retry stuck pattern.
+
+    Replicates the exact `_run_agentic_loop` cross-turn dispatch logic
+    (state vars + check + tracker update) without a real LLM. Verifies:
+      - first call dispatches and is recorded as failed
+      - second identical call is SKIPPED with a hint, not re-dispatched
+      - third call with different args dispatches again
+      - successful call clears the failure flag
+    """
+
+    def setUp(self):
+        # State mirroring _run_agentic_loop locals
+        self._last_sig = None
+        self._last_failed = False
+        self._dispatched: list = []  # records every call that actually ran
+        self._skipped: list = []     # records calls intercepted by the guard
+
+    @staticmethod
+    def _sig(tool_name: str, arguments: dict) -> str:
+        import hashlib
+        blob = json.dumps(arguments, sort_keys=True, default=str)
+        return f"{tool_name}:{hashlib.sha1(blob.encode()).hexdigest()[:12]}"
+
+    def _step(self, tool_name: str, arguments: dict, would_fail: bool) -> str:
+        """Replicate one iteration's dispatch with the cross-turn guard."""
+        sig = self._sig(tool_name, arguments)
+        if sig == self._last_sig and self._last_failed:
+            self._skipped.append((tool_name, arguments))
+            return "[hint: identical retry — skipped]"
+        # Real dispatch (simulated)
+        self._dispatched.append((tool_name, arguments))
+        self._last_sig = sig
+        self._last_failed = would_fail
+        return "[error: ...]" if would_fail else "[ok]"
+
+    def test_bloodyAD_identical_retry_blocked(self):
+        cmd = "bloodyAD -d logging.htb -u wallace.everette -p 'Welcome2026@' --host 10.129.236.203 add groupMember IT wallace.everette"
+        # Iteration N: agent runs bloodyAD → fails (insufficientAccessRights)
+        out1 = self._step("bash", {"command": cmd}, would_fail=True)
+        self.assertIn("error", out1)
+        # Iteration N+1: agent retries IDENTICAL command
+        out2 = self._step("bash", {"command": cmd}, would_fail=True)
+        self.assertIn("identical retry — skipped", out2)
+        # Verify guard intercepted: only ONE actual dispatch
+        self.assertEqual(len(self._dispatched), 1)
+        self.assertEqual(len(self._skipped), 1)
+
+    def test_different_args_dispatched(self):
+        a = "bloodyAD -d logging.htb -u wallace.everette -p A --host 10.129.236.203 add x"
+        b = "bloodyAD -d logging.htb -u wallace.everette -p B --host 10.129.236.203 add x"
+        self._step("bash", {"command": a}, would_fail=True)
+        # Different args → dispatch again
+        self._step("bash", {"command": b}, would_fail=True)
+        self.assertEqual(len(self._dispatched), 2)
+        self.assertEqual(len(self._skipped), 0)
+
+    def test_success_clears_failure_flag(self):
+        cmd_a = "bash X"
+        cmd_b = "bash Y"
+        # First fails
+        self._step("bash", {"command": cmd_a}, would_fail=True)
+        # Different cmd succeeds (clears flag)
+        self._step("bash", {"command": cmd_b}, would_fail=False)
+        # Re-run cmd_a — should dispatch (last cmd was cmd_b, not cmd_a)
+        self._step("bash", {"command": cmd_a}, would_fail=True)
+        self.assertEqual(len(self._dispatched), 3)
+        self.assertEqual(len(self._skipped), 0)
+
+    def test_audit_replay_5x_identical_bloodyAD(self):
+        """Exact pattern from session shell-20260503-221227: 5 retries
+        of the same bloodyAD across iterations should be reduced to 1
+        actual dispatch + 4 skipped hints."""
+        cmd = "bloodyAD -d logging.htb -u wallace.everette -p 'Welcome2026@' --host 10.129.236.203 set password svc_recovery N3wSecur3P4ss!"
+        for _ in range(5):
+            self._step("bash", {"command": cmd}, would_fail=True)
+        self.assertEqual(len(self._dispatched), 1, "guard should run only first attempt")
+        self.assertEqual(len(self._skipped), 4, "remaining 4 must be skipped")
+
+    def test_bash_dispatch_check_present_in_source(self):
+        """Source-level assertion: the bash branch must contain the
+        cross-turn check (regression guard against future refactors)."""
+        from dsec import cli
+        src = open(cli.__file__).read()
+        # Look for the bash-specific pre-check we added
+        self.assertIn("Cross-turn identical-cmd guard (mirrors registry path)", src)
+        self.assertIn("⏭ bash", src)
+
+
 class TestKerberosFailPatterns(unittest.TestCase):
     """Ensure the broader Kerberos / DNS / clock-skew patterns roll up to
     technique-fail buckets so 2x repetition triggers a pivot."""
