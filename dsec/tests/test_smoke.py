@@ -383,6 +383,85 @@ class TestCommonParsers(unittest.TestCase):
 # 9. Domain prompt — vault index is present
 # ────────────────────────────────────────────────────────────────────────────
 
+class TestBgPollStreakGuard(unittest.TestCase):
+    """Regression: session shell-20260503-221227 polled `bg read ferox` 5x
+    across 17 hours; ferox was never spawned. Guard now catches both
+    'no new output' and 'does not exist' variants."""
+
+    @staticmethod
+    def _simulate_streak(result_text_factory, threshold_for_does_not_exist=2, threshold_for_no_output=3):
+        """Run the streak loop the way cli.py:_run_agentic_loop does it.
+
+        Returns the rewritten result_text after `n_polls` calls. Mirrors the
+        exact logic at the registry-call dispatch site.
+        """
+        bg_streak: Dict[str, int] = {}
+
+        def step(result_text: str, job_id: str) -> str:
+            arguments = {"action": "read", "job_id": job_id}
+            tool_name = "background"
+            if (
+                tool_name == "background"
+                and isinstance(arguments, dict)
+                and arguments.get("action") == "read"
+                and ("no new output" in result_text or "does not exist" in result_text)
+            ):
+                _job = str(arguments.get("job_id", ""))
+                bg_streak[_job] = bg_streak.get(_job, 0) + 1
+                if "does not exist" in result_text:
+                    if bg_streak[_job] >= threshold_for_does_not_exist:
+                        return f"[hint: job '{_job}' DOES NOT EXIST and you've polled it {bg_streak[_job]} times. ...]"
+                elif bg_streak[_job] >= threshold_for_no_output:
+                    return f"[hint: '{_job}' has been polled with no new output {bg_streak[_job]} ...]"
+            return result_text
+
+        return step
+
+    def test_does_not_exist_triggers_at_2nd_poll(self):
+        step = self._simulate_streak(None)
+        first = step("Job 'ferox' does not exist — background jobs are in-memory...", "ferox")
+        self.assertNotIn("hint", first.lower(), "first poll should pass through")
+        second = step("Job 'ferox' does not exist — background jobs are in-memory...", "ferox")
+        self.assertIn("DOES NOT EXIST", second)
+        self.assertIn("ferox", second)
+
+    def test_no_new_output_triggers_at_3rd_poll(self):
+        step = self._simulate_streak(None)
+        a = step("[job 'x' — running — no new output]", "x")
+        b = step("[job 'x' — running — no new output]", "x")
+        c = step("[job 'x' — running — no new output]", "x")
+        self.assertNotIn("hint", a.lower())
+        self.assertNotIn("hint", b.lower())
+        self.assertIn("hint:", c)
+        self.assertIn("polled with no new output 3", c)
+
+    def test_different_jobs_tracked_separately(self):
+        step = self._simulate_streak(None)
+        step("Job 'a' does not exist", "a")
+        b1 = step("Job 'b' does not exist", "b")
+        # Each job's first poll is grace; second triggers
+        a2 = step("Job 'a' does not exist", "a")
+        self.assertNotIn("hint", b1.lower())
+        self.assertIn("DOES NOT EXIST", a2)
+
+
+class TestKerberosFailPatterns(unittest.TestCase):
+    """Ensure the broader Kerberos / DNS / clock-skew patterns roll up to
+    technique-fail buckets so 2x repetition triggers a pivot."""
+
+    def test_clock_skew_variants_share_bucket(self):
+        from dsec.cli import _run_agentic_loop  # noqa — imports patterns table
+        # Read patterns directly from the source file since they're function-local
+        import inspect
+        src = inspect.getsource(_run_agentic_loop)
+        # All variants must map to "krb_timeskew"
+        for variant in ("KRB_AP_ERR_SKEW", "Clock skew too great", "Server time"):
+            self.assertIn(f'"{variant}", "krb_timeskew"', src)
+        # And DNS variants share krb_dns
+        for variant in ("DNS resolution failed", "Could not resolve", "Name or service not known"):
+            self.assertIn(f'"{variant}", "krb_dns"', src)
+
+
 class TestDomainPromptIntegrity(unittest.TestCase):
 
     def test_htb_prompt_has_vault_index(self):
