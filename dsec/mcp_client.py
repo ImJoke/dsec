@@ -50,7 +50,8 @@ def _send(proc: subprocess.Popen, method: str, params: Any, req_id: int) -> None
         "method": method,
         "params": params,
     }) + "\n"
-    assert proc.stdin is not None
+    if proc.stdin is None:
+        raise RuntimeError("MCP process stdin is not available")
     proc.stdin.write(msg)
     proc.stdin.flush()
 
@@ -61,14 +62,16 @@ def _notify(proc: subprocess.Popen, method: str, params: Any) -> None:  # type: 
         "method": method,
         "params": params,
     }) + "\n"
-    assert proc.stdin is not None
+    if proc.stdin is None:
+        raise RuntimeError("MCP process stdin is not available")
     proc.stdin.write(msg)
     proc.stdin.flush()
 
 
 def _read_response(proc: subprocess.Popen, req_id: int, timeout: float = 10.0) -> Optional[Dict[str, Any]]:  # type: ignore[type-arg]
     """Block until we receive the JSON-RPC response for *req_id* or time out."""
-    assert proc.stdout is not None
+    if proc.stdout is None:
+        raise RuntimeError("MCP process stdout is not available")
     deadline = time.monotonic() + timeout
     fd = None
     try:
@@ -181,8 +184,9 @@ class MCPServer:
         # Drain stderr in background to prevent pipe buffer deadlock
         self._stderr_buf = []
         def _drain_stderr(proc: subprocess.Popen) -> None:  # type: ignore[type-arg]
+            if proc.stderr is None:
+                return
             try:
-                assert proc.stderr is not None
                 for line in proc.stderr:
                     self._stderr_buf.append(line.rstrip("\n"))
                     if len(self._stderr_buf) > 200:

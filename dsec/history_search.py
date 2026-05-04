@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -20,6 +21,7 @@ from .config import load_config
 
 _db_conn: Optional[sqlite3.Connection] = None
 _db_path: Optional[Path] = None
+_db_lock = threading.Lock()
 
 
 def _get_db_path() -> Path:
@@ -102,9 +104,7 @@ def rebuild_index(force: bool = False) -> int:
     conn = _get_conn()
     sd = _get_sessions_dir()
 
-    conn.execute("DELETE FROM turns")
-
-    total = 0
+    rows_to_insert = []
     for path in sd.glob("*.json"):
         try:
             data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
@@ -118,18 +118,20 @@ def rebuild_index(force: bool = False) -> int:
             turn = entry.get("turn", 0)
             if not content:
                 continue
-            conn.execute(
-                "INSERT INTO turns(session, role, content, timestamp, turn) VALUES (?,?,?,?,?)",
-                (session_name, role, content[:4000], ts, turn),
-            )
-            total += 1
+            rows_to_insert.append((session_name, role, content[:4000], ts, turn))
 
-    conn.execute(
-        "INSERT OR REPLACE INTO meta(key, value) VALUES ('indexed_at', ?)",
-        (str(time.time()),),
-    )
-    conn.commit()
-    return total
+    with _db_lock:
+        conn.execute("DELETE FROM turns")
+        conn.executemany(
+            "INSERT INTO turns(session, role, content, timestamp, turn) VALUES (?,?,?,?,?)",
+            rows_to_insert,
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('indexed_at', ?)",
+            (str(time.time()),),
+        )
+        conn.commit()
+    return len(rows_to_insert)
 
 
 def search_history(
@@ -175,20 +177,34 @@ def search_history(
                 (query, limit),
             ).fetchall()
     except sqlite3.OperationalError:
-        # FTS5 syntax error (e.g. bare special chars) — retry with quoted query
+        # FTS5 syntax error (e.g. bare special chars) — retry with quoted query,
+        # preserving the session_filter if one was supplied.
         safe_q = '"' + query.replace('"', '""') + '"'
         try:
-            rows = conn.execute(
-                """
-                SELECT session, role, content, timestamp, turn,
-                       highlight(turns, 2, '[', ']') AS snippet
-                FROM turns
-                WHERE turns MATCH ?
-                ORDER BY rank
-                LIMIT ?
-                """,
-                (safe_q, limit),
-            ).fetchall()
+            if session_filter:
+                rows = conn.execute(
+                    """
+                    SELECT session, role, content, timestamp, turn,
+                           highlight(turns, 2, '[', ']') AS snippet
+                    FROM turns
+                    WHERE turns MATCH ? AND session = ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (safe_q, session_filter, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT session, role, content, timestamp, turn,
+                           highlight(turns, 2, '[', ']') AS snippet
+                    FROM turns
+                    WHERE turns MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (safe_q, limit),
+                ).fetchall()
         except Exception:
             return []
 
@@ -215,5 +231,6 @@ def search_history(
 def invalidate_index() -> None:
     """Force next search to rebuild the index (call after saving a session)."""
     conn = _get_conn()
-    conn.execute("DELETE FROM meta WHERE key='indexed_at'")
-    conn.commit()
+    with _db_lock:
+        conn.execute("DELETE FROM meta WHERE key='indexed_at'")
+        conn.commit()

@@ -170,13 +170,16 @@ class CommandRunner:
             # shutil.which would be ideal but let the OS raise FileNotFoundError
 
         # Inject sudo -S flag and feed password via stdin pipe (not visible in ps aux).
+        # IMPORTANT: Never reconstruct a shell string from argv — that would allow
+        # command injection if any element contains shell metacharacters.
         _sudo_stdin: Optional[str] = None
         if sudo_password and _has_sudo(argv):
             if isinstance(argv, str):
+                # shell=True path: inject -S -p "" into the shell string
                 argv = _inject_sudo_stdin_flag(argv)
             elif isinstance(argv, list) and argv and argv[0] == "sudo":
-                argv = _inject_sudo_stdin_flag(shlex.join(argv))
-                shell = True
+                # shell=False path: insert flags directly into the arg list, no shell needed
+                argv = [argv[0], "-S", "-p", ""] + argv[1:]
             _sudo_stdin = sudo_password + "\n"
 
         try:

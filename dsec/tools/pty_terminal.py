@@ -39,16 +39,19 @@ _LARGE_OUTPUT_THRESHOLD = 8000  # chars
 
 
 def _maybe_save_output(job_id: str, output: str) -> str:
-    """If output exceeds threshold, save to /tmp and return preview + path."""
+    """If output exceeds threshold, save to ~/.dsec/jobs/ and return preview + path."""
     if len(output) <= _LARGE_OUTPUT_THRESHOLD:
         return output
     from datetime import datetime as _dt
+    from pathlib import Path as _Path
     ts = _dt.now().strftime("%Y%m%d_%H%M%S")
     safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", job_id)
-    path = f"/tmp/dsec_{safe_id}_{ts}.txt"
+    jobs_dir = _Path.home() / ".dsec" / "jobs"
     try:
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(output)
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        path = jobs_dir / f"dsec_{safe_id}_{ts}.txt"
+        path.write_text(output, encoding="utf-8")
+        os.chmod(str(path), 0o600)
         preview = output[:3000]
         return (
             f"[Output large ({len(output):,} chars) — full output saved to {path}]\n"

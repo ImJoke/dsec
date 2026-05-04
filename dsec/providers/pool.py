@@ -19,6 +19,7 @@ Restart-safe: a fresh process starts with everyone healthy.
 """
 from __future__ import annotations
 
+import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -29,6 +30,8 @@ from dsec.config import DEFAULT_CONFIG, load_config
 _HEALTH_TTL_SEC = 30.0
 _DEAD_TTL_SEC = 60.0
 _HEALTH_TIMEOUT_SEC = 2.0
+
+_pool_lock = threading.Lock()
 
 # Per-provider round-robin counter
 _round_robin: Dict[str, int] = {}
@@ -55,24 +58,27 @@ def get_pool(provider_key: str) -> Optional[Dict]:
 
 
 def _is_dead(provider_key: str, url: str) -> bool:
-    until = _dead_until.get((provider_key, url))
-    if until is None:
-        return False
-    if time.time() >= until:
-        _dead_until.pop((provider_key, url), None)
-        return False
-    return True
+    with _pool_lock:
+        until = _dead_until.get((provider_key, url))
+        if until is None:
+            return False
+        if time.time() >= until:
+            _dead_until.pop((provider_key, url), None)
+            return False
+        return True
 
 
 def mark_endpoint_dead(provider_key: str, url: str, ttl_sec: float = _DEAD_TTL_SEC) -> None:
-    _dead_until[(provider_key, url)] = time.time() + ttl_sec
+    with _pool_lock:
+        _dead_until[(provider_key, url)] = time.time() + ttl_sec
 
 
 def check_health(url: str, *, force: bool = False) -> bool:
     """GET {url}/api/tags with 2s timeout. Cached 30s."""
     now = time.time()
     if not force:
-        cached = _health_cache.get(url)
+        with _pool_lock:
+            cached = _health_cache.get(url)
         if cached and now - cached[0] < _HEALTH_TTL_SEC:
             return cached[1]
 
@@ -83,7 +89,8 @@ def check_health(url: str, *, force: bool = False) -> bool:
         healthy = res.status_code == 200
     except Exception:
         healthy = False
-    _health_cache[url] = (now, healthy)
+    with _pool_lock:
+        _health_cache[url] = (now, healthy)
     return healthy
 
 
@@ -101,9 +108,10 @@ def next_endpoint(provider_key: str) -> Optional[str]:
     candidates = healthy_endpoints(provider_key)
     if not candidates:
         return None
-    idx = _round_robin.get(provider_key, 0) % len(candidates)
-    chosen = candidates[idx]
-    _round_robin[provider_key] = (idx + 1) % len(candidates)
+    with _pool_lock:
+        idx = _round_robin.get(provider_key, 0) % len(candidates)
+        chosen = candidates[idx]
+        _round_robin[provider_key] = (idx + 1) % len(candidates)
     return chosen
 
 

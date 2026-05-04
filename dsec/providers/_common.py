@@ -22,30 +22,35 @@ class StreamChunk(TypedDict, total=False):
 def split_think_blocks(content: str, in_think_block: bool) -> Tuple[List[Tuple[str, str]], bool]:
     """Split a content fragment into ("thinking"|"content", text) pairs.
 
-    Mirrors the inline parser at dsec/client.py:171-189 so both providers
-    can share it. Returns (chunks, new_in_think_state).
+    Handles multiple <think>…</think> blocks within a single chunk.
+    Returns (chunks, new_in_think_state).
     """
     out: List[Tuple[str, str]] = []
     if not content:
         return out, in_think_block
 
-    if "<think>" in content:
-        before, after = content.split("<think>", 1)
-        if before and not in_think_block:
-            out.append(("content", before))
-        in_think_block = True
-        content = after
-
-    if "</think>" in content:
-        in_think_block_before = in_think_block
-        in_think_block = False
-        parts = content.split("</think>", 1)
-        if parts[0]:
-            out.append(("thinking" if in_think_block_before else "content", parts[0]))
-        if len(parts) > 1 and parts[1]:
-            out.append(("content", parts[1]))
-    elif content:
-        out.append(("thinking" if in_think_block else "content", content))
+    remaining = content
+    while remaining:
+        if in_think_block:
+            if "</think>" in remaining:
+                think_part, rest = remaining.split("</think>", 1)
+                if think_part:
+                    out.append(("thinking", think_part))
+                in_think_block = False
+                remaining = rest
+            else:
+                out.append(("thinking", remaining))
+                remaining = ""
+        else:
+            if "<think>" in remaining:
+                before, rest = remaining.split("<think>", 1)
+                if before:
+                    out.append(("content", before))
+                in_think_block = True
+                remaining = rest
+            else:
+                out.append(("content", remaining))
+                remaining = ""
 
     return out, in_think_block
 

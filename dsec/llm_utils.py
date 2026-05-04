@@ -2,9 +2,12 @@
 DSEC LLM Utils – Intelligent extraction and summarization helpers.
 """
 import json
+import logging
 from typing import List, Dict, Any, Optional, Tuple
 from dsec.client import chat
 from dsec.config import load_config
+
+logger = logging.getLogger(__name__)
 
 def get_best_model() -> str:
     cfg = load_config()
@@ -99,8 +102,8 @@ TEXT:
             except json.JSONDecodeError:
                 pass
             pos = start + 1
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("llm_extract_facts failed: %s: %s", type(exc).__name__, exc)
     return []
 
 _MAX_SUMMARIZE_CHARS = 28_000  # ~7k tokens — safe for any DeepSeek model variant

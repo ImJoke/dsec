@@ -5,31 +5,39 @@ Supports exact domains, wildcards (*.example.com), IPs, and CIDR blocks.
 """
 import ipaddress
 import re
+import threading
 from typing import List
 
+_scope_lock = threading.Lock()
 _IN_SCOPE: List[str] = []
 _OUT_OF_SCOPE: List[str] = []
 
 def add_in_scope(target: str):
     """Add a target to the in-scope list."""
     normalized = target.strip().lower() if target else ""
-    if normalized and normalized not in _IN_SCOPE:
-        _IN_SCOPE.append(normalized)
+    if normalized:
+        with _scope_lock:
+            if normalized not in _IN_SCOPE:
+                _IN_SCOPE.append(normalized)
 
 def add_out_of_scope(target: str):
     """Add a target to the out-of-scope list."""
     normalized = target.strip().lower() if target else ""
-    if normalized and normalized not in _OUT_OF_SCOPE:
-        _OUT_OF_SCOPE.append(normalized)
+    if normalized:
+        with _scope_lock:
+            if normalized not in _OUT_OF_SCOPE:
+                _OUT_OF_SCOPE.append(normalized)
 
 def clear_scope():
     """Clear all scope definitions."""
-    _IN_SCOPE.clear()
-    _OUT_OF_SCOPE.clear()
+    with _scope_lock:
+        _IN_SCOPE.clear()
+        _OUT_OF_SCOPE.clear()
 
 def get_scope() -> dict:
     """Return current scope configuration."""
-    return {"in_scope": _IN_SCOPE.copy(), "out_of_scope": _OUT_OF_SCOPE.copy()}
+    with _scope_lock:
+        return {"in_scope": _IN_SCOPE.copy(), "out_of_scope": _OUT_OF_SCOPE.copy()}
 
 def _is_match(target: str, pattern: str) -> bool:
     target = target.lower()
@@ -82,7 +90,11 @@ def validate_target(target: str) -> tuple[bool, str]:
     Validates if a target is allowed to be attacked.
     Returns (is_allowed, reason_string).
     """
-    if not _IN_SCOPE and not _OUT_OF_SCOPE:
+    with _scope_lock:
+        in_scope = list(_IN_SCOPE)
+        out_of_scope = list(_OUT_OF_SCOPE)
+
+    if not in_scope and not out_of_scope:
         return True, "No scope defined."
 
     target = target.strip().lower()
@@ -91,15 +103,15 @@ def validate_target(target: str) -> tuple[bool, str]:
         return True, f"Target '{target}' is a local address (always allowed)."
 
     # 1. Check out of scope first (explicit deny overrides everything)
-    for oos in _OUT_OF_SCOPE:
+    for oos in out_of_scope:
         if _is_match(target, oos):
             return False, f"Target '{target}' matches OUT OF SCOPE rule: {oos}"
 
     # 2. Check in scope
-    if not _IN_SCOPE:
+    if not in_scope:
         return True, "No in-scope rules defined (only out-of-scope list exists)."
 
-    for ins in _IN_SCOPE:
+    for ins in in_scope:
         if _is_match(target, ins):
             return True, f"Target '{target}' matches IN SCOPE rule: {ins}"
 
@@ -110,12 +122,17 @@ def scan_command_for_targets(cmd: str) -> list[str]:
     Extracts potential domains/IPs from a bash command using regex.
     """
     targets = []
-    # Match IPs
-    ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
-    targets.extend(re.findall(ip_pattern, cmd))
-    
+    # Match dotted-decimal candidates, then validate each octet is 0-255
+    ip_candidate_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
+    for candidate in re.findall(ip_candidate_pattern, cmd):
+        try:
+            ipaddress.ip_address(candidate)
+            targets.append(candidate)
+        except ValueError:
+            pass
+
     # Match domains (basic heuristic, looks for typical domain structures)
     domain_pattern = r'\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b'
     targets.extend(re.findall(domain_pattern, cmd))
-    
+
     return list(set(targets))

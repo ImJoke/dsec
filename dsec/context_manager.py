@@ -241,17 +241,22 @@ class ContextManager:
         
         if limit:
             current_count = self.system_prompt_tokens
-            keep_indices: List[int] = []
-            
+            keep_indices: set[int] = set()
+
             # Walk backwards to keep recent context
             for i in range(len(self.turns) - 1, -1, -1):
                 turn_tokens = self.turns[i].tokens_estimate
                 if current_count + turn_tokens > limit and keep_indices:
                     break
                 current_count += turn_tokens
-                keep_indices.insert(0, i)
-            
-            eligible_turns = [self.turns[i] for i in keep_indices]
+                keep_indices.add(i)
+
+            # Always keep at least the most recent turn so the model is never
+            # handed a completely empty conversation.
+            if not keep_indices and self.turns:
+                keep_indices.add(len(self.turns) - 1)
+
+            eligible_turns = [self.turns[i] for i in sorted(keep_indices)]
             discarded_turns = [self.turns[i] for i in range(len(self.turns)) if i not in keep_indices]
 
         # Generate summary of discarded context to prevent state loss

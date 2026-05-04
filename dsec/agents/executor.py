@@ -19,6 +19,7 @@ Loop structure:
 """
 from __future__ import annotations
 
+import re as _re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -199,7 +200,7 @@ def run_executor(
             )
             # Lightweight stuck-signal detection
             lowered = (result_text or "").lower()
-            if "exit=" in lowered and "exit=0" not in lowered and "exit=1" in lowered:
+            if "exit=" in lowered and "exit=0" not in lowered and _re.search(r'\bexit=1\b', lowered):
                 stuck_signals.append(f"nonzero_exit:{call.get('name','?')}")
             if "timed out" in lowered or "cancelled after" in lowered:
                 stuck_signals.append(f"timeout:{call.get('name','?')}")

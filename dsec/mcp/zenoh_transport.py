@@ -9,6 +9,11 @@ try:
 except ImportError:
     ZENOH_AVAILABLE = False
 
+
+class ZenohMCPError(Exception):
+    """Raised when a Zenoh MCP tool call returns an error response."""
+
+
 class ZenohMCPTransport:
     """
     Experimental Zenoh transport for Model Context Protocol.
@@ -25,11 +30,11 @@ class ZenohMCPTransport:
     def connect(self):
         if not ZENOH_AVAILABLE:
             raise ImportError("zenoh is not installed. Run `pip install eclipse-zenoh`.")
-            
+
         conf = zenoh.Config()
         conf.insert_json5("connect/endpoints", f'["{self.router_url}"]')
         self.session = zenoh.open(conf)
-        
+
         reply_topic = f"{self.base_topic}/reply"
         self._subscriber = self.session.declare_subscriber(reply_topic, self._on_reply)
 
@@ -49,7 +54,7 @@ class ZenohMCPTransport:
             self.connect()
         if not self.session:
             raise RuntimeError("Zenoh transport is not connected")
-            
+
         msg_id = str(uuid.uuid4())
         req = {
             "jsonrpc": "2.0",
@@ -61,20 +66,22 @@ class ZenohMCPTransport:
                 "arguments": arguments
             }
         }
-        
+
         topic = f"{self.base_topic}/request/{server_name}"
         self.session.put(topic, json.dumps(req))
-        
+
         with self._cond:
+            # Loop to handle spurious wakeups — only exit when our response
+            # has arrived OR the timeout has elapsed.
             self._cond.wait_for(lambda: msg_id in self._responses, timeout=timeout)
-            
-        res = self._responses.pop(msg_id, None)
+            res = self._responses.pop(msg_id, None)
+
         if not res:
             raise TimeoutError(f"Zenoh MCP request timed out for {server_name}/{tool_name}")
-            
+
         if "error" in res:
-            raise Exception(res["error"])
-            
+            raise ZenohMCPError(res["error"])
+
         return res.get("result")
 
     def disconnect(self):

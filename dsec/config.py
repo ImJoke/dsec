@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
@@ -55,13 +56,23 @@ def _ensure_runtime_dirs(config: Dict[str, Any]) -> None:
 
 def _write_config(config: Dict[str, Any]) -> None:
     _ensure_base_dirs()
-    with open(CONFIG_FILE, "w", encoding="utf-8") as handle:
-        json.dump(config, handle, indent=2)
-        handle.write("\n")
+    # Write atomically: create a temp file with restricted permissions (mkstemp
+    # uses mode 0o600 by default), then atomically replace the config file so
+    # there is never a window where the file exists with world-readable perms.
+    fd, tmp_path = tempfile.mkstemp(dir=str(CONFIG_DIR), suffix=".tmp")
     try:
-        os.chmod(CONFIG_FILE, 0o600)
-    except OSError:
-        pass
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(config, handle, indent=2)
+            handle.write("\n")
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, str(CONFIG_FILE))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    _invalidate_cache()
 
 
 def _read_extra_keys() -> Dict[str, Any]:
@@ -378,7 +389,6 @@ def save_config(key: str, value: Any) -> Dict[str, Any]:
     config, _ = _normalise_config(config)
     extras = _read_extra_keys()
     _write_config({**extras, **config})
-    _invalidate_cache()
     _ensure_runtime_dirs(config)
     return config
 
@@ -494,7 +504,10 @@ def get_sudo_password() -> str:
 def set_sudo_password(password: str) -> None:
     """Persist the sudo password.
 
-    Attempt to store in the system keyring; fall back to config file if unavailable.
+    Stores the password in the system keyring.  If the keyring is
+    unavailable the password is NOT persisted to disk to avoid storing
+    credentials in cleartext inside config.json.  In that case the
+    caller will need to re-supply the password each session.
     """
     try:
         import keyring
@@ -505,11 +518,7 @@ def set_sudo_password(password: str) -> None:
             pass
     except Exception:
         pass
-
-    config = load_config()
-    extras = _read_extra_keys()
-    extras["sudo_password"] = password
-    _write_config({**extras, **config})
+    # Keyring unavailable: do not fall back to plaintext on-disk storage.
 
 
 def clear_sudo_password() -> None:
