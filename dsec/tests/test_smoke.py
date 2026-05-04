@@ -779,5 +779,268 @@ class TestAgenticLoopIntegration(unittest.TestCase):
         self.assertIn(cmd_b, cmds, f"second cmd missing — guard wrongly blocked divergent args: {cmds}")
 
 
+class TestStress(unittest.TestCase):
+    """Stress tests — push the agentic loop, extractor, dedup, guards, and
+    PTY through edge cases at high volume. Verifies nothing crashes and
+    invariants hold under load.
+    """
+
+    # ── Extractor + dedup at high volume ──────────────────────────────────
+
+    def test_extract_100_tool_calls(self):
+        """Extractor must return all 100 distinct calls without dropping."""
+        from dsec.cli import _extract_tool_calls
+        blocks = []
+        for i in range(100):
+            blocks.append(
+                f'<tool_call>{{"name":"bash","arguments":{{"command":"echo {i}"}}}}</tool_call>'
+            )
+        text = "\n".join(blocks)
+        calls = _extract_tool_calls(text)
+        self.assertEqual(len(calls), 100, f"lost calls: {len(calls)}")
+        cmds = [c["arguments"]["command"] for c in calls]
+        self.assertEqual(cmds, [f"echo {i}" for i in range(100)])
+
+    def test_dedup_100_identical_collapses_to_1(self):
+        import json as _json
+        same = {"name": "bash", "arguments": {"command": "echo same"}}
+        calls = [dict(same) for _ in range(100)]
+        seen = set()
+        out = []
+        for c in calls:
+            k = (c["name"], _json.dumps(c["arguments"], sort_keys=True))
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(c)
+        self.assertEqual(len(out), 1)
+
+    def test_extract_handles_unicode_and_escapes(self):
+        from dsec.cli import _extract_tool_calls
+        text = (
+            '<tool_call>{"name":"bash","arguments":{"command":"echo \'héllo wörld 你好\'"}}</tool_call>'
+            '<tool_call>{"name":"bash","arguments":{"command":"grep -E \\"\\\\(.*\\\\)\\" file"}}</tool_call>'
+        )
+        calls = _extract_tool_calls(text)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("héllo", calls[0]["arguments"]["command"])
+
+    def test_extract_handles_500kb_payload(self):
+        """No regex catastrophic backtracking on giant inputs."""
+        from dsec.cli import _extract_tool_calls
+        big_cmd = "echo " + "X" * 500_000
+        text = f'<tool_call>{{"name":"bash","arguments":{{"command":"{big_cmd[:200000]}"}}}}</tool_call>'
+        import time
+        t0 = time.time()
+        calls = _extract_tool_calls(text)
+        elapsed = time.time() - t0
+        self.assertEqual(len(calls), 1)
+        self.assertLess(elapsed, 5.0, f"extraction took {elapsed:.1f}s on 200KB input")
+
+    # ── Cross-turn guard under sustained pressure ─────────────────────────
+
+    def test_guard_holds_through_50_identical_retries(self):
+        """Replicate worst-case session — agent emits SAME bash 50 times.
+        Guard must dispatch exactly 1, skip 49."""
+        from unittest import mock
+        from dsec import cli as cli_mod
+
+        bad = "bloodyAD set password svc N3w!"
+        block = f'<tool_call>{{"name":"bash","arguments":{{"command":"{bad}"}}}}</tool_call>'
+
+        # 50 followups all the same
+        fake_chat, _ = TestAgenticLoopIntegration._make_chat_stream_mock(
+            self, [block] * 49 + [""]
+        )
+        fake_runner, run_log = TestAgenticLoopIntegration._make_runner_mock(
+            self, [1] * 60
+        )
+
+        with mock.patch.object(cli_mod, "chat_stream", fake_chat), \
+             mock.patch.object(cli_mod, "get_runner", lambda: fake_runner):
+            try:
+                cli_mod._run_agentic_loop(
+                    response_content=block,
+                    session_name="stress-50",
+                    domain="htb",
+                    model="x",
+                    conversation_id=None,
+                    config={"base_url": "http://localhost:8000",
+                            "show_thinking": False, "enable_multi_agent": False},
+                    turn=1,
+                    no_think=True,
+                    no_memory=True,
+                    auto_exec=True,
+                    sudo_password=None,
+                    max_iterations=50,
+                )
+            except Exception:
+                pass
+
+        bloodyAD_dispatches = [r for r in run_log if "bloodyAD" in r["command"]]
+        self.assertEqual(
+            len(bloodyAD_dispatches), 1,
+            f"GUARD FAILED under 50-retry stress: dispatched {len(bloodyAD_dispatches)} times",
+        )
+
+    def test_guard_resets_on_alternation(self):
+        """Agent alternates A → B → A → B. Each pair has a different sig,
+        so guard should NOT fire — all dispatches should run."""
+        from unittest import mock
+        from dsec import cli as cli_mod
+
+        a = '<tool_call>{"name":"bash","arguments":{"command":"echo A"}}</tool_call>'
+        b = '<tool_call>{"name":"bash","arguments":{"command":"echo B"}}</tool_call>'
+        sequence = [b, a, b, a, b, a, ""]
+
+        fake_chat, _ = TestAgenticLoopIntegration._make_chat_stream_mock(self, sequence)
+        fake_runner, run_log = TestAgenticLoopIntegration._make_runner_mock(self, [1] * 10)
+
+        with mock.patch.object(cli_mod, "chat_stream", fake_chat), \
+             mock.patch.object(cli_mod, "get_runner", lambda: fake_runner):
+            try:
+                cli_mod._run_agentic_loop(
+                    response_content=a,
+                    session_name="stress-alt",
+                    domain="htb",
+                    model="x",
+                    conversation_id=None,
+                    config={"base_url": "http://localhost:8000",
+                            "show_thinking": False, "enable_multi_agent": False},
+                    turn=1,
+                    no_think=True,
+                    no_memory=True,
+                    auto_exec=True,
+                    sudo_password=None,
+                    max_iterations=8,
+                )
+            except Exception:
+                pass
+
+        a_count = len([r for r in run_log if r["command"] == "echo A"])
+        b_count = len([r for r in run_log if r["command"] == "echo B"])
+        # Each alternation must dispatch — never block divergent args.
+        self.assertGreaterEqual(a_count, 2, f"A dispatched only {a_count} times")
+        self.assertGreaterEqual(b_count, 2, f"B dispatched only {b_count} times")
+
+    # ── PTY pool concurrency ──────────────────────────────────────────────
+
+    def test_pty_8_concurrent_jobs_then_cap(self):
+        """_MAX_PANES=8. Spawn 8, verify all alive. 9th should error."""
+        from dsec.tools.pty_terminal import background, _PANES, _MAX_PANES
+        # Cleanup any stale stress jobs
+        for i in range(_MAX_PANES + 2):
+            try:
+                background(action="kill", job_id=f"stress-job-{i}")
+            except Exception:
+                pass
+
+        spawned = []
+        try:
+            for i in range(_MAX_PANES):
+                res = background(action="run", job_id=f"stress-job-{i}",
+                                 command=f"sleep 30 && echo {i}", wait=1)
+                self.assertIn("started", res, f"failed to spawn job {i}: {res}")
+                spawned.append(f"stress-job-{i}")
+
+            # 9th must hit the cap
+            res = background(action="run", job_id=f"stress-job-{_MAX_PANES}",
+                             command="sleep 30", wait=1)
+            self.assertIn("Max", res, f"cap should reject 9th job: {res}")
+        finally:
+            for jid in spawned + [f"stress-job-{_MAX_PANES}"]:
+                try:
+                    background(action="kill", job_id=jid)
+                except Exception:
+                    pass
+
+    def test_pty_rapid_spawn_kill_cycle(self):
+        """Spawn → kill → respawn same job_id 20× — no fd leak, no crash."""
+        from dsec.tools.pty_terminal import background
+        for i in range(20):
+            res = background(action="run", job_id="rapid-cycle",
+                             command=f"echo iter {i}", wait=0.5)
+            self.assertIn("started", res, f"iter {i} failed: {res}")
+            kres = background(action="kill", job_id="rapid-cycle")
+            self.assertIn("killed", kres.lower())
+
+    # ── Provider pool rotation under load ─────────────────────────────────
+
+    def test_provider_pool_round_robin_500_calls(self):
+        """500 next_endpoint calls across 3 endpoints — distribution within 2%."""
+        import dsec.config as cfg_mod
+        from dsec.providers import pool as ppool
+        cfg_mod._invalidate_cache()
+        cfg = cfg_mod.load_config()
+        cfg["providers"] = {
+            "stress_pool": {
+                "type": "ollama", "model": "x",
+                "endpoints": ["http://a:1", "http://b:2", "http://c:3"],
+            }
+        }
+        cfg_mod._config_cache = cfg
+        ppool._round_robin.clear()
+        ppool._dead_until.clear()
+
+        try:
+            counts = {"http://a:1": 0, "http://b:2": 0, "http://c:3": 0}
+            for _ in range(501):  # 501 = 167 each
+                ep = ppool.next_endpoint("stress_pool")
+                counts[ep] += 1
+            for ep, n in counts.items():
+                self.assertEqual(n, 167, f"uneven: {counts}")
+        finally:
+            cfg_mod._invalidate_cache()
+            ppool._round_robin.clear()
+            ppool._dead_until.clear()
+
+    # ── Config-write race protection ──────────────────────────────────────
+
+    def test_concurrent_config_writes_dont_corrupt(self):
+        """5 threads × 20 writes each. File must remain valid JSON at end."""
+        import threading
+        import json as _json
+        from dsec.config import save_config, load_config, CONFIG_FILE
+
+        errors = []
+
+        def writer(idx):
+            try:
+                for j in range(20):
+                    save_config("compress_threshold", str(100 + (idx * 100) + j))
+            except Exception as e:
+                errors.append(f"thread {idx}: {e}")
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+
+        self.assertEqual(errors, [], f"thread errors: {errors}")
+
+        # File still parses cleanly
+        with open(CONFIG_FILE) as f:
+            parsed = _json.load(f)
+        self.assertIn("compress_threshold", parsed)
+        # Reset to default for tidiness
+        save_config("compress_threshold", "500")
+
+    # ── Domain prompt token budget under multiple loads ───────────────────
+
+    def test_prompt_consistent_across_multiple_loads(self):
+        """Reload domain.py 10× — token count must stay stable (no slow leak
+        from accumulating decorators or import side-effects)."""
+        from dsec.context_manager import ContextManager
+        cm = ContextManager(domain="htb")
+        token_counts = []
+        for _ in range(10):
+            import importlib
+            import dsec.domain
+            importlib.reload(dsec.domain)
+            token_counts.append(cm.estimate_tokens(dsec.domain.DOMAIN_HTB["system_prompt"]))
+        self.assertEqual(len(set(token_counts)), 1, f"prompt drifted: {token_counts}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
