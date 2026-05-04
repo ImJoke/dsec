@@ -406,12 +406,32 @@ def background(
             return "Error: 'command' is required for action='run'."
         if not job_id:
             job_id = "job-" + uuid.uuid4().hex[:6]
+
+        # Reject duplicate run on a pane that already has an active command.
+        # Heuristic: pane exists, process alive, last command was issued within
+        # the last 60 seconds and identical to this one. The model sometimes
+        # re-emits the same background-run after a slow first response — the
+        # second call would queue the SAME command behind the first and bork
+        # the agent's mental model of which job is doing what.
+        existing = _PANES.get(job_id)
+        if existing and existing.alive and getattr(existing, "_history", None):
+            last = existing._history[-1] if existing._history else None
+            if last and last.get("cmd", "").strip() == command.strip():
+                return (
+                    f"[job '{job_id}' is already running '{command[:60]}' (PID {existing.process.pid}). "
+                    "Use action='read' to poll output or action='kill' to stop. "
+                    "Refusing duplicate run to avoid queueing the same command twice.]"
+                )
+
         try:
             pane = _get_or_create(job_id)
         except RuntimeError as e:
             return f"Error: {e}"
         pane.write(command + "\n")
-        wait_clamped = max(0.5, min(float(wait), 30.0))
+        # Cap wait at 10s for background runs — anything longer should poll via
+        # action='read'. Previously up to 30s; that turned `background run` into
+        # a near-blocking call when the model picked wait=20-30.
+        wait_clamped = max(0.5, min(float(wait), 10.0))
         output = strip_ansi(pane.read(timeout=wait_clamped))
         status = "running" if pane.alive else "exited"
         # Track history (raw output before large-output truncation)
