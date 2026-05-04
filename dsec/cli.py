@@ -4312,6 +4312,17 @@ def config_cmd(set_kv):
     """Show or update configuration."""
     if set_kv:
         key, value = set_kv
+        # Route sudo_password through the secure setter (keyring or encrypted
+        # file under ~/.dsec/), never write it as a regular config key.
+        if key == "sudo_password":
+            from dsec.config import set_sudo_password
+            try:
+                set_sudo_password(value)
+            except ConfigError as exc:
+                print_error(str(exc))
+                return
+            print_success("sudo_password stored securely (keyring or ~/.dsec/.sudo_pass.enc).")
+            return
         try:
             updated = save_config(key, value)
         except ConfigError as exc:
