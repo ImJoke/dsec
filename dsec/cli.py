@@ -1390,10 +1390,20 @@ def _run_agentic_loop(
         ("insufficientAccessRights", "ldap_acl"),
         ("LDAP modify failed", "ldap_modify"),
         ("constraint violation", "ldap_constraint"),
-        # Kerberos
+        # Kerberos — clock skew variants (all roll up to one bucket so 2x → pivot)
         ("KRB_AP_ERR_SKEW", "krb_timeskew"),
+        ("Clock skew too great", "krb_timeskew"),
+        ("clock skew", "krb_timeskew"),
+        ("Server time", "krb_timeskew"),  # certipy's "Server time is X seconds off"
+        # Kerberos — other auth failures
         ("KDC_ERR_PREAUTH_FAILED", "krb_preauth"),
         ("KDC_ERR_S_PRINCIPAL_UNKNOWN", "krb_spn"),
+        ("KDC_ERR_PADATA_TYPE_NOSUPP", "krb_padata"),
+        ("KDC_ERR_C_PRINCIPAL_UNKNOWN", "krb_user_unknown"),
+        # Kerberos — DNS resolution (FQDN missing in /etc/hosts)
+        ("DNS resolution failed", "krb_dns"),
+        ("Could not resolve", "krb_dns"),
+        ("Name or service not known", "krb_dns"),
         # Relay / coercion
         ("No targets", "relay_no_targets"),
         ("Target is not vulnerable", "relay_not_vuln"),
@@ -2353,19 +2363,36 @@ def _run_agentic_loop(
                         if len(result_text) > 10000:
                             result_text = result_text[:10000] + "\n... [truncated]"
 
-                        # Detect background-read polling streak: same job, same
-                        # "no new output" response across consecutive iterations.
-                        # After 3+ in a row, replace the result with a hint
-                        # telling the agent to stop polling and pivot.
+                        # Detect wasteful background-read patterns. Two cases:
+                        #   (a) "no new output" repeated → agent is hot-polling a
+                        #       running job; tell it to do something else.
+                        #   (b) "does not exist" repeated → agent is polling a
+                        #       job that was never spawned (or got cleared on
+                        #       session resume); tell it to RUN the job first.
                         if (
                             tool_name == "background"
                             and isinstance(arguments, dict)
                             and arguments.get("action") == "read"
-                            and "no new output" in result_text
+                            and ("no new output" in result_text or "does not exist" in result_text)
                         ):
                             _job = str(arguments.get("job_id", ""))
                             _bg_read_streak[_job] = _bg_read_streak.get(_job, 0) + 1
-                            if _bg_read_streak[_job] >= 3:
+                            if "does not exist" in result_text:
+                                # The job was never started. Even one re-poll is
+                                # wasteful — the response told the agent exactly
+                                # what to do. Hard-fail at threshold 2 (1 grace
+                                # call so the very first read doesn't trigger).
+                                if _bg_read_streak[_job] >= 2:
+                                    result_text = (
+                                        f"[hint: job '{_job}' DOES NOT EXIST and you've polled "
+                                        f"it {_bg_read_streak[_job]} times. The previous response "
+                                        f"told you to RUN it first. Do that now: "
+                                        f"<tool_call>{{\"name\":\"background\",\"arguments\":"
+                                        f"{{\"action\":\"run\",\"job_id\":\"{_job}\","
+                                        f"\"command\":\"<the command you wanted to run>\"}}}}"
+                                        f"</tool_call>. Stop polling a non-existent job.]"
+                                    )
+                            elif _bg_read_streak[_job] >= 3:
                                 result_text = (
                                     f"[hint: '{_job}' has been polled with no new output "
                                     f"{_bg_read_streak[_job]} iterations in a row. STOP polling "
