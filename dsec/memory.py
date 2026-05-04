@@ -438,6 +438,8 @@ def auto_extract_memories_llm(
         
     stored_ids: List[str] = []
     for item in facts:
+        if not isinstance(item, dict):
+            continue
         itype = item.get("type", "fact")
         content = item.get("content", "")
         entities = item.get("entities", [])
