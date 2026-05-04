@@ -1465,85 +1465,94 @@ def _run_agentic_loop(
 
                 no_tool_server_error = _has_server_overflow_error(raw_no_tool)
                 if no_tool_server_error:
-                    # TRANSIENT server failure ("服务暂时不可用") — NOT context overflow.
-                    # Strategy: exponential backoff + retry WITHOUT compacting context.
-                    # Compacting destroys attack state for no reason when the server is just busy.
-                    _server_error_streak += 1
-                    _no_tool_streak = max(0, _no_tool_streak - 1)  # don't count against AI
+                    # TRANSIENT server failure — internal retry loop so we don't
+                    # burn outer iteration slots while the server is just busy.
+                    import time as _time
+                    _no_tool_streak = max(0, _no_tool_streak - 1)
                     _no_tool_repeat_streak = 0
                     _last_no_tool_response = ""
+                    _server_recovered = False
+                    _server_stop = False
 
-                    import time as _time
-                    _backoff = min(3.0 * (2 ** (_server_error_streak - 1)), 60.0)
-                    print_warning(
-                        f"Server temporarily unavailable (streak={_server_error_streak}/{_SERVER_ERROR_RETRY_LIMIT}). "
-                        f"Waiting {_backoff:.0f}s then retrying — context preserved."
-                    )
-                    _time.sleep(_backoff)
+                    while True:
+                        _server_error_streak += 1
+                        _backoff = min(3.0 * (2 ** (_server_error_streak - 1)), 60.0)
+                        print_warning(
+                            f"Server temporarily unavailable (streak={_server_error_streak}/{_SERVER_ERROR_RETRY_LIMIT}). "
+                            f"Waiting {_backoff:.0f}s then retrying — context preserved."
+                        )
+                        _time.sleep(_backoff)
 
-                    if _server_error_streak >= _SERVER_ERROR_RETRY_LIMIT:
-                        if not _server_cooldown_used:
-                            _server_cooldown_used = True
-                            print_warning(
-                                f"Server unavailable after {_server_error_streak} retries. "
-                                "Waiting 120s for recovery…"
+                        if _server_error_streak >= _SERVER_ERROR_RETRY_LIMIT:
+                            if not _server_cooldown_used:
+                                _server_cooldown_used = True
+                                print_warning(
+                                    f"Server unavailable after {_server_error_streak} retries. "
+                                    "Waiting 120s for recovery…"
+                                )
+                                _time.sleep(120)
+                                _server_error_streak = _SERVER_ERROR_RETRY_LIMIT - 5
+                                print_info("Resuming after extended cooldown.")
+                            else:
+                                stop_reason = (
+                                    f"server unavailable after {_server_error_streak} retries "
+                                    "+ extended cooldown; giving up"
+                                )
+                                print_warning("Server unavailable for too long; stopping agentic loop.")
+                                autopilot.record_tool_result("__agentic_loop__", f"[error: {stop_reason}]")
+                                issue_path = autopilot.finalize(
+                                    reason=stop_reason,
+                                    had_tool_calls=True,
+                                    loop_ended_normally=False,
+                                    new_content=None,
+                                )
+                                if issue_path:
+                                    print_warning(f"Autopilot bug finder wrote issue report to {issue_path}")
+                                _server_stop = True
+                                break
+
+                        try:
+                            gen = chat_stream(
+                                message="Continue your analysis. Use <tool_call> blocks for your next step.",
+                                model=model,
+                                conversation_id=current_conv_id,
+                                base_url=config.get("base_url", "http://localhost:8000"),
+                                token=get_next_token(),
+                                history=_loop_pruned_history,
                             )
-                            _time.sleep(120)
-                            _server_error_streak = _SERVER_ERROR_RETRY_LIMIT - 5
-                            print_info("Resuming after extended cooldown.")
-                            # Fall through to retry API call below
-                        else:
-                            stop_reason = (
-                                f"server unavailable after {_server_error_streak} retries + extended cooldown; "
-                                "giving up"
+                            _loop_pruned_history = None
+                            thinking, new_content, new_conv_id = stream_response(
+                                generator=gen,
+                                session_name=session_name or "none",
+                                domain=domain,
+                                model=model,
+                                turn=turn + iteration,
+                                compression_info=None,
+                                research_sources=None,
+                                memory_count=0,
+                                show_thinking=config.get("show_thinking", True) and not no_think,
+                                phase=_current_phase,
                             )
-                            print_warning("Server unavailable for too long; stopping agentic loop.")
-                            autopilot.record_tool_result("__agentic_loop__", f"[error: {stop_reason}]")
-                            issue_path = autopilot.finalize(
-                                reason=stop_reason,
-                                had_tool_calls=True,
-                                loop_ended_normally=False,
-                                new_content=None,
-                            )
-                            if issue_path:
-                                print_warning(f"Autopilot bug finder wrote issue report to {issue_path}")
+                        except KeyboardInterrupt:
+                            console.print()
+                            print_warning("Agentic loop cancelled.")
+                            autopilot.note_user_interrupt()
+                            return current_conv_id
+
+                        if new_conv_id:
+                            current_conv_id = new_conv_id
+
+                        if new_content is not None and not _has_server_overflow_error(new_content):
+                            # Server recovered — got a real response
+                            current_response = new_content
+                            _server_error_streak = 0
+                            _server_recovered = True
                             break
+                        # Still down — loop again without advancing iteration
 
-                    # Retry API call after backoff — use a neutral prompt that
-                    # doesn't scold the AI for missing tool calls (it was the server).
-                    try:
-                        gen = chat_stream(
-                            message="Continue your analysis. Use <tool_call> blocks for your next step.",
-                            model=model,
-                            conversation_id=current_conv_id,
-                            base_url=config.get("base_url", "http://localhost:8000"),
-                            token=get_next_token(),
-                            history=_loop_pruned_history,
-                        )
-                        _loop_pruned_history = None
-                        thinking, new_content, new_conv_id = stream_response(
-                            generator=gen,
-                            session_name=session_name or "none",
-                            domain=domain,
-                            model=model,
-                            turn=turn + iteration,
-                            compression_info=None,
-                            research_sources=None,
-                            memory_count=0,
-                            show_thinking=config.get("show_thinking", True) and not no_think,
-                            phase=_current_phase,
-                        )
-                    except KeyboardInterrupt:
-                        console.print()
-                        print_warning("Agentic loop cancelled.")
-                        autopilot.note_user_interrupt()
-                        return current_conv_id
-
-                    if new_conv_id:
-                        current_conv_id = new_conv_id
-                    if new_content is not None:
-                        current_response = new_content
-                    continue
+                    if _server_stop:
+                        break   # break outer for loop
+                    continue    # resume outer loop with recovered response
                 else:
                     _no_tool_error_streak += 1
 
@@ -2405,15 +2414,64 @@ def _run_agentic_loop(
 
         if _followup_error:
             if _followup_transient:
-                # Transient server busy — backoff and retry without compacting context
+                # Transient server busy — inner retry loop, no compaction, no iteration burn
                 import time as _time
-                _server_error_streak += 1
-                _backoff = min(3.0 * (2 ** (_server_error_streak - 1)), 60.0)
-                print_warning(
-                    f"Server temporarily unavailable after tool follow-up (streak={_server_error_streak}/{_SERVER_ERROR_RETRY_LIMIT}). "
-                    f"Waiting {_backoff:.0f}s then retrying — context preserved."
-                )
-                _time.sleep(_backoff)
+                while True:
+                    _server_error_streak += 1
+                    _backoff = min(3.0 * (2 ** (_server_error_streak - 1)), 60.0)
+                    print_warning(
+                        f"Server temporarily unavailable after tool follow-up "
+                        f"(streak={_server_error_streak}/{_SERVER_ERROR_RETRY_LIMIT}). "
+                        f"Waiting {_backoff:.0f}s then retrying — context preserved."
+                    )
+                    _time.sleep(_backoff)
+
+                    if _server_error_streak >= _SERVER_ERROR_RETRY_LIMIT:
+                        if not _server_cooldown_used:
+                            _server_cooldown_used = True
+                            print_warning(f"Server unavailable after {_server_error_streak} retries. Waiting 120s…")
+                            _time.sleep(120)
+                            _server_error_streak = _SERVER_ERROR_RETRY_LIMIT - 5
+                            print_info("Resuming after extended cooldown.")
+                        else:
+                            new_content = None  # force break below
+                            break
+
+                    try:
+                        gen = chat_stream(
+                            message=follow_up,
+                            model=model,
+                            conversation_id=current_conv_id,
+                            base_url=config.get("base_url", "http://localhost:8000"),
+                            token=get_next_token(),
+                            history=_loop_pruned_history,
+                        )
+                        _loop_pruned_history = None
+                        thinking, new_content, new_conv_id = stream_response(
+                            generator=gen,
+                            session_name=session_name or "none",
+                            domain=domain,
+                            model=model,
+                            turn=turn + iteration,
+                            compression_info=None,
+                            research_sources=None,
+                            memory_count=0,
+                            show_thinking=config.get("show_thinking", True) and not no_think,
+                            phase=_current_phase,
+                        )
+                    except KeyboardInterrupt:
+                        console.print()
+                        print_warning("Agentic loop cancelled.")
+                        autopilot.note_user_interrupt()
+                        return current_conv_id
+
+                    if new_conv_id:
+                        current_conv_id = new_conv_id
+
+                    if new_content is not None and not _has_server_overflow_error(new_content):
+                        _server_error_streak = 0
+                        break  # recovered
+                    # Still down — loop again
             else:
                 if new_content is not None:
                     print_warning("Server returned an error during the tool-follow-up step. Force-compacting and retrying…")
@@ -2421,36 +2479,36 @@ def _run_agentic_loop(
                     print_warning("Tool-follow-up stopped early. Force-compacting and retrying…")
                 _compact_loop_context(reason="agentic loop overflow", force=True)
 
-            try:
-                gen = chat_stream(
-                    message=follow_up,
-                    model=model,
-                    conversation_id=current_conv_id,
-                    base_url=config.get("base_url", "http://localhost:8000"),
-                    token=get_next_token(),
-                    history=_loop_pruned_history,
-                )
-                _loop_pruned_history = None
-                thinking, new_content, new_conv_id = stream_response(
-                    generator=gen,
-                    session_name=session_name or "none",
-                    domain=domain,
-                    model=model,
-                    turn=turn + iteration,
-                    compression_info=None,
-                    research_sources=None,
-                    memory_count=0,
-                    show_thinking=config.get("show_thinking", True) and not no_think,
-                    phase=_current_phase,
-                )
-            except KeyboardInterrupt:
-                console.print()
-                print_warning("Agentic loop cancelled.")
-                autopilot.note_user_interrupt()
-                return current_conv_id
+                try:
+                    gen = chat_stream(
+                        message=follow_up,
+                        model=model,
+                        conversation_id=current_conv_id,
+                        base_url=config.get("base_url", "http://localhost:8000"),
+                        token=get_next_token(),
+                        history=_loop_pruned_history,
+                    )
+                    _loop_pruned_history = None
+                    thinking, new_content, new_conv_id = stream_response(
+                        generator=gen,
+                        session_name=session_name or "none",
+                        domain=domain,
+                        model=model,
+                        turn=turn + iteration,
+                        compression_info=None,
+                        research_sources=None,
+                        memory_count=0,
+                        show_thinking=config.get("show_thinking", True) and not no_think,
+                        phase=_current_phase,
+                    )
+                except KeyboardInterrupt:
+                    console.print()
+                    print_warning("Agentic loop cancelled.")
+                    autopilot.note_user_interrupt()
+                    return current_conv_id
 
-            if new_conv_id:
-                current_conv_id = new_conv_id
+                if new_conv_id:
+                    current_conv_id = new_conv_id
 
         # Update phase based on the new response
         if new_content:
