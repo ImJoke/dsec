@@ -1516,6 +1516,34 @@ class TestBackgroundFireAndForget(unittest.TestCase):
                             command="echo HELLO_WORLD_MARKER", wait=2)
         self.assertIn("HELLO_WORLD_MARKER", result)
 
+    def test_pty_unicode_passthrough(self):
+        """LANG/LC_ALL=UTF-8 means unicode in command output renders cleanly."""
+        from dsec.tools.pty_terminal import background
+        result = background(action="run", job_id="ff-test",
+                            command="echo 'héllo wörld 你好'", wait=2)
+        self.assertIn("héllo wörld 你好", result)
+
+    def test_pty_strips_nul_bytes(self):
+        """Binary NUL bytes from cat-ing a binary file must not survive."""
+        from dsec.tools.pty_terminal import background
+        background(action="run", job_id="ff-test", command="echo init", wait=1)
+        result = background(action="exec", job_id="ff-test",
+                            command="printf 'before\\x00\\x01\\x02after\\n'", wait=3)
+        self.assertIn("beforeafter", result)
+        self.assertNotIn("\x00", result)
+        self.assertNotIn("\x01", result)
+
+    def test_pty_wide_table_fits_220_cols(self):
+        """5 × 30-char columns = 150 cols, must fit within COLS=220 without wrap."""
+        from dsec.tools.pty_terminal import background
+        background(action="run", job_id="ff-test", command="echo init", wait=1)
+        result = background(action="exec", job_id="ff-test",
+                            command="printf '%-30s %-30s %-30s %-30s %-30s\\n' a b c d e",
+                            wait=3)
+        # Single line containing all five markers — no wrap.
+        for marker in ("a", "b", "c", "d", "e"):
+            self.assertIn(marker, result)
+
     def test_collapse_cr_progress_keeps_findings(self):
         """User saw bg read return 9.4 MB of feroxbuster `[>------]`
         progress redraws burying one real `200 GET /iisstart.htm` line.
