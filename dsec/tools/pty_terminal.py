@@ -458,17 +458,40 @@ def background(
         try:
             pane = _get_or_create(job_id)
         except RuntimeError as e:
-            return f"Error: {e}"
-        pane.write(command + "\n")
+            return f"[error: failed to create pane '{job_id}': {e}]"
+
+        try:
+            pane.write(command + "\n")
+        except (RuntimeError, OSError) as exc:
+            # Pane died between spawn and write. Drop it so the next run
+            # gets a fresh shell instead of hitting the same corpse.
+            try:
+                pane.close()
+            except Exception:
+                pass
+            with _PANES_LOCK:
+                if _PANES.get(job_id) is pane:
+                    del _PANES[job_id]
+            return (
+                f"[error: pane '{job_id}' died before command could be sent: {type(exc).__name__}: {exc}. "
+                f"Retry with action='run' to spawn a fresh pane.]"
+            )
+
         # Cap wait at 10s for background runs — anything longer should poll via
         # action='read'. Previously up to 30s; that turned `background run` into
         # a near-blocking call when the model picked wait=20-30.
         wait_clamped = max(0.5, min(float(wait), 10.0))
-        output = strip_ansi(pane.read(timeout=wait_clamped))
-        status = "running" if pane.alive else "exited"
-        # Track history (raw output before large-output truncation)
+        try:
+            output = strip_ansi(pane.read(timeout=wait_clamped))
+        except (OSError, ValueError) as exc:
+            output = f"[read error: {type(exc).__name__}: {exc}]"
+
+        status = "running" if pane.alive else f"exited({pane.process.returncode})"
         pane._history.append({"cmd": command, "output": output})
-        display_output = _maybe_save_output(job_id, output) if output else "(no output yet — use action=read to poll later)"
+        display_output = (
+            _maybe_save_output(job_id, output) if output
+            else "(no output yet — use action=read to poll later)"
+        )
         return (
             f"[job '{job_id}' started — PID {pane.process.pid}, status: {status}]\n"
             f"{display_output}"
