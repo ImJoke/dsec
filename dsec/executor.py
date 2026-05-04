@@ -192,10 +192,24 @@ class CommandRunner:
             # this, a `trap '' TERM; sleep 30` shell ignores SIGTERM, the
             # spawned `sleep` survives the SIGKILL on the shell parent, and
             # our pipe-reader threads block until the orphaned child exits.
+            #
+            # stdin handling:
+            #   - sudo flow: PIPE so we can write the password
+            #   - everything else: /dev/null so any process that probes
+            #     stdin (e.g. certipy "Overwrite? (y/n)" prompt, ffuf,
+            #     interactive auth tools) sees EOF and falls back to its
+            #     default action instead of blocking forever waiting for
+            #     a human keystroke that will never come.
+            if _sudo_stdin:
+                _stdin_arg = subprocess.PIPE
+                _devnull = None
+            else:
+                _devnull = open(os.devnull, "rb")
+                _stdin_arg = _devnull
             with self._lock:
                 self._proc = subprocess.Popen(
                     argv,
-                    stdin=subprocess.PIPE if _sudo_stdin else None,
+                    stdin=_stdin_arg,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -328,6 +342,11 @@ class CommandRunner:
         finally:
             with self._lock:
                 self._proc = None
+            if _devnull is not None:
+                try:
+                    _devnull.close()
+                except Exception:
+                    pass
 
         return CommandResult(
             command=command,

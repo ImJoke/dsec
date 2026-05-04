@@ -59,9 +59,26 @@ def _maybe_save_output(job_id: str, output: str) -> str:
         return output[:_LARGE_OUTPUT_THRESHOLD] + f"\n...[truncated at {_LARGE_OUTPUT_THRESHOLD} chars]"
 
 
+_ANSI_RE = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
+_BARE_CSI_RE = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')   # CSI sequences
+_BARE_OSC_RE = re.compile(r'\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)')  # OSC (window title etc.)
+_NUL_RE = re.compile(r'[\x00\x01\x02\x03\x04\x05\x06\x07\x0E\x0F]+')  # control bytes besides \t \n \r
+
+
 def strip_ansi(text: str) -> str:
-    ansi_escape = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
-    return ansi_escape.sub('', text)
+    """Remove ANSI escape sequences AND stray control bytes.
+
+    PTY capture occasionally drops NUL/SOH/ETX/etc. into the stream
+    (binary tool output, mismatched encodings). These break JSON
+    serialisation and look like garbage to the agent.
+    """
+    if not text:
+        return text
+    text = _ANSI_RE.sub('', text)
+    text = _BARE_CSI_RE.sub('', text)
+    text = _BARE_OSC_RE.sub('', text)
+    text = _NUL_RE.sub('', text)
+    return text
 
 
 # Common TUI progress-line shapes:
@@ -171,13 +188,59 @@ class Pane:
 
         env = os.environ.copy()
         env.update({
+            # 256-color xterm: most modern security tools (nxc, certipy,
+            # impacket) emit ANSI colors when TERM looks color-capable.
+            # We strip the codes downstream — the value here just keeps
+            # those tools happy so they don't downgrade to plain output.
             "TERM": "xterm-256color",
+            # Width/height — must match the TIOCSWINSZ values above so
+            # tools that read both env and ioctl agree.
             "COLUMNS": str(self.COLS),
             "LINES": str(self.ROWS),
+            # Force UTF-8 so unicode (HTB usernames with diacritics, log
+            # output with box-drawing chars, etc.) renders correctly.
+            "LANG": env.get("LANG", "en_US.UTF-8"),
+            "LC_ALL": env.get("LC_ALL", "en_US.UTF-8"),
+            # Predictable PS1 so output is consistent across user systems
+            # and the prompt-pattern matcher (`bash-`, `$ `, `# `) reliably
+            # detects the prompt regardless of the user's shell theme.
+            "PS1": r"\u@\h:\w\$ ",
+            # PROMPT_COMMAND would mutate PS1 every render. Clear it so the
+            # prompt stays our predictable string for the matcher.
+            "PROMPT_COMMAND": "",
+            # Disable bash history expansion (`!`) — it interferes with
+            # commands that legitimately contain bangs (curl URLs, etc.).
+            "HISTCONTROL": "ignoreboth",
+            # Keep shell history off the user's disk + don't pollute
+            # session output with history-merge messages.
+            "HISTFILE": "/dev/null",
+            "HISTSIZE": "0",
+            "HISTFILESIZE": "0",
+            # `git log`, `man`, `systemctl status`, etc. invoke a pager that
+            # waits for keystrokes — fatal in PTY agent mode. Force-stream.
+            "PAGER": "cat",
+            "GIT_PAGER": "cat",
+            "MANPAGER": "cat",
+            # Some setups source BASH_ENV even with --noprofile/--norc; clear
+            # it so we get a fully-clean shell.
+            "BASH_ENV": "",
+            "ENV": "",
+            # Tools like rich/textual probe COLORTERM to enable truecolor.
+            "COLORTERM": "truecolor",
+            # Stop rich/click from auto-paginating their help.
+            "CLICOLOR_FORCE": "1",
+            # Suppress Python's BytesWarning + writes to .pyc cache (cleaner
+            # output when the agent runs python3 -c '...' inside the PTY).
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONUNBUFFERED": "1",
         })
 
         self.process = subprocess.Popen(
-            ["/bin/bash"],
+            # --noprofile + --norc: skip user's .bash_profile / .bashrc.
+            # Keeps spawn fast and avoids MOTD / fortune / oh-my-bash noise
+            # leaking into the first read. Tools called by full path or
+            # already on $PATH still work; aliases are sacrificed.
+            ["/bin/bash", "--noprofile", "--norc"],
             stdin=self.slave_fd,
             stdout=self.slave_fd,
             stderr=self.slave_fd,
