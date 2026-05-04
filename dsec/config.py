@@ -513,18 +513,88 @@ def check_tokens() -> Dict[str, Any]:
 # Sudo password (stored as an extra key, not part of DEFAULT_CONFIG)
 # ─────────────────────────────────────────────────────────────────────────────
 
+_LEGACY_SUDO_WARNED = False  # fire migration warning only once per process
+_SUDO_KEYFILE = CONFIG_DIR / ".sudo_key"
+_SUDO_ENC_FILE = CONFIG_DIR / ".sudo_pass.enc"
+_ENC_PREFIX = "enc:fernet:"
+
+
+def _load_or_create_master_key() -> Optional[bytes]:
+    """Return a stable per-install Fernet key, creating it on first use.
+
+    Stored at ~/.dsec/.sudo_key with mode 0o600. If the cryptography library
+    isn't installed, returns None (caller falls back to refusing to write).
+    """
+    try:
+        from cryptography.fernet import Fernet
+    except Exception:
+        return None
+
+    _ensure_base_dirs()
+    if _SUDO_KEYFILE.exists():
+        try:
+            data = _SUDO_KEYFILE.read_bytes()
+            if data:
+                return data
+        except OSError:
+            pass
+
+    key = Fernet.generate_key()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(str(_SUDO_KEYFILE), flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(key)
+    except Exception:
+        try:
+            os.unlink(_SUDO_KEYFILE)
+        except OSError:
+            pass
+        return None
+    return key
+
+
+def _encrypt_sudo(password: str) -> Optional[str]:
+    key = _load_or_create_master_key()
+    if not key:
+        return None
+    try:
+        from cryptography.fernet import Fernet
+        token = Fernet(key).encrypt(password.encode("utf-8")).decode("ascii")
+        return _ENC_PREFIX + token
+    except Exception:
+        return None
+
+
+def _decrypt_sudo(blob: str) -> Optional[str]:
+    if not blob.startswith(_ENC_PREFIX):
+        return None
+    key = _load_or_create_master_key()
+    if not key:
+        return None
+    try:
+        from cryptography.fernet import Fernet, InvalidToken
+        token = blob[len(_ENC_PREFIX):]
+        return Fernet(key).decrypt(token.encode("ascii")).decode("utf-8")
+    except Exception:
+        return None
+
+
 def get_sudo_password() -> str:
     """Return the sudo password from a secure source, or empty string if unset.
 
     Source priority (most to least preferred):
       1. DSEC_SUDO_PASS environment variable
       2. System keyring entry ("dsec", "sudo_password")
-      3. Legacy plaintext copy in config.json (read only — never written here)
+      3. Encrypted file at ~/.dsec/.sudo_pass.enc (Fernet, key file mode 0o600)
+      4. Legacy plaintext copy in config.json (read only — never written here)
 
     The legacy file copy exists for users upgrading from older versions.
-    Calling set_sudo_password actively scrubs that copy when keyring writes
-    succeed.
+    Calling set_sudo_password actively scrubs that copy when a secure
+    backend write succeeds.
     """
+    global _LEGACY_SUDO_WARNED
+
     env_pw = os.environ.get("DSEC_SUDO_PASS")
     if env_pw:
         return env_pw
@@ -537,19 +607,28 @@ def get_sudo_password() -> str:
     except Exception:
         pass
 
+    if _SUDO_ENC_FILE.exists():
+        try:
+            blob = _SUDO_ENC_FILE.read_text(encoding="ascii").strip()
+            decoded = _decrypt_sudo(blob)
+            if decoded:
+                return decoded
+        except OSError:
+            pass
+
     try:
         if CONFIG_FILE.exists():
             with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
                 raw = json.load(fh)
             if isinstance(raw, dict):
                 legacy = str(raw.get("sudo_password", ""))
-                if legacy:
-                    # Surface the security concern once, but don't block the call.
+                if legacy and not _LEGACY_SUDO_WARNED:
+                    _LEGACY_SUDO_WARNED = True
                     import warnings as _warnings
                     _warnings.warn(
                         "sudo_password is stored in plaintext in ~/.dsec/config.json. "
                         "Re-save it via `dsec config --set sudo_password ...` to migrate "
-                        "to the system keyring.",
+                        "to a secure backend.",
                         stacklevel=2,
                     )
                 return legacy
@@ -559,32 +638,54 @@ def get_sudo_password() -> str:
 
 
 def set_sudo_password(password: str) -> None:
-    """Persist the sudo password to the system keyring.
+    """Persist the sudo password to a secure backend.
 
-    Refuses to store the password in plaintext. If the keyring backend is
-    unavailable, raises ConfigError so the caller can prompt the user to
-    install one (`pip install keyring secretstorage`) or pass the password
-    via the `DSEC_SUDO_PASS` environment variable instead.
+    Tries (in order): system keyring → encrypted file with cryptography. Refuses
+    to store in plaintext. If neither backend is available, raises ConfigError
+    pointing the user at `pip install keyring` or `pip install cryptography`,
+    or at the `DSEC_SUDO_PASS` environment variable.
     """
+    stored = False
+
+    # 1) Preferred: OS keyring (Keychain on mac, Secret Service on Linux, etc.)
     try:
         import keyring
-    except Exception as exc:
-        raise ConfigError(
-            "Cannot persist sudo password: 'keyring' module not available. "
-            "Install it (pip install keyring) or pass the password via the "
-            "DSEC_SUDO_PASS environment variable instead."
-        ) from exc
+        try:
+            keyring.set_password("dsec", "sudo_password", password)
+            stored = True
+        except Exception:
+            stored = False
+    except Exception:
+        pass
 
-    try:
-        keyring.set_password("dsec", "sudo_password", password)
-    except Exception as exc:
-        raise ConfigError(
-            f"Cannot persist sudo password: keyring backend failed ({exc}). "
-            "On Linux ensure secretstorage / dbus is running. "
-            "As a fallback, pass the password via DSEC_SUDO_PASS environment variable."
-        ) from exc
+    # 2) Fallback: Fernet-encrypted file under ~/.dsec/, key in 0o600 file.
+    if not stored:
+        token = _encrypt_sudo(password)
+        if token:
+            _ensure_base_dirs()
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            fd = os.open(str(_SUDO_ENC_FILE), flags, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="ascii") as fh:
+                    fh.write(token + "\n")
+                stored = True
+            except Exception:
+                try:
+                    os.unlink(_SUDO_ENC_FILE)
+                except OSError:
+                    pass
 
-    # Drop any legacy plaintext copy if the user previously had keyring fail.
+    if not stored:
+        raise ConfigError(
+            "Cannot persist sudo password securely. Install one of:\n"
+            "  pip install keyring        (preferred — uses OS keyring)\n"
+            "  pip install cryptography   (fallback — encrypts file under ~/.dsec/)\n"
+            "Alternatively, pass the password via the DSEC_SUDO_PASS environment "
+            "variable so it never touches disk."
+        )
+
+    # Drop any legacy plaintext copy from config.json now that we have a
+    # secure store. Best-effort — do not fail the call if scrubbing errors.
     try:
         config = load_config()
         extras = _read_extra_keys()
@@ -597,7 +698,7 @@ def set_sudo_password(password: str) -> None:
 
 
 def clear_sudo_password() -> None:
-    """Remove the sudo password from system keyring and config file."""
+    """Remove the sudo password from every backend (keyring, encrypted file, legacy)."""
     try:
         import keyring
         try:
@@ -607,7 +708,22 @@ def clear_sudo_password() -> None:
     except Exception:
         pass
 
-    config = load_config()
-    extras = _read_extra_keys()
-    extras.pop("sudo_password", None)
-    _write_config({**extras, **config})
+    try:
+        if _SUDO_ENC_FILE.exists():
+            os.unlink(_SUDO_ENC_FILE)
+    except OSError:
+        pass
+
+    try:
+        config = load_config()
+        extras = _read_extra_keys()
+        if "sudo_password" in extras:
+            extras.pop("sudo_password", None)
+            _write_config({**extras, **config})
+            _invalidate_cache()
+    except Exception:
+        pass
+
+
+# Legacy stub removed: clear_sudo_password is defined above with full backend
+# coverage (keyring + encrypted file + legacy plaintext scrub).
