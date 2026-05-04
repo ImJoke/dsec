@@ -1355,13 +1355,21 @@ def _run_agentic_loop(
     _technique_fail: Dict[str, int] = {}  # "technique_category" -> fail_count
     _mcp_server_failures: Dict[str, int] = {}  # server_name -> consecutive error count
     _MCP_SERVER_FAIL_THRESHOLD = 3  # after this many consecutive errors, inject pivot hint
-    _STUCK_THRESHOLD = 3
+    _STUCK_THRESHOLD = 2
     _TECHNIQUE_THRESHOLD = 2  # abandon a technique after this many conceptual failures
     # Track repeated `background read` polling on the same job_id across turns.
     # When the same poll returns "no new output" 3+ iterations in a row we
     # rewrite the tool result to nudge the agent to do something else instead
     # of burning iterations on a hot-loop poll.
     _bg_read_streak: Dict[str, int] = {}
+    # Cross-turn identical-command tracker. After a tool call's result is
+    # available, we record the (tool_name, args_hash) → consecutive_count.
+    # When the SAME (tool_name, args_hash) shows up two iterations in a row
+    # AND the prior result had an error marker, we inject a "you just ran
+    # this and it failed — change args before retrying" hint without
+    # re-dispatching. Resets when the agent runs a different command.
+    _last_cmd_signature: Optional[str] = None
+    _last_cmd_failed: bool = False
     _no_tool_streak = 0
     _no_tool_error_streak = 0   # non-server no-tool turns (AI chose not to call tools)
     _server_error_streak = 0    # consecutive transient server errors ("服务暂时不可用")
@@ -1388,6 +1396,8 @@ def _run_agentic_loop(
         ("[-] Got error", "adcs_req"),
         ("upn = " , "adcs_upn_check"),  # handled specially below
         ("insufficientAccessRights", "ldap_acl"),
+        ("ERROR_DS_INSUFF_ACCESS_RIGHTS", "ldap_acl"),
+        ("Insufficient access rights to perform", "ldap_acl"),
         ("LDAP modify failed", "ldap_modify"),
         ("constraint violation", "ldap_constraint"),
         # Kerberos — clock skew variants (all roll up to one bucket so 2x → pivot)
@@ -2259,6 +2269,10 @@ def _run_agentic_loop(
                         )
 
                 tool_responses.append({"name": tool_name, "result": result_text})
+                import hashlib as _hashlib
+                _bash_arg_blob = _json.dumps(arguments, sort_keys=True, default=str)
+                _last_cmd_signature = f"bash:{_hashlib.sha1(_bash_arg_blob.encode()).hexdigest()[:12]}"
+                _last_cmd_failed = (res is None or res.returncode != 0)
                 if session_name:
                     append_audit_log(session_name, {
                         "tool": tool_name,
@@ -2353,6 +2367,21 @@ def _run_agentic_loop(
 
             # ── Native registered tools ───────────────────────────────────────
             elif registry_get_tool(tool_name):
+                # Cross-turn identical-cmd detection.
+                import hashlib as _hashlib
+                _arg_blob = _json.dumps(arguments, sort_keys=True, default=str)
+                _sig = f"{tool_name}:{_hashlib.sha1(_arg_blob.encode()).hexdigest()[:12]}"
+                if _sig == _last_cmd_signature and _last_cmd_failed:
+                    _hint = (
+                        f"[hint: you just ran `{tool_name}` with these exact arguments "
+                        f"in the previous turn and it FAILED. Re-running it will produce "
+                        f"the same error. Either change the arguments (different target, "
+                        f"different auth, different syntax) or pivot to a different tool. "
+                        f"Inspect the prior error message and ADAPT.]"
+                    )
+                    tool_responses.append({"name": tool_name, "result": _hint})
+                    console.print(f"  [bold yellow]⏭ {tool_name}[/bold yellow] (skipped — identical retry)")
+                    continue  # skip dispatch entirely
                 args_str = _json.dumps(arguments, ensure_ascii=False)
                 if len(args_str) > 100: args_str = args_str[:100] + "…"
                 with console.status(f"[bold magenta]⚙ {tool_name}[/bold magenta] [#888888]{args_str}[/]", spinner="dots") as status:
@@ -2410,6 +2439,8 @@ def _run_agentic_loop(
                                 _bg_read_streak.pop(_job, None)
 
                         tool_responses.append({"name": tool_name, "result": result_text})
+                        _last_cmd_signature = _sig
+                        _last_cmd_failed = False
                         console.print(f"  [bold green]✔ {tool_name}[/bold green] [#888888]{args_str}[/]")
                         if session_name:
                             append_audit_log(session_name, {
@@ -2451,11 +2482,15 @@ def _run_agentic_loop(
                             hint = str(native_exc)
                         print_warning(f"Native tool {tool_name} failed: {hint}")
                         tool_responses.append({"name": tool_name, "result": f"[error: {hint}]"})
+                        _last_cmd_signature = _sig
+                        _last_cmd_failed = True
                         console.print(f"  [bold red]✖ {tool_name}[/bold red] [#888888]{args_str}[/]")
                     except Exception as native_exc:
                         err_text = f"[error: {type(native_exc).__name__}: {native_exc}]"
                         print_warning(f"Native tool {tool_name} failed: {native_exc}")
                         tool_responses.append({"name": tool_name, "result": err_text})
+                        _last_cmd_signature = _sig
+                        _last_cmd_failed = True
                         console.print(f"  [bold red]✖ {tool_name}[/bold red] [#888888]{args_str}[/]")
                         from rich.panel import Panel
                         from rich.text import Text
