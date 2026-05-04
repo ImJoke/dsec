@@ -238,10 +238,18 @@ class Pane:
                 os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
                 self.process.wait(timeout=2)
             except (OSError, subprocess.TimeoutExpired):
-                self.process.kill()
                 try:
+                    self.process.kill()
                     self.process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+            except KeyboardInterrupt:
+                # Mid-close interrupt (e.g. Ctrl+C during atexit). Force-kill
+                # without waiting so atexit doesn't print a misleading
+                # traceback when the user is just trying to exit.
+                try:
+                    self.process.kill()
+                except (OSError, ProcessLookupError):
                     pass
         if self.slave_fd >= 0:
             try:
