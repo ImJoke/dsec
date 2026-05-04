@@ -1456,6 +1456,67 @@ class TestExtremeStress(unittest.TestCase):
         self.assertEqual(skipped, 1, f"expected 1 skip, got {skipped}")
 
 
+class TestBackgroundFireAndForget(unittest.TestCase):
+    """User reported `background run ferox` blocking ~10s before returning.
+    Root cause: `pane.read` uses IDLE timeout, and feroxbuster prints
+    continuously — idle timer keeps resetting until 10s wall cap.
+
+    Fix: pane.read accepts max_total wall-clock cap; run action sets
+    wall_cap=wait*1.5. wait=0 skips the read entirely (true fire-and-forget).
+    """
+
+    def setUp(self):
+        from dsec.tools.pty_terminal import background
+        for jid in ("ff-test", "ff-burst"):
+            try:
+                background(action="kill", job_id=jid)
+            except Exception:
+                pass
+
+    def tearDown(self):
+        from dsec.tools.pty_terminal import background
+        for jid in ("ff-test", "ff-burst"):
+            try:
+                background(action="kill", job_id=jid)
+            except Exception:
+                pass
+
+    def test_wait_zero_returns_instantly(self):
+        """wait=0 → fire-and-forget. Should return in <1s regardless of cmd output."""
+        from dsec.tools.pty_terminal import background
+        import time
+        # Even a command that prints a lot — should NOT delay return.
+        cmd = "yes hello | head -c 100000"  # prints ~100KB fast
+        t0 = time.time()
+        result = background(action="run", job_id="ff-test", command=cmd, wait=0)
+        elapsed = time.time() - t0
+        # Pane init dominates (~0.3-1s). After that, no read = instant.
+        self.assertLess(elapsed, 2.5, f"fire-and-forget took {elapsed:.1f}s")
+        self.assertIn("started", result)
+        # Output may be empty (we skipped read) — that's the contract.
+
+    def test_wall_cap_caps_continuous_output(self):
+        """Continuously-printing command (yes/dev/zero) must NOT block beyond
+        wait*1.5 wall cap, even if idle never triggers."""
+        from dsec.tools.pty_terminal import background
+        import time
+        # `yes` floods output forever; wait=2 → wall cap = 3s
+        t0 = time.time()
+        result = background(action="run", job_id="ff-burst",
+                            command="yes BURST", wait=2)
+        elapsed = time.time() - t0
+        # Pane init ~1s + wall cap 3s = ~4s; allow slop for slower CI
+        self.assertLess(elapsed, 6.5, f"continuous-output blocked for {elapsed:.1f}s")
+        self.assertIn("started", result)
+
+    def test_wait_default_still_works_for_short_cmd(self):
+        """Default wait must capture initial output of a quick command."""
+        from dsec.tools.pty_terminal import background
+        result = background(action="run", job_id="ff-test",
+                            command="echo HELLO_WORLD_MARKER", wait=2)
+        self.assertIn("HELLO_WORLD_MARKER", result)
+
+
 class TestAuditReplayPersistence(unittest.TestCase):
     """Regression: state vars (_last_cmd_signature, _fail_history) were
     process-local — across dsec restarts they reset, so an identical bash

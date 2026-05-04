@@ -602,28 +602,47 @@ REVIEWING COMMAND HISTORY:
   background(action="history", job_id="winrm", mode="all")   ← every command run in this pane
   If output > 8000 chars, it's auto-saved to /tmp/dsec_<job>_<ts>.txt — preview + path returned.
 
-BACKGROUND-JOB DISCIPLINE — DO NOT POLL IN A LOOP
+BACKGROUND-JOB DISCIPLINE — FIRE AND FORGET
   Long enum scans (feroxbuster, gobuster, nmap full-port, hashcat) take MINUTES
-  to produce useful output. Once you start one with `background(action="run",...)`
-  treat it as fire-and-forget:
-    1. After you start the job, IMMEDIATELY pivot to a different task — enumerate
-       another service, search notes, run an alternate exploit chain. Don't wait.
-    2. Check back at most once every 4-5 iterations with `background(action="read",
-       job_id="ferox")`. If the response is "[no new output]" twice in a row,
-       LEAVE IT ALONE and keep working on something else — re-checking burns
-       iteration budget without progress.
-    3. NEVER call `background read` in two consecutive turns for the same job.
-       The agent loop deduplicates identical calls inside one turn but cannot
-       stop a sustained polling pattern across turns — that's on you.
-    4. If the job's been running >5 minutes with nothing useful, kill it and
-       try a different wordlist / smaller scope:
+  to produce useful output. Use `wait=0` to spawn TRULY in the background —
+  the run action returns immediately without reading initial output. Reading
+  output with `wait>0` makes the call block; for ferox-class tools this can
+  hold the agent for 5-10s on every spawn while output is still warming up.
+
+  RULES:
+    1. For long scans / listeners → wait=0 (instant return, poll later):
+         background(action="run", job_id="ferox",
+                    command="feroxbuster -u http://{ip}/ -w raft-medium.txt --smart -k",
+                    wait=0)
+    2. For interactive shells where you NEED the banner before sending the
+       next command (evil-winrm, mssqlclient, ssh) → wait=5 to 8 (idle-cap)
+       so action='exec' has a clean prompt to anchor on.
+    3. After spawning a long scan, IMMEDIATELY pivot to a different task —
+       enumerate another service, search notes, run an alternate exploit.
+       Don't sit and watch.
+    4. Check back at most once every 4-5 iterations with `background(
+       action="read", job_id="ferox")`. If the response is "[no new output]"
+       or "[does not exist]" twice in a row, the agent loop will inject a
+       hint and refuse further reads — you'll have to RUN it (if missing) or
+       work on something else.
+    5. NEVER call `background read` in two consecutive turns for the same
+       job. The cross-turn guard now intercepts that pattern explicitly.
+    6. If the job's been running >5 minutes with no useful output, kill it
+       and try a smaller scope:
          background(action="kill", job_id="ferox")
-         background(action="run",  job_id="ferox-fast", command="feroxbuster -u http://{ip}/ -w small.txt --depth 2 -k", wait=3)
-  CONCRETE EXAMPLE — fire ferox then continue:
-    Step A: background(action="run", job_id="ferox", command="feroxbuster -u http://{ip}/ -w raft-medium.txt --smart -k", wait=3)
-    Step B: same turn or next — nxc smb {ip} -u '' -p '' (different service)
-    Step C: keep enumerating LDAP, SMB shares, SMB null sessions for several turns
-    Step D: only NOW check `background(action="read", job_id="ferox")` for ferox findings
+         background(action="run",  job_id="ferox-fast",
+                    command="feroxbuster -u http://{ip}/ -w small.txt --depth 2 -k",
+                    wait=0)
+
+  CONCRETE EXAMPLE — fire ferox then immediately work:
+    Step A (turn N):     background(action="run", job_id="ferox",
+                                    command="feroxbuster -u http://{ip}/ ...",
+                                    wait=0)        ← INSTANT return
+    Step A still N:      nxc smb {ip} -u '' -p ''  ← keep going same turn
+    Step B (turn N+1):   notes_search(query="ADCS find vulnerable templates")
+    Step C (turn N+2-3): more enumeration on different services
+    Step D (turn N+4):   background(action="read", job_id="ferox")  ← finally check
+    Step E:              act on ferox findings, or kill+respawn if dead-end
 
 Output format:
 ## 🔍 Analysis
