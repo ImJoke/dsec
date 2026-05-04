@@ -2426,9 +2426,27 @@ def _run_agentic_loop(
                         tool_responses.append({"name": tool_name, "result": f"[error: {hint}]"})
                         console.print(f"  [bold red]✖ {tool_name}[/bold red] [#888888]{args_str}[/]")
                     except Exception as native_exc:
+                        err_text = f"[error: {type(native_exc).__name__}: {native_exc}]"
                         print_warning(f"Native tool {tool_name} failed: {native_exc}")
-                        tool_responses.append({"name": tool_name, "result": f"[error: {native_exc}]"})
+                        tool_responses.append({"name": tool_name, "result": err_text})
                         console.print(f"  [bold red]✖ {tool_name}[/bold red] [#888888]{args_str}[/]")
+                        from rich.panel import Panel
+                        from rich.text import Text
+                        console.print(
+                            Panel(
+                                Text(err_text, style="red"),
+                                title=f"[red]{tool_name} ERROR[/red]",
+                                border_style="red",
+                                padding=(0, 1),
+                            )
+                        )
+                        if session_name:
+                            append_audit_log(session_name, {
+                                "tool": tool_name,
+                                "args": arguments,
+                                "result_preview": err_text[:120],
+                                "success": False,
+                            })
                 continue # skip the old try-except block below since we included it here
             else:
                 tool_responses.append({"name": tool_name, "result": f"[error: unknown tool '{tool_name}']"})
