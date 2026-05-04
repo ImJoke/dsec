@@ -64,6 +64,62 @@ def strip_ansi(text: str) -> str:
     return ansi_escape.sub('', text)
 
 
+# Common TUI progress-line shapes:
+#   [>---------]   feroxbuster, gobuster
+#   [###       ]   hashcat, john
+#   [==========]   wget, curl
+#   3%, 100/2400, 12.3MB/s   percentage / fraction / rate
+_PROGRESS_LINE_RE = re.compile(
+    r"^\s*\[[\s\->=#|/\\.]+\]"      # [progress-bar] prefix
+    r"|^\s*\d+\s*[%/]\s*\d+"        # 50% / 100/2400
+    r"|^\s*[\d.]+[KMG]?B?/s\b"      # 12.3MB/s rate prefix
+    r"|^\s*ETA\s*\d+"               # ETA 5s
+    r"|^\s*Progress:\s*",           # Progress: prefix
+    re.IGNORECASE,
+)
+
+
+def _is_progress_line(line: str) -> bool:
+    return bool(_PROGRESS_LINE_RE.match(line))
+
+
+def collapse_cr_progress(text: str) -> str:
+    """Collapse carriage-return TUI progress redraws into a clean stream.
+
+    Tools like feroxbuster, hashcat, and curl print progress bars by
+    emitting `<line>\\r<line>\\r<line>` — each update overwrites the
+    previous one on a real terminal. PTY capture preserves every
+    iteration verbatim, so a 5-minute scan turns into 200+ duplicate
+    progress lines burying the actual findings.
+
+    Strategy: split on \\r and \\n, drop empty segments, and collapse
+    consecutive progress-shaped lines into ONE (the latest). Real
+    output lines (non-progress) pass through untouched.
+    """
+    if not text:
+        return text
+    out_lines: list = []
+    in_progress_block = False
+    for chunk in text.replace("\r\n", "\n").split("\n"):
+        # \r-overwrite within a line: keep only the segment after the LAST \r
+        last_after_cr = chunk.split("\r")[-1]
+        stripped = last_after_cr.rstrip()
+        if not stripped:
+            in_progress_block = False
+            continue
+        if _is_progress_line(stripped):
+            if in_progress_block and out_lines:
+                # Replace previous progress line with the newer one
+                out_lines[-1] = stripped
+            else:
+                out_lines.append(stripped)
+                in_progress_block = True
+        else:
+            out_lines.append(stripped)
+            in_progress_block = False
+    return "\n".join(out_lines)
+
+
 # Prompt patterns for known interactive shells — used by action="exec"
 # All patterns are plain substring matches (no glob/fnmatch).
 # evil-winrm prompt is literally: *Evil-WinRM shell v3.x Final* PS C:\Users\>
@@ -520,9 +576,9 @@ def background(
             wait_clamped = max(0.5, min(wait_f, 10.0))
             wall_cap = min(wait_clamped * 1.5, 10.0)
             try:
-                output = strip_ansi(
+                output = collapse_cr_progress(strip_ansi(
                     pane.read(timeout=wait_clamped, max_total=wall_cap)
-                )
+                ))
             except (OSError, ValueError) as exc:
                 output = f"[read error: {type(exc).__name__}: {exc}]"
 
@@ -543,9 +599,10 @@ def background(
             return "Error: 'job_id' is required for action='exec'."
         if not command:
             return "Error: 'command' is required for action='exec'."
-        if job_id not in _PANES:
-            return _RESUME_ERR.format(job_id)
-        pane = _PANES[job_id]
+        with _PANES_LOCK:
+            pane = _PANES.get(job_id)
+            if pane is None:
+                return _RESUME_ERR.format(job_id)
         if not pane.alive:
             return f"[job '{job_id}' has exited — use action='run' to restart]"
 
@@ -572,18 +629,25 @@ def background(
     if action == "read":
         if not job_id:
             return "Error: 'job_id' is required for action='read'."
+        # Snapshot the pane reference under the lock. Pane.read() and the
+        # status-check methods all guard against master_fd < 0 / process
+        # death internally, so it's safe to drop the lock for the slow
+        # read call — no crash if the pane is killed concurrently.
         with _PANES_LOCK:
-            if job_id not in _PANES:
+            pane = _PANES.get(job_id)
+            if pane is None:
                 return _RESUME_ERR.format(job_id)
-            pane = _PANES[job_id]
         # Hard wall-clock cap of 2s. Without max_total, a continuously
         # printing process (feroxbuster, hashcat) keeps resetting the
         # idle timer on every chunk and `read` blocks until the process
         # itself goes quiet — which for an active scan can be minutes.
-        # 2s is enough to drain whatever's queued in the kernel buffer
-        # for the agent to act on.
-        output = strip_ansi(pane.read(timeout=0.5, max_total=2.0))
-        status = "running" if pane.alive else f"exited({pane.process.returncode})"
+        # collapse_cr_progress strips repeated TUI progress-bar redraws
+        # so the agent sees real findings, not 200 duplicate progress lines.
+        output = collapse_cr_progress(strip_ansi(pane.read(timeout=0.5, max_total=2.0)))
+        try:
+            status = "running" if pane.alive else f"exited({pane.process.returncode})"
+        except Exception:
+            status = "unknown"
         if not output:
             return f"[job '{job_id}' — {status} — no new output]"
         return f"[job '{job_id}' — {status}]\n{_maybe_save_output(job_id, output)}"
@@ -592,11 +656,12 @@ def background(
     if action == "send":
         if not job_id:
             return "Error: 'job_id' is required for action='send'."
-        if job_id not in _PANES:
-            return _RESUME_ERR.format(job_id)
         if not input:
             return "Error: 'input' is required for action='send'."
-        pane = _PANES[job_id]
+        with _PANES_LOCK:
+            pane = _PANES.get(job_id)
+            if pane is None:
+                return _RESUME_ERR.format(job_id)
         processed = (
             input
             .replace("\\x03", "\x03")
@@ -612,9 +677,10 @@ def background(
     if action == "history":
         if not job_id:
             return "Error: 'job_id' is required for action='history'."
-        if job_id not in _PANES:
-            return _RESUME_ERR.format(job_id)
-        pane = _PANES[job_id]
+        with _PANES_LOCK:
+            pane = _PANES.get(job_id)
+            if pane is None:
+                return _RESUME_ERR.format(job_id)
         if not pane._history:
             return f"[job '{job_id}'] No command history recorded yet."
         mode_lower = (mode or "last").strip().lower()
@@ -635,10 +701,14 @@ def background(
     if action == "kill":
         if not job_id:
             return "Error: 'job_id' is required for action='kill'."
-        if job_id not in _PANES:
+        with _PANES_LOCK:
+            pane = _PANES.pop(job_id, None)
+        if pane is None:
             return f"[job '{job_id}' does not exist — already gone or never started]"
-        _PANES[job_id].close()
-        del _PANES[job_id]
+        try:
+            pane.close()
+        except Exception:
+            pass
         return f"[job '{job_id}' killed]"
 
     return f"Error: unknown action '{action}'. Valid: run, exec, read, send, history, kill, list."
