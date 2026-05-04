@@ -1516,6 +1516,35 @@ class TestBackgroundFireAndForget(unittest.TestCase):
                             command="echo HELLO_WORLD_MARKER", wait=2)
         self.assertIn("HELLO_WORLD_MARKER", result)
 
+    def test_collapse_cr_progress_keeps_findings(self):
+        """User saw bg read return 9.4 MB of feroxbuster `[>------]`
+        progress redraws burying one real `200 GET /iisstart.htm` line.
+        collapse_cr_progress must dedupe progress and preserve findings."""
+        from dsec.tools.pty_terminal import collapse_cr_progress
+        sample = (
+            "[>-------------------] - 6m     83128/2340234 found:1\n"
+            "[>-------------------] - 5m     41340/1170000 128/s\n"
+            "[>-------------------] - 5m     40521/1170000 123/s\n"
+            "\r\r\r[>-------------------] - 6m     83129/2340234 found:1\n"
+            "[>-------------------] - 5m     41340/1170000 128/s\n"
+            "\r\r\r[>-------------------] - 9m     40560/1170000 72/s\n"
+            "200      GET     12l       45w      1023c http://x/iisstart.htm\n"
+            "[>-------------------] - 10m    83131/2340234 found:1\n"
+            "200      GET     5l        20w       300c http://x/admin/\n"
+        )
+        out = collapse_cr_progress(sample)
+        # Real findings must be present
+        self.assertIn("/iisstart.htm", out)
+        self.assertIn("/admin/", out)
+        # Progress collapsed: at most 4 lines (interspersed progress + finding)
+        self.assertLessEqual(len(out.splitlines()), 5,
+                             f"failed to dedupe progress: {out!r}")
+
+    def test_collapse_cr_progress_passes_through_normal_output(self):
+        from dsec.tools.pty_terminal import collapse_cr_progress
+        normal = "Header line\nSome data\nAnother line\nFinal line"
+        self.assertEqual(collapse_cr_progress(normal), normal)
+
     def test_read_capped_at_2s_on_continuous_output(self):
         """`background read` on a job spewing burst output (yes, hashcat
         progress) must NOT block beyond ~2s wall cap. Without the cap,
