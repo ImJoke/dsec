@@ -899,8 +899,9 @@ def _extract_tool_calls(text: str) -> list[dict]:
         if brace_start == -1:
             brace_start = -1
         raw_json = content[brace_start:]
-        
+
         # Try parsing as-is first, then with repair
+        block_parsed = False
         if brace_start != -1:
             for attempt_json in [raw_json, _repair_json(raw_json)]:
                 try:
@@ -922,12 +923,16 @@ def _extract_tool_calls(text: str) -> list[dict]:
 
                         if "name" in call_data:
                             calls.append(call_data)
+                            block_parsed = True
                             break
                 except Exception:
                     continue
 
-        if calls:
-            break
+        # If THIS block parsed successfully, skip XML recovery for it and move
+        # on to the NEXT block. The previous `if calls: break` exited the outer
+        # loop, silently dropping every <tool_call> block after the first one.
+        if block_parsed:
+            continue
 
         # Recover XML `<parameter>` children inside a `<tool_call>` block.
         if "<parameter" in content.lower():
@@ -1467,6 +1472,24 @@ def _run_agentic_loop(
 
     for iteration in range(1, max_iterations + 1):
         tool_calls = _extract_tool_calls(current_response)
+        # Dedupe: model sometimes emits the same <tool_call> block multiple times
+        # in one turn (especially during streaming hiccups). Identical (name+args)
+        # calls are collapsed into one — running the same bash/background command
+        # five times in a row never helps and just wastes time + state.
+        if tool_calls:
+            _seen: set = set()
+            _deduped: List[Dict[str, Any]] = []
+            for _tc in tool_calls:
+                _key = (_tc.get("name", ""), _json.dumps(_tc.get("arguments") or {}, sort_keys=True))
+                if _key in _seen:
+                    continue
+                _seen.add(_key)
+                _deduped.append(_tc)
+            if len(_deduped) < len(tool_calls):
+                print_info(
+                    f"Dedup: collapsed {len(tool_calls) - len(_deduped)} duplicate tool call(s) in this turn."
+                )
+            tool_calls = _deduped
         if not tool_calls:
             if auto_exec:
                 raw_no_tool = (current_response or "").strip()
