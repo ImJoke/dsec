@@ -1370,6 +1370,56 @@ def _run_agentic_loop(
     # re-dispatching. Resets when the agent runs a different command.
     _last_cmd_signature: Optional[str] = None
     _last_cmd_failed: bool = False
+
+    # Replay recent audit log so cross-turn guard + _fail_history survive
+    # session-resume across dsec restarts. Without this, a fresh process
+    # has empty state and re-dispatches a command the user has already
+    # seen fail in a prior dsec invocation.
+    #
+    # Audit log persists args with a flexible schema (`cmd` for bash,
+    # `command` for background, etc). Runtime-side, the cross-turn guard
+    # hashes the AGENT-FACING args dict (which uses "command" for bash).
+    # We therefore RECONSTRUCT the runtime-shape args before hashing so
+    # the signature matches what a future emitted tool_call will produce.
+    if session_name:
+        try:
+            from .session import load_audit_log
+            import hashlib as _hashlib_replay
+
+            def _runtime_shape(tool: str, raw_args: Dict[str, Any]) -> Dict[str, Any]:
+                """Map audit-log args back to the dict shape an agent emits."""
+                if tool == "bash":
+                    cmd = raw_args.get("command") or raw_args.get("cmd") or ""
+                    return {"command": cmd}
+                return dict(raw_args)
+
+            _recent = load_audit_log(session_name, limit=10)
+            for _ent in _recent:
+                _ent_args = _ent.get("args") or {}
+                _ent_tool = _ent.get("tool", "")
+                _ent_failed = _ent.get("success") is False
+                if _ent_tool == "bash":
+                    _cmd = _ent_args.get("cmd") or _ent_args.get("command") or ""
+                    if _cmd:
+                        _key = f"bash:{_cmd[:100]}"
+                        if _ent_failed:
+                            _fail_history[_key] = _fail_history.get(_key, 0) + 1
+                # Last entry wins for the cross-turn signature.
+                if _ent_args:
+                    _shaped = _runtime_shape(_ent_tool, _ent_args)
+                    _blob = _json.dumps(_shaped, sort_keys=True, default=str)
+                    _last_cmd_signature = (
+                        f"{_ent_tool}:{_hashlib_replay.sha1(_blob.encode()).hexdigest()[:12]}"
+                    )
+                    _last_cmd_failed = _ent_failed
+            if _recent:
+                print_info(
+                    f"Replayed {len(_recent)} audit entries from prior session — "
+                    f"stuck-detection state primed."
+                )
+        except Exception as _replay_exc:
+            print_warning(f"Audit replay skipped: {_replay_exc}")
+
     _no_tool_streak = 0
     _no_tool_error_streak = 0   # non-server no-tool turns (AI chose not to call tools)
     _server_error_streak = 0    # consecutive transient server errors ("服务暂时不可用")
