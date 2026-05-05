@@ -26,6 +26,13 @@ _DEFAULT_VAULT_CANDIDATES = [
     "~/.dsec/notes",
 ]
 
+# Additional read-only knowledge sources merged into the index.
+# These are concatenated to the user's primary vault so notes_search
+# spans personal Obsidian notes + reference CTF/security playbooks.
+_EXTRA_VAULT_CANDIDATES = [
+    "~/Documents/Experiment/deepseek/reference_repos/ctf-skills",
+]
+
 
 def _has_md_shallow(p: Path, max_depth: int = 3) -> bool:
     """Check if path contains .md within max_depth without full rglob."""
@@ -62,6 +69,37 @@ def _resolve_vault_dir() -> Optional[Path]:
         if p.is_dir() and _has_md_shallow(p):
             return p
     return None
+
+
+def _resolve_extra_vaults() -> List[Path]:
+    """Find optional reference vaults (CTF playbooks, security skills) to
+    merge into the search index alongside the primary vault."""
+    out: List[Path] = []
+    extra_env = os.environ.get("DSEC_EXTRA_NOTES_DIRS")
+    if extra_env:
+        for raw in extra_env.split(":"):
+            raw = raw.strip()
+            if not raw:
+                continue
+            p = Path(raw).expanduser().resolve()
+            if p.is_dir():
+                out.append(p)
+    try:
+        from .config import load_config
+        cfg = load_config()
+        configured = cfg.get("extra_notes_dirs") or []
+        if isinstance(configured, list):
+            for raw in configured:
+                p = Path(str(raw)).expanduser().resolve()
+                if p.is_dir() and p not in out:
+                    out.append(p)
+    except Exception:
+        pass
+    for cand in _EXTRA_VAULT_CANDIDATES:
+        p = Path(cand).expanduser().resolve()
+        if p.is_dir() and _has_md_shallow(p) and p not in out:
+            out.append(p)
+    return out
 
 
 # ─── Tokenizer ───────────────────────────────────────────────────────────────
@@ -189,24 +227,38 @@ def _load_index(force: bool = False) -> Dict[str, Any]:
             # immutable note list + bm25 instance, so later force-reload is safe)
             return dict(_state)
         vault = _resolve_vault_dir()
-        if not vault:
+        extras = _resolve_extra_vaults()
+        roots: List[Path] = []
+        if vault:
+            roots.append(vault)
+        for e in extras:
+            if e not in roots:
+                roots.append(e)
+        if not roots:
             snap = {"loaded": True, "vault": None, "notes": [], "bm25": None}
             _state.update(snap)
             return dict(snap)
 
         notes: List[Dict[str, Any]] = []
-        for md_path in vault.rglob("*.md"):
-            # Skip Obsidian internals (case-insensitive on path components)
-            parts_lower = {p.lower() for p in md_path.parts}
-            if any(s in parts_lower for s in (".obsidian", ".trash", "templates")):
-                continue
-            note = _parse_note(md_path)
-            if note:
-                notes.append(note)
+        for root in roots:
+            for md_path in root.rglob("*.md"):
+                parts_lower = {p.lower() for p in md_path.parts}
+                if any(s in parts_lower for s in (".obsidian", ".trash", "templates")):
+                    continue
+                note = _parse_note(md_path)
+                if note:
+                    notes.append(note)
 
         bm25 = _BM25Index([n["tokens"] for n in notes]) if notes else None
 
-        snap = {"loaded": True, "vault": str(vault), "notes": notes, "bm25": bm25}
+        primary = str(vault) if vault else (str(roots[0]) if roots else None)
+        snap = {
+            "loaded": True,
+            "vault": primary,
+            "vaults": [str(r) for r in roots],
+            "notes": notes,
+            "bm25": bm25,
+        }
         _state.update(snap)
         return dict(snap)
 

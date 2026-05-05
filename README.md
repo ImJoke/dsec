@@ -9,7 +9,59 @@
  ╚═════╝ ╚══════╝╚══════╝ ╚═════╝
 ```
 
-> **Agentic AI security assistant** for Bug Bounty, HackTheBox, CTF, Vulnerability Research, and Code Auditing — powered by DeepSeek with autonomous tool execution, split-pane TUI, hybrid memory (vector + graph), offensive skill bundles, and interactive PTY terminals.
+> **Agentic AI security assistant** for Bug Bounty, HackTheBox, CTF, Vulnerability Research, and Code Auditing — powered by a **multi-agent cloud-frontier orchestrator** with autonomous tool execution, persistent PTY shell, hybrid knowledge base, and stealth-oriented attack defaults.
+
+---
+
+## 🧠 Multi-Agent Orchestrator (NEW)
+
+dsec runs as four specialized agents over rotating Ollama cloud-frontier endpoints, with automatic cascade to local DeepSeek when every cloud endpoint is down or rate-limited:
+
+| Role | Default cloud model | Endpoint pool | Job |
+|---|---|---|---|
+| **brain** | `deepseek-v4-pro:cloud` | `brain_pool` (round-robin, 8 endpoints) | Plans, hypothesizes, delegates. Cannot run bash directly when `enable_multi_agent=true`. |
+| **executor** | `qwen3-coder:480b-cloud` | `exec_pool` | Receives concrete plan from brain, runs bash + MCP tools, returns digest. |
+| **research** | `qwen3.5:397b-cloud` | `research_pool` | KB lookup (Obsidian + ctf-skills), live CVE feeds, GTFOBins, methodology recall. |
+| **utility** | `minimax-m2.7:cloud` | `util_pool` | Cheap classifier / summarizer (mostly invisible). |
+
+**Auto-rotation:** rate-limited (HTTP 429) endpoints are marked dead for 10 min, fatal endpoints (401/404) for 30 min, transient 5xx for 30 s. The pool moves on automatically — no manual switching.
+
+**Auto-stop:** when the brain emits a flag pattern (`HTB{...}`, `FLAG{...}`, `THM{...}`, etc.) or the explicit marker `TASK_COMPLETE`, the agentic loop exits cleanly so it doesn't keep spinning past the answer.
+
+Build pools from an OllamaHound scan CSV:
+
+```
+python3 tools/build_ollama_pools.py \
+  --csv ~/tools/OllamaHound/results/scanner/<scan>.csv \
+  --pool-size 8 --candidates-per-role 40 --apply
+```
+
+The picker honors `ROLE_MODELS` priority (strongest cloud frontier first, local fallback last) and only keeps models with ≥2 chat-OK endpoints in the pool. Backups are atomic; `~/.dsec/config.json.bak` is written before every apply.
+
+## 🐚 Persistent PTY Shell (NEW)
+
+The `pty_shell` tool gives the AI a single long-lived bash session. State (cwd, env, sourced venvs, exported funcs, aliases) survives every call — `cd` once and stay there, `source venv/bin/activate` once and pip-install in place. Pre-tuned PS1 / TERM / COLUMNS / `HISTFILE=/dev/null` for clean low-footprint output.
+
+```python
+pty_shell(command="cd /opt/work")
+pty_shell(command="source venv/bin/activate && python3 attack.py")
+pty_shell(command="echo $PATH")   # reflects the venv from the previous turn
+```
+
+For listeners (`nc`, `responder`, `chisel`) and interactive shells (`evil-winrm`, `mssqlclient`, `python REPL`), use the `background` tool — same Pane infrastructure, dedicated `job_id`s.
+
+## 📚 Knowledge Base (NEW)
+
+`notes_search` indexes both:
+
+- the user's Obsidian vault (`~/Documents/vincent` — 752+ Permanent / Fleeting / Storage notes covering AD/ADCS, Kerberos, RSA/ECDSA, web exploitation, CTF write-ups)
+- the `ctf-skills` reference (forensics, crypto, pwn, web, reverse, misc playbooks)
+
+Combined corpus is BM25-indexed in-memory. Hot-reload with `notes_reload`. Add extra vault paths with `DSEC_EXTRA_NOTES_DIRS` env var or `extra_notes_dirs` config key.
+
+## 🥷 Stealth-Oriented Defaults (NEW)
+
+The brain system prompt includes red-team operator principles: prefer PTY-allocated SSH (`ssh -tt -o LogLevel=ERROR`), avoid disk artifacts (in-memory `bash -c`, `python3 -c`), use LOLBINs over dropped tools, sanitize remote shell history on entry, and tag every tool call with intent. The non-PTY default for `bash` calls pipes `/dev/null` to stdin so prompts that probe for a TTY (`certipy "Overwrite?"`, `ffuf`, etc.) abort cleanly instead of hanging.
 
 ---
 

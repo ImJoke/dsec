@@ -151,8 +151,22 @@ def call_tool(
             f"Required params: {required}. All params: {params}]"
         )
 
+    # Drop unknown kwargs so the model can pass extra hints (cwd, env, …)
+    # without crashing the call. Tools that need a catch-all can still
+    # declare **kwargs in their signature.
+    func = tool["func"]
+    fn_sig = inspect.signature(func)
+    accepts_var_kw = any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in fn_sig.parameters.values()
+    )
+    if not accepts_var_kw:
+        allowed = {p for p in fn_sig.parameters if p != "self"}
+        dropped = [k for k in list(resolved) if k not in allowed]
+        for k in dropped:
+            resolved.pop(k, None)
+
     try:
-        return tool["func"](**resolved)
+        return func(**resolved)
     except TypeError as e:
         return f"[error: {name}() call failed — {e}]"
 

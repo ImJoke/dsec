@@ -416,11 +416,47 @@ def build_prompt_session(state: Dict[str, Any]) -> Optional["PromptSession"]:  #
     def _force_submit(event: Any) -> None:  # noqa: ANN001
         event.current_buffer.validate_and_handle()
 
-    # NOTE: bottom_toolbar and multiline are both omitted intentionally.
-    # Both cause extra layout regions that prompt_toolkit must erase and redraw
-    # on every SIGWINCH.  When resize events arrive faster than redraws complete,
-    # stale prompt lines accumulate ("ghost enter" effect).  A single-line prompt
-    # with no toolbar resizes cleanly in all cases.
+    # bottom_toolbar = single-line, static-height statusline. Single-line with
+    # multiline=False resizes cleanly; the prior issue was multi-line + toolbar
+    # racing on SIGWINCH, which we still avoid.
+    def _bottom_toolbar() -> "HTML":  # type: ignore[name-defined]
+        try:
+            import os as _os
+            from dsec.providers import pool as _ppool
+            from dsec.domain import get_domain as _get_domain
+
+            domain = (state.get("resolved_domain")
+                      or state.get("domain_override")
+                      or "auto")
+            dom_cfg = _get_domain(domain) if domain != "auto" else {}
+            dom_color = dom_cfg.get("color", "white")
+            dom_label = dom_cfg.get("display", domain.upper())
+
+            model = state.get("model_override") or "default"
+
+            brain_pool = _ppool.get_pool("brain_pool") or {}
+            brain_eps = list(brain_pool.get("endpoints") or [])
+            brain_alive = sum(1 for e in brain_eps if not _ppool._is_dead("brain_pool", e))
+            brain_total = len(brain_eps)
+            brain_model = brain_pool.get("model", "")
+
+            cwd = _os.getcwd().replace(_os.path.expanduser("~"), "~", 1)
+            sess = state.get("session_name", "?")
+            ae = "ON" if state.get("auto_exec") else "OFF"
+            ae_color = "ansigreen" if state.get("auto_exec") else "ansired"
+
+            return HTML(
+                f' <{dom_color}>{dom_label}</{dom_color}>'
+                f' │ <ansicyan>{model}</ansicyan>'
+                f' │ <ansiblue>brain={brain_alive}/{brain_total}</ansiblue>'
+                f' <ansiyellow>{brain_model}</ansiyellow>'
+                f' │ <{ae_color}>auto={ae}</{ae_color}>'
+                f' │ <ansiwhite>{cwd}</ansiwhite>'
+                f' │ <session>{sess}</session> '
+            )
+        except Exception:
+            return HTML(' dsec ')
+
     return PromptSession(
         completer=DsecCompleter(),
         auto_suggest=DsecAutoSuggest(),
@@ -432,6 +468,7 @@ def build_prompt_session(state: Dict[str, Any]) -> Optional["PromptSession"]:  #
         enable_history_search=False,
         mouse_support=False,
         output=None,
+        bottom_toolbar=_bottom_toolbar,
     )
 
 
@@ -443,12 +480,8 @@ def format_prompt(session_name: str, domain: str = "htb") -> "HTML | str":  # ty
     if _PROMPT_TOOLKIT_AVAILABLE:
         from dsec.domain import get_domain
         color = get_domain(domain).get("color", "white")
-        # prompt_toolkit HTML expects recognized names or specific formatting.
-        # It handles 'green', 'yellow', etc. well in standard tags if defined,
-        # but inline styles via <style color="{}"> or <span fg="{}"> is best done via standard tags
-        # We can just use the color name as the tag if it's one of the basics, or use style="color: {color}"
         return HTML(
             f"<session>{session_name}</session>"
-            f" <{color}>❯</{color}> "
+            f' <style fg="{color}">❯</style> '
         )
     return f"{session_name} ❯ "

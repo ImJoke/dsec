@@ -155,7 +155,20 @@ def _stream_ollama_pool(
             ctype = chunk.get("type")
             if ctype == "error" and not produced_content:
                 had_error = True
-                provider_pool.mark_endpoint_dead(provider_key, endpoint)
+                # Pick a TTL based on the failure mode:
+                #   rate_limited → long cooldown so the limit window expires
+                #   fatal_endpoint (401/404) → very long; misconfigured endpoint
+                #   transient (5xx) → short; upstream may recover quickly
+                #   default → 60s
+                if chunk.get("rate_limited"):
+                    ttl = 600.0
+                elif chunk.get("fatal_endpoint"):
+                    ttl = 1800.0
+                elif chunk.get("transient"):
+                    ttl = 30.0
+                else:
+                    ttl = 60.0
+                provider_pool.mark_endpoint_dead(provider_key, endpoint, ttl_sec=ttl)
                 break  # rotate to next endpoint
             if ctype in ("content", "thinking"):
                 produced_content = True
@@ -190,6 +203,7 @@ def provider_chat_stream(
     content chunks ("服务暂时不可用", "第三方响应错误") still pass through;
     the agentic loop's _has_server_overflow_error detector handles them.
     """
+    original_model = model
     provider_key, eff_model, fallback_key = _resolve_role(role, provider, model)
 
     pool = provider_pool.get_pool(provider_key)
@@ -228,7 +242,7 @@ def provider_chat_stream(
             }
             yield from provider_chat_stream(
                 message=message,
-                model=eff_model,
+                model=original_model,
                 conversation_id=conversation_id,
                 base_url=base_url,
                 token=token,

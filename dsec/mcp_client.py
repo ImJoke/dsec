@@ -30,8 +30,9 @@ import subprocess
 import threading
 import time
 import select
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Deque, Dict, Iterator, List, Optional
 
 
 CONFIG_PATH = Path.home() / ".dsec" / "config.json"
@@ -144,7 +145,7 @@ class MCPServer:
         self._req_id_gen = itertools.count(1)
         self._lock = threading.Lock()
         self._stderr_thread: Optional[threading.Thread] = None
-        self._stderr_buf: list[str] = []
+        self._stderr_buf: Deque[str] = deque(maxlen=200)
 
     # ── state ─────────────────────────────────────────────────────────────────
 
@@ -178,15 +179,15 @@ class MCPServer:
         except Exception:  # noqa: BLE001
             return False
 
-        # Drain stderr in background to prevent pipe buffer deadlock
-        self._stderr_buf = []
+        # Drain stderr in background to prevent pipe buffer deadlock.
+        # deque(maxlen=...) is thread-safe for append; main thread can
+        # iterate via list(self._stderr_buf) for a snapshot.
+        self._stderr_buf: Deque[str] = deque(maxlen=200)
         def _drain_stderr(proc: subprocess.Popen) -> None:  # type: ignore[type-arg]
             try:
                 assert proc.stderr is not None
                 for line in proc.stderr:
                     self._stderr_buf.append(line.rstrip("\n"))
-                    if len(self._stderr_buf) > 200:
-                        self._stderr_buf = self._stderr_buf[-100:]
             except (ValueError, OSError):
                 pass
         self._stderr_thread = threading.Thread(target=_drain_stderr, args=(self._proc,), daemon=True)
@@ -239,6 +240,14 @@ class MCPServer:
                         except Exception:  # noqa: BLE001
                             pass
                 self._proc = None
+        # Join the stderr drainer so the file handle is fully released
+        # before this server slot can be reused.
+        if self._stderr_thread is not None:
+            try:
+                self._stderr_thread.join(timeout=2)
+            except Exception:  # noqa: BLE001
+                pass
+            self._stderr_thread = None
         self._tools = []
 
     # ── tool management ───────────────────────────────────────────────────────
@@ -485,13 +494,24 @@ class MCPManager:
         params: Optional[Dict[str, Any]] = None,
         timeout: float = 30.0,
     ) -> Any:
-        """Call a tool on a connected server."""
+        """Call a tool on a server. Auto-connects on first use; transparently
+        reconnects if the server process died between calls."""
         srv = self._servers.get(server_name)
         if not srv or not srv.connected:
-            raise RuntimeError(
-                f"Server '{server_name}' is not connected. "
-                "Use: /mcp connect <server>"
-            )
+            if server_name not in self._defs:
+                raise RuntimeError(
+                    f"Server '{server_name}' has no definition. Add it with /mcp add."
+                )
+            ok = self.connect(server_name)
+            if not ok:
+                raise RuntimeError(
+                    f"Server '{server_name}' failed to start "
+                    f"(command: {self._defs[server_name].get('command','?')}). "
+                    "Check the command/args/env in ~/.dsec/config.json."
+                )
+            srv = self._servers.get(server_name)
+            if not srv:
+                raise RuntimeError(f"Server '{server_name}' connect succeeded but no server slot.")
         return srv.call_tool(tool_name, params, timeout=timeout)
 
     # ── add server def at runtime ─────────────────────────────────────────────

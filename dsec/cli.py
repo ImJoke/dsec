@@ -1051,7 +1051,7 @@ def _extract_tool_calls(text: str) -> list[dict]:
             heredoc_open = _re.search(r"<<\s*['\"]?(\w+)['\"]?", command)
             if heredoc_open:
                 delim = heredoc_open.group(1)
-                if not _re.search(r'(?:^|\n)' + _re.escape(delim) + r'\s*$', command):
+                if not _re.search(r'(?:^|\n)' + _re.escape(delim) + r'\s*$', command, _re.MULTILINE):
                     command = command.rstrip() + f"\n{delim}\n"
             calls.append({"name": "bash", "arguments": {"command": command}})
 
@@ -1525,7 +1525,7 @@ def _run_agentic_loop(
                     _shaped = _runtime_shape(_ent_tool, _ent_args)
                     _blob = _json.dumps(_shaped, sort_keys=True, default=str)
                     _last_cmd_signature = (
-                        f"{_ent_tool}:{_hashlib_replay.sha1(_blob.encode()).hexdigest()[:12]}"
+                        f"{_ent_tool}:{_hashlib_replay.sha256(_blob.encode()).hexdigest()[:12]}"
                     )
                     _last_cmd_failed = _ent_failed
             if _recent:
@@ -1738,6 +1738,38 @@ def _run_agentic_loop(
         # injected as a synthetic tool_response *before* dispatching real
         # tools — the model sees the pivot demand on the next chat call.
         _pending_stalemate_hint = _stalemate_hint()
+
+        # Auto-stop on completion signals — break before extracting more
+        # tool calls, so we don't keep spinning after the answer is in hand.
+        # Two signals: (1) flag pattern in model output (HTB{...}, FLAG{...}, etc.),
+        # (2) explicit completion marker emitted by the brain.
+        if auto_exec and current_response:
+            _flag_match = _re.search(
+                r"\b(?:HTB|THM|FLAG|flag|hgs|hcr|picoCTF|csaw|google|ctfd)\{[^}\s]{4,}\}",
+                current_response,
+                _re.IGNORECASE,
+            )
+            if _flag_match:
+                console.print(
+                    f"\n[bold green]🚩 Flag captured: {_flag_match.group(0)}[/bold green]"
+                )
+                console.print(
+                    "[bold green]Task appears complete — exiting agentic loop. "
+                    "Send the next prompt to continue.[/bold green]"
+                )
+                break
+            if _re.search(
+                r"\b(?:TASK[\s_-]*COMPLETE|MISSION[\s_-]*ACCOMPLISHED|"
+                r"CHALLENGE[\s_-]*SOLVED|GOAL[\s_-]*ACHIEVED)\b",
+                current_response,
+                _re.IGNORECASE,
+            ):
+                console.print(
+                    "\n[bold green]✓ Brain emitted completion marker — exiting "
+                    "agentic loop. Send the next prompt to continue.[/bold green]"
+                )
+                break
+
         tool_calls = _extract_tool_calls(current_response)
         # Dedupe: model sometimes emits the same <tool_call> block multiple times
         # in one turn (especially during streaming hiccups). Identical (name+args)
@@ -1925,21 +1957,53 @@ def _run_agentic_loop(
                     f"(streak={_no_tool_streak}); continuing autonomous mode…"
                 )
 
-                if _no_tool_streak >= 2:
+                # Detect "asking for context" / "I don't have the original task"
+                # patterns. When the model loses context it tends to spin
+                # asking the operator for clarification — that loop never
+                # ends in autonomous mode. Force a concrete orienting probe.
+                _ctx_loss_patterns = (
+                    "don't have the original",
+                    "don't have any prior",
+                    "i don't have any",
+                    "could you clarify",
+                    "could you please restate",
+                    "please provide the",
+                    "please share the details",
+                    "what analysis were you",
+                    "what task you'd like",
+                    "i need a bit more",
+                    "i need the actual details",
+                    "no previous turn was provided",
+                    "no record of a previous",
+                )
+                _lower_resp = (raw_no_tool or "").lower()
+                _ctx_lost = any(p in _lower_resp for p in _ctx_loss_patterns)
+
+                if _ctx_lost:
+                    continue_msg = (
+                        "STOP asking the operator for context. They already gave you the original prompt; "
+                        "you're inside an autonomous loop. Take ONE concrete orienting action right now to "
+                        "rebuild context yourself: "
+                        "<tool_call>{\"name\": \"pty_shell\", \"arguments\": {\"command\": \"pwd && ls -la\"}}</tool_call>. "
+                        "Then read what's actually here and continue from observation, not from asking. "
+                        "If after that you genuinely have nothing to do, say `TASK_COMPLETE: <reason>` and stop."
+                    )
+                elif _no_tool_streak >= 2:
                     continue_msg = (
                         "Your previous response did not include any parseable <tool_call> blocks. "
                         "If work remains, you MUST emit at least one valid <tool_call> now. "
                         "If you wrote bare JSON like {\"command\": \"...\"}, wrap it: "
                         "<tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"...\"}}</tool_call>. "
-                        "Only emit no tool calls if the task is truly complete; if so, include a brief completion statement."
+                        "For executor delegation use {\"plan\": \"...\"} not {\"command\": \"...\"}. "
+                        "Only emit no tool calls if the task is truly complete; if so, say TASK_COMPLETE: <one-liner>."
                     )
                 else:
                     continue_msg = (
                         "Continue your autonomous analysis from the previous turn. "
                         "If the task is not finished, emit one or more <tool_call> blocks. "
                         "Concrete example: "
-                        "<tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"id\"}}</tool_call>. "
-                        "If you believe the task is finished, briefly state that and then emit no tool calls only when you are truly done."
+                        "<tool_call>{\"name\": \"pty_shell\", \"arguments\": {\"command\": \"id\"}}</tool_call>. "
+                        "If you believe the task is finished, say TASK_COMPLETE: <reason> on its own line."
                     )
 
                 try:
@@ -2184,7 +2248,7 @@ def _run_agentic_loop(
                 # AND the prior outcome was a failure, skip dispatch and inject
                 # a hint instead. Catches `bloodyAD ... -p X` retried verbatim.
                 import hashlib as _hashlib
-                _bash_sig_pre = f"bash:{_hashlib.sha1(_json.dumps(arguments, sort_keys=True, default=str).encode()).hexdigest()[:12]}"
+                _bash_sig_pre = f"bash:{_hashlib.sha256(_json.dumps(arguments, sort_keys=True, default=str).encode()).hexdigest()[:12]}"
                 if _bash_sig_pre == _last_cmd_signature and _last_cmd_failed:
                     _retry_hint = (
                         f"[hint: you just ran this exact bash command in the previous turn "
@@ -2356,7 +2420,7 @@ def _run_agentic_loop(
                             f"[bold cyan]$ [/bold cyan][white]{preview_cmd}[/white]",
                             title=f"[bold cyan]bash ({idx}/{len(tool_calls)})[/bold cyan]  [{risk_color}]⚠ {risk_label}[/{risk_color}]",
                             title_align="left",
-                            subtitle="[bold green][[y]][/bold green]es  [bold red][[n]][/bold red]o  [bold yellow][[A]][/bold yellow]ll  [bold][[e]][/bold]dit",
+                            subtitle="[bold green]\\[y][/bold green]es  [bold red]\\[n][/bold red]o  [bold yellow]\\[A][/bold yellow]ll  [bold]\\[e][/bold]dit",
                             subtitle_align="left",
                             border_style="#444444",
                             padding=(0, 1),
@@ -2543,7 +2607,7 @@ def _run_agentic_loop(
                 _track_for_stalemate(tool_name, arguments, result_text)
                 import hashlib as _hashlib
                 _bash_arg_blob = _json.dumps(arguments, sort_keys=True, default=str)
-                _last_cmd_signature = f"bash:{_hashlib.sha1(_bash_arg_blob.encode()).hexdigest()[:12]}"
+                _last_cmd_signature = f"bash:{_hashlib.sha256(_bash_arg_blob.encode()).hexdigest()[:12]}"
                 _last_cmd_failed = (res is None or res.returncode != 0)
                 if session_name:
                     append_audit_log(session_name, {
@@ -2642,7 +2706,7 @@ def _run_agentic_loop(
                 # Cross-turn identical-cmd detection.
                 import hashlib as _hashlib
                 _arg_blob = _json.dumps(arguments, sort_keys=True, default=str)
-                _sig = f"{tool_name}:{_hashlib.sha1(_arg_blob.encode()).hexdigest()[:12]}"
+                _sig = f"{tool_name}:{_hashlib.sha256(_arg_blob.encode()).hexdigest()[:12]}"
                 if _sig == _last_cmd_signature and _last_cmd_failed:
                     _hint = (
                         f"[hint: you just ran `{tool_name}` with these exact arguments "
@@ -3096,13 +3160,51 @@ def _generate_shell_session_name() -> str:
 
 
 def _browse_sessions() -> Optional[str]:
-    """Show a numbered session list and return the chosen session name (or None for new)."""
+    """Arrow-key navigable session picker. Returns session name or None for new.
+
+    Uses prompt_toolkit's radiolist_dialog so up/down/PageUp/PageDown work,
+    plus type-to-search filtering. Falls back to a numbered prompt if
+    prompt_toolkit is unavailable.
+    """
     sessions = list_sessions()
     if not sessions:
         return None
 
+    from dsec.formatter import _relative_time
+
+    # Try prompt_toolkit-based picker first (arrow-key navigation).
+    try:
+        from prompt_toolkit.shortcuts import radiolist_dialog
+        from prompt_toolkit.formatted_text import HTML
+
+        rows: list = []
+        for s in sessions:
+            dom = s.get("domain", "htb")
+            dom_cfg = get_domain(dom)
+            dom_display = dom_cfg.get("display", dom.upper())
+            last = _relative_time(s.get("last_used", ""))
+            label = (
+                f"{s.get('name','')[:30]:<30}  "
+                f"{dom_display:<10}  "
+                f"turns={s.get('message_count', 0):<5}  "
+                f"{last}"
+            )
+            rows.append((s.get("name", ""), label))
+
+        result = radiolist_dialog(
+            title="Resume Session",
+            text=HTML(
+                "↑/↓ navigate · <b>Enter</b> resume · <b>Esc</b> new session · type to filter"
+            ),
+            values=rows,
+            default=rows[0][0] if rows else None,
+        ).run()
+        return result  # None if Esc, else session name
+    except (ImportError, Exception):
+        pass
+
+    # Fallback: numbered prompt (legacy)
     DOMAIN_COLORS = {"htb": "green", "bugbounty": "yellow", "ctf": "cyan", "research": "magenta"}
-    from dsec.formatter import _relative_time, _model_short
     from rich.table import Table
     from rich import box
 
@@ -3143,8 +3245,7 @@ def _browse_sessions() -> Optional[str]:
     try:
         choice = console.input("> ").strip().lower()
     except (EOFError, KeyboardInterrupt):
-        return None  # new session
-
+        return None
     if not choice or choice == "r":
         return sessions[0]["name"]
     if choice == "n":
@@ -3153,11 +3254,10 @@ def _browse_sessions() -> Optional[str]:
         idx = int(choice) - 1
         if 0 <= idx < len(sessions):
             return sessions[idx]["name"]
-    # Try matching by name substring
     for s in sessions:
         if choice in s["name"].lower():
             return s["name"]
-    return None  # fallback: new
+    return None
 
 
 def _print_shell_banner(session_name: str, domain: str, model: str, sudo_set: bool = False) -> None:
@@ -3289,10 +3389,13 @@ def _print_shell_status(state: Dict[str, Any]) -> None:
     info.append(f"{'off' if state['no_memory'] else 'on'}\n")
     info.append("Auto-exec:   ", style="bold")
     ae = state.get("auto_exec", False)
-    info.append(f"[bold {'green' if ae else 'red'}]{'ON' if ae else 'OFF'}[/bold {'green' if ae else 'red'}]\n")
+    info.append(f"{'ON' if ae else 'OFF'}\n", style=f"bold {'green' if ae else 'red'}")
     info.append("Sudo pass:   ", style="bold")
     sudo_set = bool(state.get("sudo_password"))
-    info.append(f"[bold {'yellow' if sudo_set else 'dim'}]{'🔑 set' if sudo_set else 'not set'}[/bold {'yellow' if sudo_set else 'dim'}]\n")
+    info.append(
+        f"{'🔑 set' if sudo_set else 'not set'}\n",
+        style=f"bold {'yellow' if sudo_set else 'dim'}",
+    )
     from rich import box
     from rich.panel import Panel
     console.print(Panel(info, title="[bold]Shell Status[/bold]", title_align="left", border_style="blue", box=box.MINIMAL))
@@ -3744,8 +3847,8 @@ def _shell_run_command(cmd: str, state: Dict[str, Any]) -> None:
     try:
         console.print(
             "\n[bold]Send this output to the AI?[/bold]  "
-            "[bold green][[s]][/bold green]end  [bold][[d]][/bold]iscard  "
-            "[bold][[a]][/bold]sk a question first"
+            "[bold green]\\[s][/bold green]end  [bold]\\[d][/bold]iscard  "
+            "[bold]\\[a][/bold]sk a question first"
         )
         choice = console.input("> ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -3891,7 +3994,7 @@ def _handle_mcp_command(arg: str, state: Dict[str, Any]) -> None:
                 console.print(Syntax(_json2.dumps(result, indent=2), "json"))
             # Offer to send to AI
             try:
-                console.print("\n[bold]Send result to AI?[/bold] [bold green][[y]][/bold green]/[bold][[n]][/bold]")
+                console.print("\n[bold]Send result to AI?[/bold] [bold green]\\[y][/bold green]/[bold]\\[n][/bold]")
                 if console.input("> ").strip().lower() == "y":
                     output_str = result if isinstance(result, str) else _json2.dumps(result, indent=2)
                     _run_chat(

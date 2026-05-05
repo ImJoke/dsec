@@ -40,57 +40,66 @@ except ImportError:
 
 
 # ── Role → preferred model substrings (most → least preferred) ───────────
-# Cloud-tagged frontier models work — they're just SLOW on first probe
-# (cold-start + model load can take 60-120s). With CHAT_TIMEOUT bumped
-# to 180s + num_predict=1, they have time to respond.
+# Cloud-tagged frontier models can be slow on first probe (cold-start +
+# model load up to 3-5 min). CHAT_TIMEOUT=360s + num_predict=8 +
+# think:false gives them room to ack with content or thinking tokens.
 ROLE_MODELS: Dict[str, List[str]] = {
     "brain": [
-        # Frontier cloud (best long-horizon planning)
-        "glm-5.1",
-        "deepseek-v4-pro",
-        "kimi-k2.6",
-        "deepseek-v3.2",
-        "kimi-k2.5",
-        "glm-5",
-        # Local frontier (fallback — usually faster cold-start)
+        # Cloud frontier — strongest reasoning / planning first
+        "deepseek-v4-pro:cloud",
+        "kimi-k2.6:cloud",
+        "deepseek-v3.1:671b-cloud",
+        "kimi-k2.5:cloud",
+        "deepseek-v3.2:cloud",
+        "glm-5.1:cloud",
+        "glm-5:cloud",
+        "deepseek-v4-flash:cloud",
+        # Local frontier tail-fallbacks
         "gpt-oss:120b",
-        "qwen3:32b",
         "deepseek-r1:70b",
-        "deepseek-r1:32b",
-        "qwq:32b",
+        "qwen3:32b",
     ],
     "executor": [
-        "qwen3-coder-next",
-        "qwen3-coder:480b",
-        "devstral-2:123b",
-        "minimax-m2.7",
+        # Cloud coder specialists — biggest first
+        "qwen3-coder:480b-cloud",
+        "qwen3-coder-next:cloud",
+        "devstral-2:123b-cloud",
+        "minimax-m2:cloud",
+        # Local fallbacks
         "qwen3-coder:30b",
-        "qwen3-coder:14b",
         "qwen2.5-coder:32b",
         "devstral-small-2",
     ],
     "research": [
+        # Frontier monster first
+        "qwen3.5:397b-cloud",
+        "kimi-k2-thinking:cloud",
         "qwen3.6:35b",
+        "qwen3.5:cloud",
+        "glm-4.7:cloud",
+        "glm-4.6:cloud",
+        "gpt-oss:120b-cloud",
+        # Local fallbacks
         "qwen3.6:27b",
-        "glm-4.7-flash",
-        "gpt-oss:20b",
-        "magistral:24b",
-        "qwen3:32b",
         "qwen3:14b",
+        "gpt-oss:20b",
     ],
     "utility": [
+        # Newest minimax first (m2.7 has 96 hosts, supersedes m2.5)
+        "minimax-m2.7:cloud",
+        "minimax-m2.5:cloud",
+        "gemini-3-flash-preview:cloud",
+        "minimax-m2:cloud",
+        "gpt-oss:20b-cloud",
+        # Local fallbacks
         "qwen3:8b",
-        "qwen3:4b",
-        "granite4:8b",
-        "granite4:3b",
-        "lfm2.5-thinking:1.2b",
         "llama3.2:3b",
     ],
 }
 
 PROBE_TIMEOUT = 5.0       # /api/tags health check
-CHAT_TIMEOUT = 180.0      # /api/chat — frontier MoE cold-start can take 1-2min
-HARD_PROBE_TIMEOUT = 240.0  # outer cap
+CHAT_TIMEOUT = 360.0      # /api/chat — frontier MoE cold-start can take 3-5min on first hit
+HARD_PROBE_TIMEOUT = 480.0  # outer cap
 DEFAULT_POOL_SIZE = 5
 MAX_WORKERS = 50
 
@@ -173,10 +182,10 @@ def probe_chat(ep: Endpoint, client: httpx.Client) -> None:
         "model": ep.matched_model,
         "messages": [{"role": "user", "content": "hi"}],
         "stream": False,
-        # 1 token = fastest possible ack. We just want to confirm the
-        # endpoint can complete a chat turn for THIS model — content
-        # quality is irrelevant.
-        "options": {"num_predict": 1, "temperature": 0},
+        # num_predict=8 leaves room for content after thinking models
+        # burn budget on reasoning tokens. think:false asks Ollama to
+        # skip thinking on supported models — harmless on others.
+        "options": {"num_predict": 8, "temperature": 0, "think": False},
     }
     t0 = time.time()
     try:
@@ -186,8 +195,10 @@ def probe_chat(ep: Endpoint, client: httpx.Client) -> None:
             ep.error = f"chat HTTP {r.status_code}"
             return
         data = r.json()
-        content = (data.get("message") or {}).get("content", "")
-        if content:
+        msg = data.get("message") or {}
+        content = msg.get("content") or ""
+        thinking = msg.get("thinking") or ""
+        if content.strip() or thinking.strip():
             ep.chat_ok = True
         else:
             ep.error = "chat: empty response"
@@ -215,12 +226,14 @@ def probe_all(endpoints: List[Endpoint]) -> List[Endpoint]:
             try:
                 ep = fut.result()
                 out.append(ep)
-                # Live progress — print each chat-OK as it lands
                 if ep.chat_ok:
                     print(f"    ✓ {ep.url}  →  {ep.matched_model}  "
                           f"({ep.chat_latency_s:.1f}s)", flush=True)
-            except Exception:
-                pass
+                elif ep.error:
+                    print(f"    ✗ {ep.url}  →  {ep.matched_model}  "
+                          f"[{ep.error}]", flush=True)
+            except Exception as exc:
+                print(f"    ✗ probe crashed: {type(exc).__name__}: {exc}", flush=True)
             done += 1
             if done % 10 == 0 or done == len(endpoints):
                 ok = sum(1 for e in out if e.chat_ok)
@@ -228,34 +241,55 @@ def probe_all(endpoints: List[Endpoint]) -> List[Endpoint]:
     return out
 
 
-def winnow(endpoints: List[Endpoint], pool_size: int) -> List[Endpoint]:
-    """Keep only chat_ok=True; sort by latency; take pool_size."""
-    alive = [e for e in endpoints if e.chat_ok]
-    alive.sort(key=lambda e: e.chat_latency_s)
-    return alive[:pool_size]
+def _pick_best_model(
+    chat_ok: List[Endpoint], role: str, pool_size: int, min_endpoints: int = 2
+) -> Tuple[str, List[Endpoint]]:
+    """Pick the highest-priority ROLE_MODELS entry that has enough endpoints.
 
+    Walk ROLE_MODELS[role] in declared order. For each preferred substring,
+    collect endpoints whose matched_model contains it. Take the first
+    preference that yields >= min_endpoints (so the pool has redundancy).
+    Sort that group by latency, return top pool_size.
 
-# ── Output ───────────────────────────────────────────────────────────────
-
-
-def _pick_majority_model(pool: List[Endpoint]) -> Tuple[str, List[Endpoint]]:
-    """Pick the most-common model in pool; filter pool to only that model.
-
-    A dsec provider pool advertises ONE model — all endpoints must serve
-    it. Picking the majority maximises pool size; falling back to the
-    first endpoint's model when there's a tie keeps determinism.
+    If no preference meets min_endpoints, fall back to the largest group
+    (so we still produce a usable pool from whatever survived). Worst-case:
+    return [] if no chat-ok endpoints exist.
     """
-    if not pool:
+    if not chat_ok:
         return "", []
-    from collections import Counter
-    counts = Counter(ep.matched_model for ep in pool)
-    # Most common; ties broken by latency-order via first-occurrence in pool
-    model, _ = counts.most_common(1)[0]
-    filtered = [ep for ep in pool if ep.matched_model == model]
-    return model, filtered
+
+    by_model: Dict[str, List[Endpoint]] = {}
+    for ep in chat_ok:
+        by_model.setdefault(ep.matched_model, []).append(ep)
+
+    prefs = ROLE_MODELS.get(role, [])
+    # Walk priorities; first one with enough endpoints wins.
+    for pref in prefs:
+        eps: List[Endpoint] = []
+        chosen_model = ""
+        for model_key, group in by_model.items():
+            if pref in model_key:
+                eps.extend(group)
+                # Stable winner: smallest model_key string for determinism
+                # when multiple variants match (e.g. ":cloud" vs ":latest")
+                if not chosen_model or len(model_key) < len(chosen_model):
+                    chosen_model = model_key
+        if len(eps) >= min_endpoints:
+            # Restrict to a single advertised model name so pool is uniform
+            uniform = [e for e in eps if e.matched_model == chosen_model]
+            uniform.sort(key=lambda e: e.chat_latency_s)
+            return chosen_model, uniform[:pool_size]
+
+    # No preference met threshold — fall back to largest single-model group.
+    largest = max(by_model.items(), key=lambda kv: len(kv[1]))
+    largest[1].sort(key=lambda e: e.chat_latency_s)
+    return largest[0], largest[1][:pool_size]
 
 
-def render_shell_commands(pools: Dict[str, List[Endpoint]]) -> str:
+RoleResult = Tuple[str, List[Endpoint]]  # (model, endpoints)
+
+
+def render_shell_commands(pools: Dict[str, RoleResult]) -> str:
     lines: List[str] = []
     role_to_provider_key = {
         "brain": "brain_pool",
@@ -263,13 +297,12 @@ def render_shell_commands(pools: Dict[str, List[Endpoint]]) -> str:
         "research": "research_pool",
         "utility": "util_pool",
     }
-    for role, pool in pools.items():
-        if not pool:
+    for role, (model, endpoints) in pools.items():
+        if not endpoints:
             lines.append(f"# {role}: no working endpoints found, skipped")
             continue
         provider_key = role_to_provider_key[role]
-        model, filtered = _pick_majority_model(pool)
-        endpoints_csv = ",".join(ep.url for ep in filtered)
+        endpoints_csv = ",".join(ep.url for ep in endpoints)
         lines.append(
             f"dsec providers add {provider_key} --type ollama --model '{model}' \\"
         )
@@ -282,7 +315,7 @@ def render_shell_commands(pools: Dict[str, List[Endpoint]]) -> str:
     return "\n".join(lines)
 
 
-def apply_to_config(pools: Dict[str, List[Endpoint]]) -> None:
+def apply_to_config(pools: Dict[str, RoleResult]) -> None:
     config_path = Path.home() / ".dsec" / "config.json"
     if not config_path.exists():
         print(f"  config not found at {config_path}; run dsec once first", file=sys.stderr)
@@ -297,25 +330,29 @@ def apply_to_config(pools: Dict[str, List[Endpoint]]) -> None:
         "research": "research_pool",
         "utility": "util_pool",
     }
-    for role, pool in pools.items():
-        if not pool:
+    for role, (model, endpoints) in pools.items():
+        if not endpoints:
             continue
         provider_key = role_to_provider_key[role]
-        model, filtered = _pick_majority_model(pool)
         cfg["providers"][provider_key] = {
             "type": "ollama",
             "model": model,
-            "endpoints": [ep.url for ep in filtered],
+            "endpoints": [ep.url for ep in endpoints],
             "fallback": "deepseek",
         }
         cfg["roles"][role] = {"provider": provider_key, "fallback": "deepseek"}
 
     cfg["enable_multi_agent"] = True
 
-    # Backup
+    # Backup current config first.
     backup = config_path.with_suffix(".json.bak")
     backup.write_text(config_path.read_text())
-    config_path.write_text(json.dumps(cfg, indent=2) + "\n")
+    # Atomic write: write to temp file in same dir, then os.replace().
+    # If the write fails partway, config.json keeps prior content.
+    import os
+    tmp_path = config_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(cfg, indent=2) + "\n")
+    os.replace(tmp_path, config_path)
     print(f"  config written to {config_path}")
     print(f"  backup at {backup}")
 
@@ -331,7 +368,7 @@ def main() -> int:
     p.add_argument("--apply", action="store_true",
                    help="Write to ~/.dsec/config.json (default: dry-run)")
     p.add_argument("--candidates-per-role", type=int, default=30,
-                   help="Candidates probed per role before winnowing (default: 30)")
+                   help="Candidates probed per role before pool selection (default: 30)")
     p.add_argument("--roles", nargs="*", choices=list(ROLE_MODELS),
                    default=list(ROLE_MODELS),
                    help="Roles to build pools for (default: all)")
@@ -347,22 +384,23 @@ def main() -> int:
     use = usable_rows(rows)
     print(f"    {len(rows)} total → {len(use)} usable (patched + generate=200)")
 
-    pools: Dict[str, List[Endpoint]] = {}
+    pools: Dict[str, RoleResult] = {}
     for role in args.roles:
         print(f"[2/3] role={role}")
         candidates = find_candidates_for_role(use, role,
                                               max_per_model=args.candidates_per_role)
         print(f"    {len(candidates)} candidates")
         if not candidates:
-            pools[role] = []
+            pools[role] = ("", [])
             continue
         probed = probe_all(candidates)
-        winners = winnow(probed, args.pool_size)
-        print(f"    {sum(1 for e in probed if e.chat_ok)} chat-ok, "
-              f"keeping top {len(winners)}:")
+        chat_ok = [e for e in probed if e.chat_ok]
+        model, winners = _pick_best_model(chat_ok, role, args.pool_size)
+        print(f"    {len(chat_ok)} chat-ok, "
+              f"selected model={model!r}, kept {len(winners)} endpoints:")
         for e in winners:
             print(f"      ✓ {e.url}  →  {e.matched_model}  ({e.chat_latency_s:.1f}s)")
-        pools[role] = winners
+        pools[role] = (model, winners)
 
     print(f"\n[3/3] result")
     if args.apply:

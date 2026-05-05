@@ -66,13 +66,32 @@ def ollama_chat_stream(
         with httpx.Client(timeout=httpx.Timeout(timeout_seconds, connect=10.0)) as client:
             with client.stream("POST", url, json=payload, headers=headers) as response:
                 if response.status_code == 401:
-                    yield {"type": "error", "text": f"Ollama 401 at {base_url} (auth header rejected)."}
+                    yield {
+                        "type": "error",
+                        "text": f"Ollama 401 at {base_url} (auth header rejected).",
+                        "fatal_endpoint": True,
+                    }
                     return
                 if response.status_code == 404:
-                    yield {"type": "error", "text": f"Ollama 404 at {base_url} (model '{model}' not pulled?)."}
+                    yield {
+                        "type": "error",
+                        "text": f"Ollama 404 at {base_url} (model '{model}' not pulled?).",
+                        "fatal_endpoint": True,
+                    }
                     return
                 if response.status_code == 429:
-                    yield {"type": "error", "text": f"Ollama 429 rate-limit at {base_url}."}
+                    yield {
+                        "type": "error",
+                        "text": f"Ollama 429 rate-limit at {base_url}.",
+                        "rate_limited": True,
+                    }
+                    return
+                if response.status_code in (502, 503, 504):
+                    yield {
+                        "type": "error",
+                        "text": f"Ollama upstream {response.status_code} at {base_url}.",
+                        "transient": True,
+                    }
                     return
                 if response.status_code not in (200, 206):
                     body = ""

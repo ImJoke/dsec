@@ -775,3 +775,57 @@ def background(
         return f"[job '{job_id}' killed]"
 
     return f"Error: unknown action '{action}'. Valid: run, exec, read, send, history, kill, list."
+
+
+# ── pty_shell — single persistent main shell for stateful workflows ─────────
+
+
+@register(
+    "pty_shell",
+    (
+        "Run a command in your PERSISTENT main bash PTY shell. State (cwd, env, "
+        "exported funcs, sourced venvs, aliases) survives ALL future calls. Use "
+        "this whenever you need stateful workflows: cd into target dir, source "
+        "venv/conda, set env vars, keep ssh agent forwarded. The first call "
+        "auto-spawns the shell. PS1, COLUMNS, TERM are pre-tuned for clean output.\n"
+        "PARAMETERS: command (the line to run), wait (seconds to wait for prompt; "
+        "default 5, max 120). For long-running commands prefer the `background` "
+        "tool with a dedicated job_id."
+    ),
+    roles=("brain", "executor"),
+)
+def pty_shell(command: str = "", wait: float = 5.0, cwd: str = "", **kwargs) -> str:
+    """Run *command* in the persistent main bash PTY.
+
+    Accepts (and tolerates) extra kwargs so the model is free to send
+    `cwd`, `working_dir`, `env`, etc. without crashing the call. `cwd`
+    if provided is realised as a `cd '<cwd>' &&` prefix on the command.
+    """
+    cmd = (command or "").strip()
+    if not cmd:
+        return "Error: 'command' is required."
+    cwd = (cwd or kwargs.get("working_dir") or kwargs.get("workdir") or "").strip()
+    pane = _get_or_create("main")
+    if not pane.alive:
+        pane = _get_or_create("main")
+    pane.read(timeout=0.2)
+    if cwd:
+        # shell-quote cwd to survive paths with spaces / special chars.
+        import shlex as _shlex
+        wrapped = f"cd {_shlex.quote(cwd)} && {cmd}"
+        pane.write(wrapped + "\n")
+        cmd_for_clean = wrapped
+    else:
+        pane.write(cmd + "\n")
+        cmd_for_clean = cmd
+    wait_clamped = max(2.0, min(float(wait), 120.0))
+    raw = pane.read_until_prompt(_PROMPT_PATTERNS, timeout=wait_clamped)
+    clean = _clean_exec_output(raw, cmd_for_clean)
+    try:
+        pane._history.append({"cmd": cmd_for_clean, "output": clean})
+    except Exception:
+        pass
+    status = "running" if pane.alive else "exited"
+    if not clean:
+        return f"[pty_shell — {status}] (no output)"
+    return f"[pty_shell — {status}]\n{_maybe_save_output('main', clean)}"

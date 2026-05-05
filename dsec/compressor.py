@@ -263,6 +263,10 @@ def _compress_linpeas(text: str) -> str:
 
     for line in lines:
         stripped = line.strip()
+        # Cap line length before regex — keeps regex bounded on pathological
+        # base64 dumps or 1MB-no-newline output without losing meaning.
+        if len(stripped) > 4000:
+            stripped = stripped[:4000]
         if not stripped or SEPARATORS.match(stripped):
             continue
         if any(m in stripped for m in ("[+]", "[!]", "[*]", "CVE-", "SUID", "SGID", "cron", "sudo")):
