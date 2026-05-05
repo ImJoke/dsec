@@ -459,7 +459,7 @@ _BROKEN_TOOL_CALL_LINE_RE = _re.compile(r"^\s*<?tool_call>\s*([a-zA-Z_][a-zA-Z0-
 _LEGACY_BASH_LINE_RE = _re.compile(r"(?im)^\s*(?:bash|sh|shell)\s*>\s*(.+?)\s*$")
 _NC_MACOS_RE = _re.compile(r'\bnc\s+-[a-zA-Z]*(?:l)[a-zA-Z]*v?n?p?\s+(\d+)')
 _NAME_FIELD_RE = _re.compile(r'"(?:name|tool)"\s*:\s*"([^"]+)"', _re.IGNORECASE)
-_COMMAND_FIELD_RE = _re.compile(r'"command"\s*:\s*"((?:\\\\.|[^"\\\\])*)"', _re.DOTALL | _re.IGNORECASE)
+_COMMAND_FIELD_RE = _re.compile(r'"command"\s*:\s*"((?:\\.|[^"\\])*)"', _re.DOTALL | _re.IGNORECASE)
 _PLAIN_COMMAND_LINE_RE = _re.compile(r"^\s*(?:\$\s*)?([a-zA-Z0-9_./-][^`]*)$")
 _NATIVE_TOOL_CALL_LINE_RE = _re.compile(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+(\{.*\})\s*$")
 # <tool_call name="TOOL"> with name as XML attribute (not JSON body) — step 0d
@@ -886,11 +886,14 @@ def _extract_tool_calls(text: str) -> list[dict]:
     # 2. If no tags found, try to find raw JSON blocks that look like tool calls
     if not potential_json_blocks:
         # Simple heuristic: find blocks starting with { and ending with }
-        # that contain "name": or "tool":
+        # that contain "name":, "tool": or "command": (the latter recovers
+        # bash-shaped JSON the model emits after MCP failures, where it
+        # forgets the <tool_call> wrapper but still produces a JSON shell
+        # of the form {"command": "..."}).
         raw_matches = _re.finditer(r"\{.*?\}", text, _re.DOTALL)
         for rm in raw_matches:
             block = rm.group(0)
-            if '"name":' in block or '"tool":' in block:
+            if '"name":' in block or '"tool":' in block or '"command":' in block:
                 potential_json_blocks.append(block)
 
     for content in potential_json_blocks:
@@ -975,7 +978,11 @@ def _extract_tool_calls(text: str) -> list[dict]:
                     command = _json.loads(f'"{raw_cmd}"')
                 except Exception:
                     command = raw_cmd.replace('\\n', ' ').replace('\\t', ' ')
-                calls.append({"name": tool_name, "arguments": {"command": command}})
+                # Skip empty/whitespace-only commands — emitting them would
+                # land at the bash dispatcher's "[error: empty command]" guard
+                # and just spin one more iteration for nothing.
+                if (command or "").strip():
+                    calls.append({"name": tool_name, "arguments": {"command": command}})
                 continue
 
             # Last-resort extraction for malformed JSON strings with odd escaping.
@@ -1011,6 +1018,42 @@ def _extract_tool_calls(text: str) -> list[dict]:
 
             # Non-bash tool without command field: still recover the name.
             calls.append({"name": tool_name, "arguments": {}})
+
+    # 2b'. Pure-command JSON fallback: recover {"command": "..."} blocks
+    # that lack a name/tool field. Models often emit these after MCP
+    # failures or in autonomous-mode reasoning, expecting them to run as
+    # bash. Without this rescue path the agentic loop spins on no-tool
+    # responses until the streak limit fires.
+    if not calls:
+        for content in potential_json_blocks:
+            if _NAME_FIELD_RE.search(content):
+                continue  # already handled above
+            cmd_match = _COMMAND_FIELD_RE.search(content)
+            if not cmd_match:
+                continue
+            raw_cmd = cmd_match.group(1)
+            try:
+                command = _json.loads(f'"{raw_cmd}"')
+            except Exception:
+                command = (
+                    raw_cmd
+                    .replace('\\\\', '\\')
+                    .replace('\\"', '"')
+                    .replace('\\n', '\n')
+                    .replace('\\t', '\t')
+                )
+            command = (command or "").strip()
+            if not command:
+                continue
+            # Auto-close unclosed heredocs (model sometimes emits
+            # `python3 << 'PYEOF'\nimport ...` and forgets the closing
+            # delimiter, which would otherwise hang the shell forever).
+            heredoc_open = _re.search(r"<<\s*['\"]?(\w+)['\"]?", command)
+            if heredoc_open:
+                delim = heredoc_open.group(1)
+                if not _re.search(r'(?:^|\n)' + _re.escape(delim) + r'\s*$', command):
+                    command = command.rstrip() + f"\n{delim}\n"
+            calls.append({"name": "bash", "arguments": {"command": command}})
 
     # 2c. Bare malformed tag fallback: `tool_call name="bash"> command`
     # or similar lines that omitted the leading angle bracket.
@@ -1884,14 +1927,18 @@ def _run_agentic_loop(
 
                 if _no_tool_streak >= 2:
                     continue_msg = (
-                        "Your previous response did not include any <tool_call> blocks. "
+                        "Your previous response did not include any parseable <tool_call> blocks. "
                         "If work remains, you MUST emit at least one valid <tool_call> now. "
-                        "Only emit no tool calls if the task is truly complete, and include a brief completion statement."
+                        "If you wrote bare JSON like {\"command\": \"...\"}, wrap it: "
+                        "<tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"...\"}}</tool_call>. "
+                        "Only emit no tool calls if the task is truly complete; if so, include a brief completion statement."
                     )
                 else:
                     continue_msg = (
                         "Continue your autonomous analysis from the previous turn. "
                         "If the task is not finished, emit one or more <tool_call> blocks. "
+                        "Concrete example: "
+                        "<tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"id\"}}</tool_call>. "
                         "If you believe the task is finished, briefly state that and then emit no tool calls only when you are truly done."
                     )
 
@@ -2121,7 +2168,15 @@ def _run_agentic_loop(
                 # scripts need them. Only normalize tabs and strip edges.
 
                 if not cmd:
-                    tool_responses.append({"name": tool_name, "result": "[error: empty command]"})
+                    tool_responses.append({
+                        "name": tool_name,
+                        "result": (
+                            "[error: empty command — your <tool_call> contained "
+                            "no command string. Emit a real command, e.g. "
+                            "<tool_call>{\"name\": \"bash\", \"arguments\": "
+                            "{\"command\": \"id\"}}</tool_call>]"
+                        ),
+                    })
                     continue
 
                 # ── Cross-turn identical-cmd guard (mirrors registry path) ────

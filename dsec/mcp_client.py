@@ -276,26 +276,78 @@ class MCPServer:
         for tool in self._tools:
             if tool.get("name") == tool_name:
                 schema = tool.get("inputSchema", {})
-                required = schema.get("required", [])
+                required = list(schema.get("required", []))
                 props = schema.get("properties", {})
+
+                # Common alias map — models routinely use synonyms.
+                # Apply BEFORE missing/required check so aliased keys count as present.
+                _ALIASES = {
+                    "address": ("addr", "function_address", "func_addr", "offset", "ea"),
+                    "name": ("function_name", "func_name", "symbol", "tool_name"),
+                    "file_path": ("path", "file", "filepath", "filename"),
+                    "program": ("binary", "module", "prog"),
+                    "count": ("limit", "n", "max"),
+                }
+                for canonical, aliases in _ALIASES.items():
+                    if canonical in props and canonical not in params:
+                        for a in aliases:
+                            if a in params:
+                                params[canonical] = params.pop(a)
+                                break
+
+                # Coerce types per schema BEFORE missing-required so well-formed
+                # but mistyped params don't trigger spurious "missing" errors.
+                for pname, pschema in props.items():
+                    if pname not in params:
+                        continue
+                    val = params[pname]
+                    decl = pschema.get("type")
+                    if decl == "boolean":
+                        if isinstance(val, bool):
+                            pass
+                        elif isinstance(val, int):
+                            params[pname] = bool(val)
+                        elif isinstance(val, str):
+                            v = val.strip().lower()
+                            if v in ("true", "1", "yes", "y"):
+                                params[pname] = True
+                            elif v in ("false", "0", "no", "n", ""):
+                                params[pname] = False
+                    elif decl == "integer":
+                        if isinstance(val, str):
+                            try:
+                                params[pname] = int(val, 0) if val.strip() else 0
+                            except ValueError:
+                                pass
+                        elif isinstance(val, bool):
+                            params[pname] = int(val)
+                    elif decl == "number":
+                        if isinstance(val, str):
+                            try:
+                                params[pname] = float(val)
+                            except ValueError:
+                                pass
+                    elif decl == "string":
+                        if isinstance(val, (int, float)) and not isinstance(val, bool):
+                            # r2/ghidra address fields sometimes typed as string
+                            # but the model passes 0x401000 as int. Stringify.
+                            if pname.lower() in ("address", "addr", "offset", "ea"):
+                                params[pname] = hex(int(val)) if isinstance(val, int) else str(val)
+                            else:
+                                params[pname] = str(val)
 
                 missing = [r for r in required if r not in params]
                 if missing:
                     sig = ", ".join(
                         f"{k}: {v.get('type', 'any')}" for k, v in props.items()
                     )
+                    desc_lines = (tool.get("description") or "").splitlines()
+                    desc = desc_lines[0][:120] if desc_lines else ""
                     raise ValueError(
                         f"Missing required parameter(s) {missing} for '{tool_name}'. "
-                        f"Signature: {tool_name}({sig})"
+                        f"Signature: {tool_name}({sig})."
+                        + (f" Hint: {desc}." if desc else "")
                     )
-
-                # Coerce integer → boolean for params declared as boolean in the schema.
-                # Models frequently pass count=10 instead of count=true.
-                for pname, pschema in props.items():
-                    if pschema.get("type") == "boolean" and pname in params:
-                        val = params[pname]
-                        if isinstance(val, int) and not isinstance(val, bool):
-                            params[pname] = bool(val)
                 break
 
         assert self._proc is not None
