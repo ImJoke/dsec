@@ -46,6 +46,7 @@ from .config import (
     save_config,
     set_sudo_password,
 )
+from .display import resolve_brain_display_model, resolve_default_domain
 from .domain import detect_domain, get_domain, get_system_prompt
 from .formatter import (
     console,
@@ -99,7 +100,15 @@ def _ensure_native_tools_loaded():
         import dsec.skills.persistence  # noqa: F401
         import dsec.tools.payload_tools # noqa: F401
         import dsec.tools.knowledge_tools # noqa: F401
+        import dsec.tools.vuln_hunter      # noqa: F401  # 0day discovery pipeline
+        import dsec.tools.parallel_tools   # noqa: F401  # parallel job orchestration
         import dsec.agents.brain_tools  # noqa: F401  # registers `executor` brain tool
+        from dsec.agents.report_writer import ReportWriter
+        from dsec.agents.resume_store import ResumeStore, load_terminal_jobs
+        from dsec.agents.coordinator import Coordinator as _Coord
+        ReportWriter.install()
+        ResumeStore.install()
+        load_terminal_jobs(_Coord.get())
     except ImportError:
         pass
     try:
@@ -181,7 +190,7 @@ def _resolve_session(
         return session_data
 
     domain_guess = domain_override or detect_domain(full_input, session_name)
-    model_guess = model_override or config.get("default_model", "deepseek-expert-r1-search")
+    model_guess = resolve_brain_display_model(config, model_override)
     created = create_session(session_name, domain_guess, model_guess)
     print_info(f"Created new session: [bold]{session_name}[/bold] [{domain_guess}]")
     return created
@@ -198,16 +207,23 @@ def _resolve_domain_and_model(
     if domain_override:
         domain = domain_override
     elif session_data:
-        domain = session_data.get("domain", "htb")
+        domain = session_data.get("domain") or resolve_default_domain(config)
     else:
         domain = detect_domain(full_input, session_name)
 
     if model_override:
         model = model_override
-    elif session_data:
-        model = session_data.get("model") or config.get("default_model", "deepseek-expert-r1-search")
+    elif session_data and session_data.get("model"):
+        model = session_data["model"]
     else:
-        model = config.get("default_model", "deepseek-expert-r1-search")
+        model = resolve_brain_display_model(config, "")
+
+    # Auto-mode live promotion: if domain is still "auto", let detect_domain
+    # try to upgrade based on the user's input + cwd before we commit.
+    if domain == "auto":
+        promoted = detect_domain(full_input or "", session_name or "")
+        if promoted and promoted != "auto":
+            domain = promoted
 
     return domain, model
 
@@ -1390,6 +1406,26 @@ def _run_agentic_loop(
     runner = get_runner()
     _loop_pruned_history: Optional[List] = None  # set when mid-loop compaction resets conv_id
 
+    # ── Cross-iteration history (Ollama-safe) ─────────────────────────────
+    # Ollama (cloud frontier pools) is stateless: it has no notion of a
+    # `conversation_id`, so EVERY call must include the full context as
+    # `messages=[...]`. The legacy DeepSeek path could rely on conv_id
+    # to keep state server-side; Ollama can't. We accumulate the running
+    # transcript here and pass it on every chat_stream call so the brain
+    # sees the same context regardless of provider.
+    _iter_history: List[Dict[str, Any]] = []
+    try:
+        if session_data := config.get("__session_data__"):
+            for _t in (session_data.get("history") or []):
+                if _t.get("role") in ("user", "assistant", "system"):
+                    _iter_history.append({"role": _t["role"], "content": _t.get("content", "")})
+    except Exception:
+        pass
+    # Seed with the first assistant turn we already have (response_content),
+    # so the model sees what it just said when we send the next follow-up.
+    if response_content:
+        _iter_history.append({"role": "assistant", "content": response_content})
+
     # Phase tracking for TUI color shifts
     _current_phase: str = _detect_phase(response_content)
 
@@ -1413,6 +1449,15 @@ def _run_agentic_loop(
     # re-dispatching. Resets when the agent runs a different command.
     _last_cmd_signature: Optional[str] = None
     _last_cmd_failed: bool = False
+
+    # Cross-turn repeat-call tracker. We canonicalise (tool_name, args) into
+    # a sha256-12 signature and remember the last 8. If the model emits a
+    # signature that already appears in the recent window, we skip dispatch
+    # and inject a "you already did this — move on" feedback. This is what
+    # actually catches `pty_shell pwd && ls -la` being re-issued every turn.
+    from collections import deque as __deque_for_sigs
+    _recent_call_sigs = __deque_for_sigs(maxlen=8)  # type: ignore[var-annotated]
+    _REPEAT_CALL_LOOKBACK = 5
 
     # ── Stalemate detector ──────────────────────────────────────────────
     # Counts iterations since the last sign of "real progress" (credential
@@ -1764,11 +1809,31 @@ def _run_agentic_loop(
                 current_response,
                 _re.IGNORECASE,
             ):
-                console.print(
-                    "\n[bold green]✓ Brain emitted completion marker — exiting "
-                    "agentic loop. Send the next prompt to continue.[/bold green]"
+                # Reject FAKE completions — model sometimes emits
+                # `TASK_COMPLETE: No previous analysis task is available …`
+                # as an excuse for losing context, not as a real success
+                # signal. If the response contains negative-completion
+                # phrases, treat it as context-loss instead and let the
+                # no-tool-streak handler force a re-orienting probe.
+                _negative_phrases = (
+                    "no previous", "context is empty", "is not available",
+                    "context is not", "no analysis task", "no record of",
+                    "no prior", "nothing to continue", "is empty",
                 )
-                break
+                _lower_resp = current_response.lower()
+                _is_fake_complete = any(p in _lower_resp for p in _negative_phrases)
+                if not _is_fake_complete:
+                    console.print(
+                        "\n[bold green]✓ Brain emitted completion marker — exiting "
+                        "agentic loop. Send the next prompt to continue.[/bold green]"
+                    )
+                    break
+                else:
+                    print_warning(
+                        "Brain emitted TASK_COMPLETE but response signals "
+                        "context loss (negative phrasing). Treating as "
+                        "context-lost and forcing re-orientation."
+                    )
 
         tool_calls = _extract_tool_calls(current_response)
         # Dedupe: model sometimes emits the same <tool_call> block multiple times
@@ -1884,7 +1949,7 @@ def _run_agentic_loop(
                                 conversation_id=current_conv_id,
                                 base_url=config.get("base_url", "http://localhost:8000"),
                                 token=get_next_token(),
-                                history=_loop_pruned_history,
+                                history=(_loop_pruned_history if _loop_pruned_history else _iter_history),
                                 role="brain",
                             )
                             _loop_pruned_history = None
@@ -2013,7 +2078,7 @@ def _run_agentic_loop(
                         conversation_id=current_conv_id,
                         base_url=config.get("base_url", "http://localhost:8000"),
                         token=get_next_token(),
-                        history=_loop_pruned_history,
+                        history=(_loop_pruned_history if _loop_pruned_history else _iter_history),
                         role="brain",
                     )
                     _loop_pruned_history = None
@@ -2718,6 +2783,24 @@ def _run_agentic_loop(
                     tool_responses.append({"name": tool_name, "result": _hint})
                     console.print(f"  [bold yellow]⏭ {tool_name}[/bold yellow] (skipped — identical retry)")
                     continue  # skip dispatch entirely
+                # Cross-turn REPEAT detection (even on success). Catches the
+                # `pty_shell pwd && ls -la` / `executor "list directory"` loop
+                # where the model re-issues the same probe every iteration
+                # because it forgot it already ran it.
+                _recent_list = list(_recent_call_sigs)[-_REPEAT_CALL_LOOKBACK:]
+                if _sig in _recent_list:
+                    _hint = (
+                        f"[hint: you ALREADY ran `{tool_name}` with these exact arguments "
+                        f"in a recent turn. The output is in your context above — re-read "
+                        f"it instead of re-running. If you need different information, "
+                        f"change the arguments (different file, different command, deeper "
+                        f"path) or pivot to a different tool. Re-running the same probe "
+                        f"is the textbook stalemate pattern.]"
+                    )
+                    tool_responses.append({"name": tool_name, "result": _hint})
+                    console.print(f"  [bold yellow]⏭ {tool_name}[/bold yellow] (skipped — repeat of recent call)")
+                    _recent_call_sigs.append(_sig)
+                    continue
                 args_str = _json.dumps(arguments, ensure_ascii=False)
                 if len(args_str) > 100: args_str = args_str[:100] + "…"
                 with console.status(f"[bold magenta]⚙ {tool_name}[/bold magenta] [#888888]{args_str}[/]", spinner="dots") as status:
@@ -2778,6 +2861,7 @@ def _run_agentic_loop(
                         _track_for_stalemate(tool_name, arguments, result_text)
                         _last_cmd_signature = _sig
                         _last_cmd_failed = False
+                        _recent_call_sigs.append(_sig)
                         console.print(f"  [bold green]✔ {tool_name}[/bold green] [#888888]{args_str}[/]")
                         if session_name:
                             append_audit_log(session_name, {
@@ -2948,13 +3032,19 @@ def _run_agentic_loop(
         new_content = None
         new_conv_id = None
         try:
+            # Append the follow_up as a user turn so the brain sees what
+            # tool_response just landed in its context. (We append BEFORE
+            # the call; the provider will not double-append since both
+            # ollama_chat_stream and _stream_deepseek de-dupe the trailing
+            # user message that matches the explicit `message` arg.)
+            _iter_history.append({"role": "user", "content": follow_up})
             gen = chat_stream(
                 message=follow_up,
                 model=model,
                 conversation_id=current_conv_id,
                 base_url=config.get("base_url", "http://localhost:8000"),
                 token=get_next_token(),
-                history=_loop_pruned_history,  # non-None only after mid-loop compaction
+                history=(_loop_pruned_history if _loop_pruned_history else _iter_history),
                 role="brain",
             )
             _loop_pruned_history = None  # consumed — clear so next iteration uses conv_id
@@ -3029,7 +3119,7 @@ def _run_agentic_loop(
                             conversation_id=current_conv_id,
                             base_url=config.get("base_url", "http://localhost:8000"),
                             token=get_next_token(),
-                            history=_loop_pruned_history,
+                            history=(_loop_pruned_history if _loop_pruned_history else _iter_history),
                             role="brain",
                         )
                         _loop_pruned_history = None
@@ -3075,7 +3165,7 @@ def _run_agentic_loop(
                         conversation_id=current_conv_id,
                         base_url=config.get("base_url", "http://localhost:8000"),
                         token=get_next_token(),
-                        history=_loop_pruned_history,
+                        history=(_loop_pruned_history if _loop_pruned_history else _iter_history),
                         role="brain",
                     )
                     _loop_pruned_history = None
@@ -3140,6 +3230,30 @@ def _run_agentic_loop(
                 )
 
         current_response = new_content
+        # Append assistant turn so subsequent chat_stream calls (which
+        # always send `history=_iter_history` for Ollama-statelessness)
+        # see the brain's prior reply. Without this, every call after
+        # the first would only have user turns and the brain would
+        # forget what it just emitted.
+        if new_content:
+            _iter_history.append({"role": "assistant", "content": new_content})
+        # Bound history to keep payload < ~80K chars (~20K tokens).
+        # Drop oldest non-system turns when over budget; system msgs
+        # (cumulative summary) are pinned at index 0 if present.
+        _MAX_ITER_HIST_CHARS = 80_000
+        try:
+            _total = sum(len(m.get("content", "") or "") for m in _iter_history)
+            while _total > _MAX_ITER_HIST_CHARS and len(_iter_history) > 4:
+                # find oldest non-system turn to drop
+                _drop_idx = next(
+                    (i for i, m in enumerate(_iter_history) if m.get("role") != "system"),
+                    None,
+                )
+                if _drop_idx is None:
+                    break
+                _total -= len(_iter_history.pop(_drop_idx).get("content", "") or "")
+        except Exception:
+            pass
 
     else:
         print_warning(f"Agentic loop hit the {max_iterations}-iteration limit.")
@@ -3162,9 +3276,9 @@ def _generate_shell_session_name() -> str:
 def _browse_sessions() -> Optional[str]:
     """Arrow-key navigable session picker. Returns session name or None for new.
 
-    Uses prompt_toolkit's radiolist_dialog so up/down/PageUp/PageDown work,
-    plus type-to-search filtering. Falls back to a numbered prompt if
-    prompt_toolkit is unavailable.
+    Uses a custom prompt_toolkit Application so Enter directly submits
+    (the stock radiolist_dialog requires Tab→Enter, which confuses users).
+    Falls back to a numbered prompt if prompt_toolkit is unavailable.
     """
     sessions = list_sessions()
     if not sessions:
@@ -3172,34 +3286,133 @@ def _browse_sessions() -> Optional[str]:
 
     from dsec.formatter import _relative_time
 
-    # Try prompt_toolkit-based picker first (arrow-key navigation).
+    # Custom picker — single-key submit/cancel.
     try:
-        from prompt_toolkit.shortcuts import radiolist_dialog
-        from prompt_toolkit.formatted_text import HTML
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.layout import Layout, HSplit, Window
+        from prompt_toolkit.layout.controls import FormattedTextControl
+        from prompt_toolkit.formatted_text import FormattedText
 
-        rows: list = []
+        rows = []
         for s in sessions:
             dom = s.get("domain", "htb")
             dom_cfg = get_domain(dom)
             dom_display = dom_cfg.get("display", dom.upper())
             last = _relative_time(s.get("last_used", ""))
-            label = (
-                f"{s.get('name','')[:30]:<30}  "
-                f"{dom_display:<10}  "
-                f"turns={s.get('message_count', 0):<5}  "
-                f"{last}"
-            )
-            rows.append((s.get("name", ""), label))
+            rows.append({
+                "name": s.get("name", ""),
+                "domain": dom_display,
+                "turns": s.get("message_count", 0),
+                "last": last,
+            })
 
-        result = radiolist_dialog(
-            title="Resume Session",
-            text=HTML(
-                "↑/↓ navigate · <b>Enter</b> resume · <b>Esc</b> new session · type to filter"
-            ),
-            values=rows,
-            default=rows[0][0] if rows else None,
-        ).run()
-        return result  # None if Esc, else session name
+        state = {"idx": 0, "filter": "", "result": None}
+
+        def visible() -> list:
+            f = state["filter"].lower().strip()
+            if not f:
+                return list(range(len(rows)))
+            return [i for i, r in enumerate(rows) if f in r["name"].lower()]
+
+        def render() -> FormattedText:
+            tokens: list = []
+            tokens.append(("bold fg:ansired", " Resume Session "))
+            tokens.append(("", "\n"))
+            tokens.append(("fg:ansigray", " ↑/↓ navigate · "))
+            tokens.append(("bold", "Enter"))
+            tokens.append(("fg:ansigray", " resume · "))
+            tokens.append(("bold", "Esc"))
+            tokens.append(("fg:ansigray", " new session · "))
+            tokens.append(("bold", "/"))
+            tokens.append(("fg:ansigray", " filter\n\n"))
+            if state["filter"]:
+                tokens.append(("fg:ansiyellow", f" filter: {state['filter']}\n\n"))
+            vis = visible()
+            if not vis:
+                tokens.append(("fg:ansired", " (no matches — Backspace to clear filter, Esc to cancel)\n"))
+                return FormattedText(tokens)
+            cur = state["idx"]
+            if cur >= len(vis):
+                cur = state["idx"] = max(0, len(vis) - 1)
+            view_window = 18
+            start = max(0, cur - view_window // 2)
+            end = min(len(vis), start + view_window)
+            for vi in range(start, end):
+                ri = vis[vi]
+                r = rows[ri]
+                marker = " ▶ " if vi == cur else "   "
+                style = "reverse bold" if vi == cur else ""
+                line = f"{marker}{r['name'][:28]:<28}  {r['domain']:<10}  turns={r['turns']:<5}  {r['last']}\n"
+                tokens.append((style, line))
+            tokens.append(("fg:ansigray", f"\n {len(vis)} match(es) · idx={cur+1}\n"))
+            return FormattedText(tokens)
+
+        kb = KeyBindings()
+
+        @kb.add("up")
+        def _(event):
+            state["idx"] = max(0, state["idx"] - 1)
+
+        @kb.add("down")
+        def _(event):
+            state["idx"] = min(len(visible()) - 1, state["idx"] + 1)
+
+        @kb.add("pageup")
+        def _(event):
+            state["idx"] = max(0, state["idx"] - 10)
+
+        @kb.add("pagedown")
+        def _(event):
+            state["idx"] = min(len(visible()) - 1, state["idx"] + 10)
+
+        @kb.add("home")
+        def _(event):
+            state["idx"] = 0
+
+        @kb.add("end")
+        def _(event):
+            state["idx"] = max(0, len(visible()) - 1)
+
+        @kb.add("enter")
+        def _(event):
+            vis = visible()
+            if not vis:
+                return
+            ri = vis[state["idx"]]
+            state["result"] = rows[ri]["name"]
+            event.app.exit()
+
+        @kb.add("escape", eager=True)
+        @kb.add("c-c")
+        def _(event):
+            state["result"] = None
+            event.app.exit()
+
+        @kb.add("backspace")
+        def _(event):
+            state["filter"] = state["filter"][:-1]
+            state["idx"] = 0
+
+        @kb.add("<any>")
+        def _(event):
+            ch = event.data
+            if ch and ch.isprintable() and len(ch) == 1:
+                state["filter"] += ch
+                state["idx"] = 0
+
+        body = Window(
+            content=FormattedTextControl(render, focusable=True),
+            wrap_lines=False,
+        )
+        app = Application(
+            layout=Layout(HSplit([body])),
+            key_bindings=kb,
+            full_screen=True,
+            mouse_support=False,
+        )
+        app.run()
+        return state["result"]
     except (ImportError, Exception):
         pass
 
@@ -3471,7 +3684,7 @@ def _handle_shell_command(raw: str, state: Dict[str, Any]) -> bool:
         from .session import create_session
         new_name = arg if arg else _generate_shell_session_name()
         dom = state["domain_override"] or "htb"
-        model_name = state.get("model_override") or load_config().get("default_model", "deepseek-expert-r1-search")
+        model_name = resolve_brain_display_model(load_config(), state.get("model_override", "") or "")
         create_session(new_name, dom, model_name)
         state["session_name"] = new_name
         
@@ -3529,7 +3742,7 @@ def _handle_shell_command(raw: str, state: Dict[str, Any]) -> bool:
 
     # ── domain ────────────────────────────────────────────────────────────────
     if command == "/domain":
-        if arg not in {"htb", "bugbounty", "ctf", "research", "programmer"}:
+        if arg not in {"auto", "htb", "bugbounty", "ctf", "research", "programmer"}:
             print_warning("Usage: /domain <htb|bugbounty|ctf|research|programmer>")
             return True
         state["domain_override"] = arg
@@ -3683,6 +3896,72 @@ def _handle_shell_command(raw: str, state: Dict[str, Any]) -> bool:
                     print_success(f"Added to OUT OF SCOPE: {target}")
                 else:
                     print_warning("Usage: /scope <add|exclude|clear> [target]")
+        return True
+
+    # ── parallel sub-agent ops ────────────────────────────────────────────────
+    if command == "/jobs":
+        from dsec.agents.coordinator import Coordinator
+        from rich.table import Table
+        from rich import box
+        rows = Coordinator.get().list_jobs()
+        if not rows:
+            print_info("No parallel jobs yet.")
+            return True
+        table = Table(title="Parallel Jobs", title_justify="left",
+                      border_style="#888888", box=box.SIMPLE)
+        for col in ("id", "kind", "state", "target", "age", "runtime", "finds"):
+            table.add_column(col, style="bold" if col == "id" else "")
+        for r in rows:
+            state = r["state"]
+            color = {
+                "running": "yellow", "done": "green", "failed": "red",
+                "cancelled": "magenta", "pending": "cyan",
+            }.get(state, "white")
+            table.add_row(
+                r["id"], r["kind"], f"[{color}]{state}[/{color}]",
+                str(r["target"] or "-"), f"{r['age']:.1f}s",
+                f"{r['runtime']:.1f}s", str(r["findings"]),
+            )
+        console.print(table)
+        return True
+
+    if command == "/parallel":
+        from dsec.agents.coordinator import Coordinator
+        coord = Coordinator.get()
+        if not arg:
+            print_info(f"Parallel worker cap: {coord.max_workers}")
+            return True
+        try:
+            n = int(arg.strip())
+        except ValueError:
+            print_warning("Usage: /parallel <N>  (1-32)")
+            return True
+        new_cap = coord.set_max_workers(n)
+        print_success(f"Parallel worker cap → {new_cap}")
+        return True
+
+    if command == "/cancel":
+        from dsec.agents.coordinator import Coordinator
+        if not arg:
+            print_warning("Usage: /cancel <job_id>")
+            return True
+        if Coordinator.get().cancel(arg.strip()):
+            print_success(f"Cancellation requested for {arg.strip()}")
+        else:
+            print_warning(f"Job {arg.strip()} not found or already terminal.")
+        return True
+
+    if command == "/report":
+        import os
+        from pathlib import Path
+        report_path = Path(os.getcwd()) / ".report.md"
+        if not report_path.exists():
+            print_info(f"No report file yet at {report_path}")
+            return True
+        content = report_path.read_text(errors="replace")
+        tail = "\n".join(content.splitlines()[-30:])
+        console.print(Panel(tail or "(empty)", title=str(report_path),
+                            border_style="#888888"))
         return True
 
     print_warning(f"Unknown shell command: {command}. Use /help.")
@@ -4048,7 +4327,7 @@ def _launch_shell(
     if not quick:
         _resolve_session(shell_session, "", config, domain_override, model_override)
     shell_domain = domain_override or detect_domain("", shell_session)
-    shell_model = model_override or config.get("default_model", "deepseek-expert-r1-search")
+    shell_model = model_override or resolve_brain_display_model(config, "")
     # Resolve sudo password: env var → persisted config → None
     _initial_sudo = _os.environ.get("DSEC_SUDO_PASS") or get_sudo_password() or None
 
@@ -4101,24 +4380,16 @@ def _launch_shell(
 
     def _run_loop() -> None:
         while True:
-            # ── prompt ────────────────────────────────────────────────────────
             raw = _read_line()
-
             if not raw:
                 continue
-
-            # ── !cmd shorthand ─────────────────────────────────────────────────
             if raw.startswith("!"):
                 cmd = raw[1:].strip()
                 if cmd:
                     _shell_run_command(cmd, state)
                 continue
-
-            # ── slash commands ──────────────────────────────────────────────────
             if _handle_shell_command(raw, state):
                 continue
-
-            # ── send to AI ──────────────────────────────────────────────────────
             try:
                 _run_chat(
                     message=raw,
@@ -4530,7 +4801,7 @@ class ChatGroup(click.Group):
 @click.option("--new-session", "-n", "new_session", default=None, metavar="NAME",
               help="Create a new session with this name and start chatting.")
 @click.option("--domain", "-d", default=None,
-              type=click.Choice(["htb", "bugbounty", "ctf", "research", "programmer"]),
+              type=click.Choice(["auto", "htb", "bugbounty", "ctf", "research", "programmer"]),
               help="Override domain detection.")
 @click.option("--model", "-m", default=None, metavar="MODEL",
               help="Override model (for example: deepseek-expert-r1-search).")
@@ -4580,7 +4851,7 @@ def cli(
 
     if use_search:
         cfg = load_config()
-        base_model = model or cfg.get("default_model", "deepseek-expert-r1-search")
+        base_model = model or resolve_brain_display_model(cfg, "")
         if not base_model.endswith("-search"):
             model = base_model + "-search"
 
@@ -4683,7 +4954,7 @@ def note_cmd(content, session_name, note_type):
 @cli.command("memory")
 @click.option("--list", "do_list", is_flag=True, help="List all memories.")
 @click.option("--domain", default=None,
-              type=click.Choice(["htb", "bugbounty", "ctf", "research", "programmer"]),
+              type=click.Choice(["auto", "htb", "bugbounty", "ctf", "research", "programmer"]),
               help="Filter by domain.")
 @click.option("--session", "-s", "filter_session", default=None, metavar="NAME",
               help="Filter by session name.")
@@ -4752,7 +5023,7 @@ def memory_cmd(
             content=add_content,
             metadata={
                 "session": filter_session or "manual",
-                "domain": domain or "htb",
+                "domain": domain or "auto",
                 "type": mem_type,
                 "confidence": "verified",
                 "tags": tag_list,
@@ -5014,7 +5285,7 @@ def tags_cmd(tag_list, session_name):
 @click.option("--new-session", "-n", "new_session", default=None, metavar="NAME",
               help="Create a new shell session with this name.")
 @click.option("--domain", "-d", default=None,
-              type=click.Choice(["htb", "bugbounty", "ctf", "research", "programmer"]),
+              type=click.Choice(["auto", "htb", "bugbounty", "ctf", "research", "programmer"]),
               help="Override domain detection.")
 @click.option("--model", "-m", default=None, metavar="MODEL", help="Override model.")
 @click.option("--no-compress", "no_compress", is_flag=True, help="Skip context compression.")
@@ -5041,7 +5312,7 @@ def shell_cmd(
 
     if use_search:
         cfg = load_config()
-        base_model = model or cfg.get("default_model", "deepseek-expert-r1-search")
+        base_model = model or resolve_brain_display_model(cfg, "")
         if not base_model.endswith("-search"):
             model = base_model + "-search"
 

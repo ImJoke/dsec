@@ -720,6 +720,22 @@ DOMAIN_CTF: Dict[str, Any] = {
     ],
     "system_prompt": """You are an expert CTF player across all categories.
 
+**STEP ZERO — IDENTIFY THE CHALLENGE TYPE BEFORE ASKING FOR ANYTHING.**
+
+CTF challenges are NOT always network targets. Before you ask the operator for an IP / hostname, look at what's actually present:
+- Source-code directory in cwd (multi-service, Dockerfile, nginx/, client/, sso-provider/, etc.) → **WEB / source-review challenge**. Read the code, don't ask for IP.
+- A single binary, ELF, EXE, .out, .bin → **PWN / RE challenge**. Run `file`, `checksec`, `strings`, then disassemble.
+- A packet capture (.pcap, .pcapng) → **FORENSICS — NETWORK**. Analyze with tshark / Wireshark.
+- An image / audio / video file → **STEGO**. Try strings, binwalk, exiftool, zsteg, steghide.
+- A ciphertext blob in a .txt / .py file → **CRYPTO**. Read the encoder, identify the cipher, attack.
+- A Docker compose / live URL / docker-compose.yml present → **WEB blackbox or boot2root**, scope determined by the artifacts.
+
+**You only ask the operator for an IP / hostname when:**
+1. The challenge artifacts make it clear a network service must be reached (no source code, no local binary, no file artifacts), AND
+2. You've already inspected `pwd && ls -la` and there is genuinely nothing to work with locally.
+
+If the operator dropped you into a directory full of source code and said "explore this CTF challenge", your FIRST action is `pty_shell pwd && ls -la && find . -maxdepth 3 -type f | head -40` — NOT "please give me the target IP". Source code in front of you IS the target.
+
 Categories and approach:
 
 WEB:
@@ -840,7 +856,35 @@ CRITICAL MEMORY RULE: Memory context provides historical constraints or project 
     "auto_research_triggers": ["error", "exception", "framework", "library", "syntax"],
 }
 
+DOMAIN_AUTO: Dict[str, Any] = {
+    "name": "auto",
+    "display": "Auto",
+    "color": "#7aa2f7",
+    "triggers": [],  # auto is the fallback — never matched by triggers
+    "system_prompt": """You are dsec in **AUTO MODE**. The operator has not pinned a category — you must INFER the task type from the working-directory contents and the user's prompt before taking action.
+
+STEP ZERO — INFER the task type, then behave like the matching specialist:
+- cwd contains source code (Dockerfile, package.json, *.py, *.go, etc.)
+    → web / source-review / code-audit. Read files; do NOT scan an IP.
+- cwd contains a binary (ELF, .out, .bin, .exe)
+    → reverse-engineering / pwn. Run `file`, `checksec`, `strings`, then disassemble.
+- cwd contains a `.pcap` / `.pcapng` → forensics — analyse with tshark / Wireshark.
+- cwd contains an image / audio / video → stego — strings, binwalk, exiftool, zsteg, steghide.
+- cwd contains a ciphertext blob in `.txt` / `.py` → crypto — read the encoder, identify the cipher, attack.
+- operator names an IP or hostname → network engagement (HTB / pentest).
+- operator names a CVE or "vulnerability research" → vuln-research / 0-day hunt — use `vuln_hunt`.
+- nothing else matches → ask ONE concise orienting question; do not stall.
+
+After inference, behave like the matching specialist (web / pwn / crypto / forensics / network / research) without needing the operator to set `/domain`. If the task changes mid-session, infer again.
+
+CRITICAL MEMORY RULE: memory context is historical reference only. Never assume past sessions apply to the current task without verification.""",
+    "research_sources": ["nvd", "exploitdb", "github_advisories", "ctftime_writeups"],
+    "auto_research_triggers": ["cve", "vulnerability", "exploit", "technique"],
+}
+
+
 DOMAINS: Dict[str, Dict[str, Any]] = {
+    "auto": DOMAIN_AUTO,         # default — task type inferred from input + cwd
     "htb": DOMAIN_HTB,
     "bugbounty": DOMAIN_BUGBOUNTY,
     "ctf": DOMAIN_CTF,
@@ -857,8 +901,8 @@ def detect_domain(text: str, session_name: str = "") -> str:
     """
     Priority:
     1. Session name prefix (htb-, bb-, ctf-, research-)
-    2. Keyword matching with scoring
-    3. Default → "htb"
+    2. Keyword matching with scoring (skips the auto meta-domain)
+    3. Default → "auto" (let the model infer from cwd + prompt at runtime)
     """
     # 1. Session name prefix
     sl = session_name.lower()
@@ -873,9 +917,9 @@ def detect_domain(text: str, session_name: str = "") -> str:
     if sl.startswith("htb-"):
         return "htb"
 
-    # 2. Keyword scoring
+    # 2. Keyword scoring (skip the auto meta-domain — it has no triggers)
     tl = text.lower()
-    scores: Dict[str, int] = {d: 0 for d in DOMAINS}
+    scores: Dict[str, int] = {d: 0 for d in DOMAINS if d != "auto"}
     STRONG = {
         "htb": {"htb", "hackthebox", "user.txt", "root.txt"},
         "bugbounty": {"bug bounty", "hackerone", "bugcrowd", "intigriti"},
@@ -885,18 +929,21 @@ def detect_domain(text: str, session_name: str = "") -> str:
     }
 
     for domain_name, domain_data in DOMAINS.items():
+        if domain_name == "auto":
+            continue
         for trigger in domain_data["triggers"]:
             if trigger.lower() in tl:
                 scores[domain_name] += 1
                 if trigger.lower() in STRONG.get(domain_name, set()):
                     scores[domain_name] += 2
 
-    max_score = max(scores.values())
-    if max_score > 0:
-        return max(scores, key=lambda k: scores[k])
+    if scores:
+        max_score = max(scores.values())
+        if max_score > 0:
+            return max(scores, key=lambda k: scores[k])
 
-    # 3. Default
-    return "htb"
+    # 3. Default — auto-mode (task type inferred at runtime)
+    return "auto"
 
 
 # ---------------------------------------------------------------------------
@@ -1010,6 +1057,37 @@ _MEMORY_GUIDANCE = """
 MEMORY GUIDANCE:
 If you discovered something worth remembering (CVE, credential, technique, tool quirk, user preference), use core_memory_append or graph_memory_insert to persist it NOW. Don't wait to be asked."""
 
+_PARALLEL_GUIDANCE = """
+[PARALLEL ORCHESTRATION — when to fan out]
+You can run sub-agent jobs concurrently. Use these tools instead of the synchronous `executor` / `research` when work is independent and parallelism saves wall time:
+
+  parallel_executor(plan, target=...)   → fire-and-forget; returns job_id
+  parallel_research(query)              → independent KB / CVE lookup
+  parallel_vuln_hunt(path)              → parallel code audit
+  await_jobs("id1,id2", timeout=300)    → block, get markdown digest
+  list_jobs / cancel_job / claim_target / report_note
+
+WHEN TO PARALLELIZE:
+  - Multi-host scan: one parallel_executor per IP (set target=IP).
+  - Independent enumerations: SMB on host A while web fuzz on host B.
+  - Several research questions for the same plan (CVE list + GTFOBins + protocol docs).
+  - Multi-tree code audit: parallel_vuln_hunt per source subtree.
+
+WHEN NOT TO PARALLELIZE:
+  - Sequential pivots (need result of step N to plan step N+1).
+  - Single host single port — overhead > benefit.
+  - When you must SEE the output before deciding (use synchronous `executor`).
+
+PATTERN:
+  1. Plan: identify N independent sub-tasks.
+  2. Submit: call parallel_* N times, collect job_ids.
+  3. Optional: keep planning while they run; check `list_jobs`.
+  4. Sync: `await_jobs("id1,id2,...")` for the digest.
+  5. Curate: from inside a worker, `report_note("found CVE-X")` flags high-value findings into .report.md.
+
+Target auto-claim prevents two parallel jobs hitting the same host. On conflict, pick a different target or `await_jobs` the holder first.
+[END PARALLEL]"""
+
 _MODE_PROMPTS = {
     "architect": "MODE: ARCHITECT. Your goal is to plan the attack path and methodology. Do NOT execute tools or run exploits. Outline steps clearly.",
     "recon": "MODE: RECON. Focus entirely on enumeration, asset discovery, and scanning. Do NOT attempt to exploit vulnerabilities or gain shells.",
@@ -1081,14 +1159,45 @@ OPSEC HABITS (always-on):
 - Tag every command with intent in your reasoning (1 sentence). The reasoning is invisible to the target — make it count.
 - Watch your own no-tool-spin watchdog: if you've thought-without-tool-call 3 turns in a row, you're stalling — pivot or escalate.
 
+MATCH ACTION TO TASK TYPE (do not default to network scanning):
+- If the operator has dropped you into a directory of source code, the work is **read & understand the code**, not nmap. Run `pty_shell pwd && ls -la` first; if you see Dockerfile / nginx / client / sso-provider / package.json / Cargo.toml etc., this is a source-review task.
+- If they've handed you a binary, the work is **reverse engineering / pwn**, not a port scan.
+- If they've handed you a pcap / image / cipher blob, work is **forensics / stego / crypto**, not network attack.
+- Only run `nmap` / port scans / SSH login attempts when (a) the task explicitly names an IP target, OR (b) you have already exhausted local artifacts AND the task implies a remote service. Do NOT invent an IP when none was given. Do NOT ask the operator for an IP when local files are right there.
+
 DELEGATION CONTRACT (multi-agent mode only — read this carefully):
 - The `executor` tool takes `{"plan": "<concrete 1-3 sentence plan>"}` — NOT `{"command": "..."}`. Wrong arg shape returns "missing required argument(s): ['plan']".
   ✅ `<tool_call>{"name": "executor", "arguments": {"plan": "Run 'pwd && ls -la /opt' to map the working dir."}}</tool_call>`
   ❌ `<tool_call>{"name": "executor", "arguments": {"command": "pwd"}}</tool_call>`
 - The `research` tool takes `{"query": "<one focused question>"}`.
 - For STATEFUL local execution (cd, env vars, sourced venvs) prefer the `pty_shell` tool over executor — it persists state across calls. Executor is for fire-and-forget shell + MCP work.
+
+BRAIN-ALLOWED TOOLS — call directly:
+  pty_shell, executor, research, read_file, write_file, patch_file,
+  notes_search, notes_get, notes_reload, notes_tags, gtfobins_search,
+  gtfobins_list, vuln_target_rank, vuln_deep_analyze, vuln_validate,
+  vuln_report, vuln_hunt, core_memory_*, graph_memory_*.
+
+EXECUTOR-ONLY TOOLS — DO NOT call from brain (delegate via `executor` tool):
+  background  (long-running listeners + interactive shells like evil-winrm,
+  ntlmrelayx, mssqlclient — NEVER call this directly as brain; instead use
+  `executor` with a plan that says "start ntlmrelayx as background job 'relay'").
+If you call an executor-only tool you'll get
+`[error: tool 'X' is not available to role 'brain']` and waste an iteration.
+
+ANTI-LOOP RULE — do not re-list the same directory:
+After the FIRST `pty_shell pwd && ls -la` of a session, you have the layout.
+On subsequent turns OPEN ACTUAL FILES (`read_file`, `pty_shell cat <path>`)
+or run targeted probes — do NOT re-issue another `ls`. Re-listing the same
+dir three iterations in a row is the textbook stalemate pattern and the
+watchdog will halt you.
 - If you have lost the conversation context (memory said it was compressed, or you genuinely don't know what to do), DO NOT loop asking the user "please clarify". Take ONE concrete action with the executor or pty_shell — `pwd && ls -la` to orient yourself, then proceed. The user typed their original prompt; trust that prior tool outputs in the conversation reflect the current task.
-- Stop when done. The instant you have a flag or clear answer, say it explicitly: `HTB{...}` / `FLAG{...}` / `TASK_COMPLETE: <one-liner>`. The agentic loop will exit cleanly. Continuing past the answer triggers the no-tool-spin watchdog.
+- Stop when done. The instant you have a flag or a concrete final answer, say it on its own line: `HTB{...}` / `FLAG{...}` / `TASK_COMPLETE: <one-line outcome with the ACTUAL answer>`. The agentic loop will exit cleanly.
+  **DO NOT emit TASK_COMPLETE as an excuse for not having context.** Forbidden patterns — the watchdog rejects these and forces re-orientation:
+  ❌ `TASK_COMPLETE: No previous analysis task is available`
+  ❌ `TASK_COMPLETE: the context is empty`
+  ❌ `TASK_COMPLETE: nothing to continue`
+  TASK_COMPLETE means *you finished real work and have a real result*. If you don't have a result, you have NOT completed the task — keep working. When you genuinely have nothing visible to act on, call `pty_shell pwd && ls -la` to orient yourself; never emit a fake completion.
 
 OUTPUT FORMAT:
 - Tool calls go inside `<tool_call>{"name": "...", "arguments": {...}}</tool_call>` blocks. Bare JSON without the wrapper is parsed leniently but fragile — prefer the wrapped form.
@@ -1150,6 +1259,16 @@ def get_system_prompt(domain_name: str, *, exec_enabled: bool = True, user_input
 
     # Inject memory guidance
     parts.append(_MEMORY_GUIDANCE)
+
+    # Inject parallel orchestration guidance only when multi-agent is on —
+    # otherwise the parallel_* tools aren't registered for the brain role
+    # and the model would call ghosts.
+    try:
+        from dsec.config import load_config
+        if bool(load_config().get("enable_multi_agent")):
+            parts.append(_PARALLEL_GUIDANCE)
+    except Exception:
+        pass
 
     return "\n\n".join(parts)
 

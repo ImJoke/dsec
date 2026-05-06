@@ -18,6 +18,7 @@ CHARS_PER_TOKEN = 4
 
 # Default context budgets per domain (in tokens)
 _DOMAIN_BUDGETS: Dict[str, int] = {
+    "auto": 128_000,
     "htb": 128_000,
     "bugbounty": 128_000,
     "ctf": 128_000,
@@ -26,28 +27,97 @@ _DOMAIN_BUDGETS: Dict[str, int] = {
     "programmer": 512_000,
 }
 
-# Model-specific overrides — these take precedence over domain budgets
-_MODEL_BUDGETS: Dict[str, int] = {
+# Static fallback table — only consulted when an Ollama `/api/show` probe
+# fails AND no disk cache entry is present. The probe (Ollama 0.5+ exposes
+# `model_info.<family>.context_length`) is authoritative; this table only
+# covers a handful of well-known models so we still have *some* sensible
+# budget when the user is offline or the endpoint refuses /api/show.
+# Values intentionally conservative — better to compress early than overrun.
+_MODEL_BUDGETS_FALLBACK: Dict[str, int] = {
+    # ── DeepSeek ──
     "deepseek-chat": 128_000,
     "deepseek-coder": 128_000,
     "deepseek-reasoner": 128_000,
     "deepseek-r1": 128_000,
+    "deepseek-r1:14b": 128_000,
+    "deepseek-r1:32b": 128_000,
+    "deepseek-r1:70b": 128_000,
     "deepseek-v3": 128_000,
-    "deepseek-v4": 1_000_000,
-    "deepseek-expert-r1": 128_000,
-    "deepseek-expert-r1-search": 128_000,
-    # Extended context models
+    "deepseek-v3.1:671b-cloud": 128_000,
+    "deepseek-v3.2:cloud": 128_000,
+    # DeepSeek V4: official 1,048,576-token ("1M agent context") release
+    # April 2026; Ollama /api/show confirms 1048576 for v4-pro:cloud.
+    "deepseek-v4": 1_048_576,
+    "deepseek-v4-pro:cloud": 1_048_576,
+    "deepseek-v4-flash:cloud": 1_048_576,
     "deepseek-v3-1m": 1_000_000,
     "deepseek-v4-1m": 1_000_000,
     "deepseek-r1-1m": 1_000_000,
+    "deepseek-expert-r1": 128_000,
+    "deepseek-expert-r1-search": 128_000,
+    # ── Qwen3 / Qwen3-Coder / Qwen2.5 ──
+    "qwen3:4b": 128_000,
+    "qwen3:8b": 128_000,
+    "qwen3:14b": 128_000,
+    "qwen3:32b": 128_000,
+    "qwen3-coder:14b": 256_000,
+    "qwen3-coder:30b": 256_000,
+    "qwen3-coder:480b-cloud": 256_000,
+    "qwen3-coder-next:cloud": 256_000,
+    "qwen3-next:80b-cloud": 256_000,
+    "qwen3-vl:235b-cloud": 256_000,
+    "qwen3.5:cloud": 128_000,
+    "qwen3.5:397b-cloud": 256_000,
+    "qwen3.6:27b": 128_000,
+    "qwen3.6:35b": 128_000,
+    "qwen2.5-coder:14b": 128_000,
+    "qwen2.5-coder:32b": 128_000,
+    "qwen-2.5-72b": 128_000,
+    # ── Kimi (Moonshot) — K2.6 tech blog: ctx=262144 ──
+    "kimi-k2:1t-cloud": 262_144,
+    "kimi-k2.5:cloud": 262_144,
+    "kimi-k2.6:cloud": 262_144,
+    "kimi-k2-thinking:cloud": 262_144,
+    # ── Zhipu / GLM — GLM-5.1 docs: 200K ctx, 128K max-out ──
+    "glm-4.6:cloud": 200_000,
+    "glm-4.7:cloud": 200_000,
+    "glm-4.7-flash": 200_000,
+    "glm-5:cloud": 200_000,
+    "glm-5.1:cloud": 200_000,
+    "gemma4:31b-cloud": 128_000,
+    # ── MiniMax M2 — Ollama /api/show confirms 204800 for m2.7 ──
+    "minimax-m2:cloud": 204_800,
+    "minimax-m2.1:cloud": 204_800,
+    "minimax-m2.5:cloud": 204_800,
+    "minimax-m2.7:cloud": 204_800,
+    # ── Google Gemini ──
+    "gemini-3-flash-preview:cloud": 1_000_000,
+    "gemini-2.5-pro": 1_000_000,
+    # ── GPT-OSS / OpenAI ──
+    "gpt-oss:20b": 128_000,
+    "gpt-oss:20b-cloud": 128_000,
+    "gpt-oss:120b": 128_000,
+    "gpt-oss:120b-cloud": 128_000,
     "gpt-4o": 128_000,
     "gpt-4-turbo": 128_000,
+    # ── Mistral / Devstral ──
+    "devstral-2:123b-cloud": 128_000,
+    "devstral-small-2": 128_000,
+    "devstral-small-2:24b-cloud": 128_000,
+    # ── Llama / Meta ──
+    "llama3-70b": 128_000,
+    "llama3.1:8b": 128_000,
+    "llama3.2:3b": 128_000,
+    "llama3.3": 128_000,
+    # ── Anthropic Claude ──
     "claude-3-opus": 200_000,
     "claude-3.5-sonnet": 200_000,
     "claude-4-opus": 200_000,
-    "gemini-2.5-pro": 1_000_000,
-    "llama3-70b": 128_000,
-    "qwen-2.5-72b": 128_000,
+    # ── NVIDIA Nemotron ──
+    "nemotron-3-super:cloud": 128_000,
+    "nemotron-mini:latest": 128_000,
+    # ── Magistral (Mistral-derived) ──
+    "magistral:24b": 128_000,
 }
 
 DEFAULT_BUDGET = 32_000
@@ -86,25 +156,45 @@ class ContextManager:
         print(cm.usage_summary())
     """
 
-    def __init__(self, domain: str = "htb", budget: Optional[int] = None, model: str = ""):
+    def __init__(self, domain: str = "auto", budget: Optional[int] = None, model: str = ""):
         self.domain = domain
-        # Priority: explicit budget > model budget > domain budget > default
+        # Priority:
+        #   1. explicit `budget` arg (caller knows best)
+        #   2. live probe via Ollama `/api/show` against the configured
+        #      brain pool (authoritative — beats any stale lookup table)
+        #   3. hardcoded model → ctx table (offline fallback)
+        #   4. domain default
+        #   5. DEFAULT_BUDGET (32K)
         if budget:
             self.budget = budget
-        elif model:
-            # Try exact match first, then prefix match
-            self.budget = _MODEL_BUDGETS.get(model, 0)
-            if not self.budget:
-                # Prefer longer (more specific) matches first so "deepseek-v3-1m"
-                # matches before "deepseek-v3".
-                for k, v in sorted(_MODEL_BUDGETS.items(), key=lambda x: -len(x[0])):
-                    if model.startswith(k) or k.startswith(model):
-                        self.budget = v
-                        break
+        else:
+            self.budget = 0
+            # Stage 2 — Ollama probe
+            try:
+                from dsec.providers.ollama_caps import best_effort_context_for_pool
+                from dsec.config import load_config
+                _cfg = load_config()
+                if _cfg.get("enable_multi_agent"):
+                    _roles = _cfg.get("roles") or {}
+                    _entry = _roles.get("brain") or {}
+                    _pkey = _entry.get("provider")
+                    if isinstance(_pkey, str) and _pkey.strip():
+                        probed = best_effort_context_for_pool(_pkey.strip(), fallback=0)
+                        if probed and probed > 0:
+                            self.budget = probed
+            except Exception:
+                pass
+            # Stage 3 — model→ctx table
+            if not self.budget and model:
+                self.budget = _MODEL_BUDGETS_FALLBACK.get(model, 0)
+                if not self.budget:
+                    for k, v in sorted(_MODEL_BUDGETS_FALLBACK.items(), key=lambda x: -len(x[0])):
+                        if model.startswith(k) or k.startswith(model):
+                            self.budget = v
+                            break
+            # Stage 4 — domain default
             if not self.budget:
                 self.budget = _DOMAIN_BUDGETS.get(domain, DEFAULT_BUDGET)
-        else:
-            self.budget = _DOMAIN_BUDGETS.get(domain, DEFAULT_BUDGET)
         self.turns: List[Turn] = []
         self.system_prompt_tokens: int = 0
         self._compressed_block: str = ""

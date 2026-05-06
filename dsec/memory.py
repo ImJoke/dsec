@@ -191,7 +191,7 @@ def _memory_record(mem_id: str, doc: str, meta: Dict[str, Any], *, similarity: f
         "id": mem_id,
         "content": doc,
         "session": meta.get("session", "unknown"),
-        "domain": meta.get("domain", "htb"),
+        "domain": meta.get("domain", "auto"),
         "type": meta.get("type", "finding"),
         "confidence": meta.get("confidence", "suspected"),
         "tags": [t for t in meta.get("tags", "").split(",") if t],
@@ -234,7 +234,7 @@ def store_memory(content: str, metadata: Dict[str, Any]) -> Optional[str]:
     mem_id = str(uuid.uuid4())
     meta = {
         "session": metadata.get("session", "unknown"),
-        "domain": metadata.get("domain", "htb"),
+        "domain": metadata.get("domain", "auto"),
         "type": metadata.get("type", "finding"),
         "confidence": metadata.get("confidence", "suspected"),
         "tags": ",".join(metadata.get("tags", [])),

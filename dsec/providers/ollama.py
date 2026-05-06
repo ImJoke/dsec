@@ -54,6 +54,24 @@ def ollama_chat_stream(
         "model": model,
         "messages": messages,
         "stream": True,
+        # `think: True` opts the request into Ollama's native reasoning
+        # surface (returned as `message.thinking`). Models that don't
+        # support thinking ignore the flag harmlessly. Combined with
+        # the legacy <think>...</think> path in split_think_blocks
+        # we now capture both styles.
+        "think": True,
+        # Loop-prevention. Some cloud frontier models (notably the
+        # smaller cloud variants and qwen3-coder branches) get stuck
+        # repeating the same sentence ~30 times when context is dense.
+        # repeat_penalty 1.18 + frequency_penalty 0.4 + presence_penalty
+        # 0.3 are conservative — strong enough to break loops, mild
+        # enough to keep instruction-following intact.
+        "options": {
+            "repeat_penalty": 1.18,
+            "frequency_penalty": 0.4,
+            "presence_penalty": 0.3,
+            "num_ctx": 32768,
+        },
     }
 
     headers: Dict[str, str] = {"Content-Type": "application/json"}
@@ -121,11 +139,23 @@ def ollama_chat_stream(
                         return
 
                     msg = data.get("message") or {}
+                    # Ollama 0.5+ surfaces reasoning models' chain-of-thought
+                    # in a separate `message.thinking` field. Stream it as
+                    # `type: thinking` so the formatter can render it as a
+                    # live "💭 thinking…" block — matches aider's
+                    # reasoning_tags.format_reasoning_content pattern.
+                    thinking = msg.get("thinking") or ""
+                    if thinking:
+                        yield {"type": "thinking", "text": thinking}
+
                     content = msg.get("content") or ""
                     if not content:
                         continue
 
                     content = normalize_tool_calls(content)
+                    # Some models still inline <think>...</think> in `content`
+                    # rather than using the dedicated `thinking` field —
+                    # split_think_blocks routes those to the thinking lane too.
                     chunks, in_think_block = split_think_blocks(content, in_think_block)
                     for kind, text in chunks:
                         if text:

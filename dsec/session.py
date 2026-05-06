@@ -133,7 +133,7 @@ def list_sessions() -> List[Dict[str, Any]]:
             sessions.append(
                 {
                     "name": data.get("name", f.stem),
-                    "domain": data.get("domain", "htb"),
+                    "domain": data.get("domain", "auto"),
                     "message_count": data.get("message_count", 0),
                     "model": data.get("model", ""),
                     "last_used": data.get("last_used", ""),

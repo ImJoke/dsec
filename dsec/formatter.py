@@ -8,6 +8,7 @@ OpenCode and Claude Code's split-view experience.
 """
 from datetime import datetime, timezone
 from typing import Any, Dict, Generator, List, Optional, Tuple
+import threading
 import time
 
 import sys
@@ -221,7 +222,7 @@ def _build_response_panel(
             except Exception:
                 body = Text(content)
     elif is_streaming:
-        body = Text("⏳ Generating response…", style="#888888")
+        body = Text("")  # sticky bottom shows the spinner — no duplicate indicator
     else:
         body = Text("")
 
@@ -271,24 +272,30 @@ def _build_inline_layout(
     domain_cfg = get_domain(domain)
     color = phase_color if phase_color else domain_cfg.get("color", "white")
 
-    # ---- Thinking Block (Collapsible style) ----
+    # ---- Thinking Block — aider/Claude-Code style live reasoning ─────────
     thinking_renderable = None
     if show_thinking and thinking:
-        lines = thinking.splitlines()
         word_count = len(thinking.split())
         elapsed_str = f"{elapsed:.1f}s"
+        # Spinner glyph for the header so the user can see the model is
+        # actively reasoning even when chunks are slow.
+        _CC_FRAMES = ("·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢")
+        spin = _CC_FRAMES[int(elapsed * 20) % len(_CC_FRAMES)] if is_streaming else "▼"
 
         if is_streaming and not content:
-            # Thinking still in progress – show compact live view of last line
-            last_line = lines[-1] if lines else ""
-            if len(last_line) > 80:
-                last_line = last_line[:80] + "…"
-            thinking_renderable = Text(f"💭 Thinking... {last_line}", style="italic #888888")
+            # Thinking in progress — show the live tail so the operator
+            # sees the model "talking to itself". Cap at last ~40 lines
+            # to avoid Live-frame jitter on a giant scratchpad.
+            tail_lines = thinking.splitlines()[-40:]
+            shown = "\n".join(tail_lines)
+            header = f"{spin} thinking…  ({word_count}w · {elapsed_str})\n"
+            thinking_renderable = Text(header + shown, style="italic #6c7086")
         elif not is_streaming:
-            # Stream finished – show collapsed summary
-            thinking_renderable = Text(f"▶ Thinking ({word_count} words, {elapsed_str})", style="italic #666666")
-        # else: content is streaming (thinking already done) – hide indicator,
-        # focus display on the arriving response text
+            # Stream finished — show full collapsed thinking, dim italic.
+            header = f"{spin} thought for {elapsed_str} ({word_count}w)\n"
+            thinking_renderable = Text(header + thinking, style="italic #6c7086")
+        # else: content streaming, thinking complete — hide the thinking
+        # block and focus display on the arriving response.
 
     # ---- Response Block ----
     if content:
@@ -303,7 +310,10 @@ def _build_inline_layout(
             except Exception:
                 body = Text(display_content)
     elif is_streaming and not thinking:
-        body = Text("⏳ Generating response…", style="#888888")
+        # Empty body during pre-token wait — the sticky bottom statusline
+        # already shows the spinner + elapsed time, so we don't need a
+        # second "Generating response…" indicator competing for attention.
+        body = Text("")
     else:
         body = Text("")
 
@@ -334,6 +344,112 @@ def _build_inline_layout(
 # ---------------------------------------------------------------------------
 # Main Stream Renderer (Split-Pane TUI)
 # ---------------------------------------------------------------------------
+
+def _build_sticky_bottom(domain: str, session_name: str, streaming: bool, elapsed: float) -> Any:
+    """Adaptive statusline + faux prompt for the Live-frame bottom row.
+
+    Width-aware: full bar when terminal ≥ 110 cols, slim bar (drops
+    cwd + brain model) when narrower, ultra-slim (status + session
+    only) when < 70 cols. Avoids wrap-induced double-rendering on
+    small terminals.
+    """
+    import os as _os
+    import shutil as _shutil
+    from rich.text import Text as _Text
+    try:
+        from dsec.providers import pool as _ppool
+    except Exception:
+        _ppool = None  # type: ignore
+
+    try:
+        term_w = _shutil.get_terminal_size((100, 24)).columns
+    except Exception:
+        term_w = 100
+
+    domain_cfg = get_domain(domain)
+    dom_color = domain_cfg.get("color", "white")
+    dom_label = domain_cfg.get("display", domain.upper())
+
+    home = _os.path.expanduser("~")
+    cwd = _os.getcwd()
+    if cwd.startswith(home):
+        cwd = "~" + cwd[len(home):]
+    _cwd_max = 26 if term_w >= 110 else 18
+    if len(cwd) > _cwd_max:
+        cwd = "…" + cwd[-(_cwd_max - 1):]
+
+    sess = (session_name or "?")[:22 if term_w >= 100 else 18]
+
+    brain_alive = brain_total = 0
+    brain_model = ""
+    if _ppool is not None:
+        bp = _ppool.get_pool("brain_pool") or {}
+        eps = list(bp.get("endpoints") or [])
+        brain_alive = sum(1 for e in eps if not _ppool._is_dead("brain_pool", e))
+        brain_total = len(eps)
+        brain_model = (bp.get("model") or "").split(":")[0]
+    brain_style = "#7dcfff" if brain_alive == brain_total else "bold #f7768e"
+
+    _CC_FRAMES = ["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"]
+    if streaming:
+        idx = int(elapsed * 20) % len(_CC_FRAMES)
+        spin = _CC_FRAMES[idx]
+        status = f"{spin} thinking {elapsed:5.1f}s"
+        status_style = "bold #7aa2f7"
+    else:
+        status = "✓ done"
+        status_style = "bold #9ece6a"
+
+    sep = "[#565f89]  •  [/#565f89]"
+    edge_l = "[#7aa2f7]▎[/#7aa2f7]"
+    edge_r = "[#7aa2f7]▕[/#7aa2f7]"
+
+    # Build candidate segments (markup, plain) so we can drop low-priority
+    # ones until the line fits the terminal width.
+    cands = [
+        (f"[bold {dom_color}]{dom_label}[/bold {dom_color}]", dom_label, 0),  # priority — always keep
+        (f"[{status_style}]{status}[/{status_style}]", status, 1),            # always keep
+        (f"[bold #bb9af7]◉ {sess}[/bold #bb9af7]", f"◉ {sess}", 2),
+        (f"[{brain_style}]🧠 {brain_alive}/{brain_total}[/{brain_style}]", f"🧠 {brain_alive}/{brain_total}", 3),
+        (f"[#9ece6a]{brain_model or 'default'}[/#9ece6a]", brain_model or "default", 4),
+        (f"[#c0caf5]{cwd}[/#c0caf5]", cwd, 5),
+    ]
+    # Sort kept set by priority so drops happen from the lowest-priority end.
+    cands.sort(key=lambda x: x[2])
+
+    edge_plain_len = 4  # "▎ " + " ▕"
+    sep_plain = "  •  "
+    sep_plain_narrow = " · "
+    use_narrow_sep = term_w < 90
+    sep_use = sep_plain_narrow if use_narrow_sep else sep_plain
+
+    def _fits(segs_in: list) -> bool:
+        plain = sum(len(s[1]) for s in segs_in) + len(sep_use) * max(0, len(segs_in) - 1) + edge_plain_len
+        return plain <= term_w
+
+    # Greedy: start with all, drop lowest priority (highest index) until fits.
+    kept = list(cands)
+    # Always keep priority 0 + 1 (domain + status).
+    while not _fits(kept) and len(kept) > 2:
+        kept.pop()  # drop the lowest-priority (last in sorted order)
+
+    sep_markup = sep if not use_narrow_sep else "[#565f89] · [/#565f89]"
+    line1 = f"{edge_l} " + sep_markup.join(s[0] for s in kept) + f" {edge_r}"
+
+    if streaming:
+        if term_w >= 80:
+            hint = "Ctrl-C to cancel · streaming response above…"
+        else:
+            hint = "Ctrl-C cancels"
+        line2 = (
+            f"[#7aa2f7]▎[/#7aa2f7] "
+            f"[#a9b1d6]{sess}[/#a9b1d6] "
+            f"[bold #7aa2f7]❯[/bold #7aa2f7] "
+            f"[#565f89]{hint}[/#565f89]"
+        )
+        return _Text.from_markup(line1 + "\n" + line2)
+    return _Text.from_markup(line1)
+
 
 def stream_response(
     generator: Generator,
@@ -372,17 +488,44 @@ def stream_response(
 
     def _render(streaming: bool) -> Any:
         elapsed = time.time() - start_time
-        return _build_inline_layout(
+        layout = _build_inline_layout(
             "".join(thinking_parts), "".join(content_parts),
             effective_domain, session_name, model, turn,
             compression_info, research_sources, memory_count,
             streaming, show_thinking, elapsed,
             phase_color=phase_color,
         )
+        # Sticky bottom statusline — visible ONLY during AI streaming
+        # (prompt_toolkit is dormant in the sync shell loop while we
+        # render, so there's no double-bar overlap). Gives the operator
+        # a live spinner + elapsed counter while the model is silent.
+        if streaming:
+            try:
+                bottom = _build_sticky_bottom(domain, session_name, streaming, elapsed)
+                if bottom is not None:
+                    from rich.console import Group as _Group
+                    return _Group(layout, bottom)
+            except Exception:
+                pass
+        return layout
 
     try:
-        with Live(console=console, refresh_per_second=12, transient=True) as live:
+        with Live(console=console, refresh_per_second=20, transient=True) as live:
             live.update(_render(True))  # show ⏳ immediately, before first API byte
+
+            # Background ticker — keeps the bottom-bar spinner moving + the
+            # elapsed-time counter ticking even when the model is silent
+            # (cloud cold-start typically gives 60-100s of zero chunks).
+            _tick_stop = threading.Event()
+            def _tick():
+                while not _tick_stop.wait(0.10):
+                    try:
+                        live.update(_render(True))
+                    except Exception:
+                        return
+            _tick_thread = threading.Thread(target=_tick, daemon=True)
+            _tick_thread.start()
+
             for chunk in generator:
                 ctype = chunk.get("type")
 
@@ -392,6 +535,34 @@ def stream_response(
 
                 elif ctype == "content":
                     content_parts.append(chunk["text"])
+                    # Loop-guard: if the model has emitted the SAME
+                    # non-trivial line 8+ times consecutively, it's
+                    # stuck in a generation loop (Ollama frontier models
+                    # do this when context is dense + temp is low).
+                    # Cancel the stream so the agent doesn't burn 60s
+                    # printing the same sentence 200 times.
+                    if len(content_parts) % 64 == 0:
+                        _joined = "".join(content_parts)
+                        _tail_lines = [ln for ln in _joined.splitlines()[-30:]
+                                       if len(ln.strip()) > 20]
+                        if len(_tail_lines) >= 12:
+                            from collections import Counter as _Ctr
+                            _common = _Ctr(_tail_lines).most_common(1)
+                            if _common and _common[0][1] >= 8:
+                                # 8+ repeats in last 30 lines → loop
+                                console.print(
+                                    "[bold yellow]⚠ Generation loop detected — "
+                                    "model emitted the same line "
+                                    f"{_common[0][1]}× in a row. "
+                                    "Cancelling stream to recover.[/bold yellow]"
+                                )
+                                _tick_stop.set()
+                                try:
+                                    generator.close()  # type: ignore[union-attr]
+                                except Exception:
+                                    pass
+                                cancelled = True
+                                break
                     live.update(_render(True))
 
                 elif ctype == "done":
@@ -411,6 +582,7 @@ def stream_response(
                         box=box.HEAVY,
                     )
                     live.update(error_panel)
+                    _tick_stop.set()
                     live.stop()
                     console.print(error_panel)
                     partial_thinking = "".join(thinking_parts)
@@ -419,12 +591,17 @@ def stream_response(
                         return partial_thinking or None, partial_content or None, conv_id
                     return None, None, None
 
+            _tick_stop.set()
     except KeyboardInterrupt:
         # Ctrl-C mid-stream: stop the generator, keep whatever arrived so far,
         # then re-raise so the caller's KeyboardInterrupt handler fires correctly.
         # Previously this swallowed the exception — callers got "✖ Response cancelled."
         # as content and kept looping, making Ctrl+C unable to stop the agentic loop.
         cancelled = True
+        try:
+            _tick_stop.set()  # type: ignore[name-defined]
+        except Exception:
+            pass
         try:
             generator.close()  # type: ignore[union-attr]
         except Exception:
@@ -717,6 +894,7 @@ def print_warning(msg: str) -> None:
 
 # Domain color palette — richer than single-word colors
 _DOMAIN_PALETTE = {
+    "auto":      {"primary": "#7aa2f7", "accent": "#bb9af7", "dim": "#1a1b26"},
     "htb":       {"primary": "#00ff41", "accent": "#39ff14", "dim": "#0a3d0a"},
     "bugbounty": {"primary": "#ffaf00", "accent": "#ffd700", "dim": "#4a3800"},
     "ctf":       {"primary": "#00d4ff", "accent": "#00bfff", "dim": "#003d4d"},
@@ -726,7 +904,7 @@ _DOMAIN_PALETTE = {
 }
 
 def _get_palette(domain: str) -> Dict[str, str]:
-    return _DOMAIN_PALETTE.get(domain, _DOMAIN_PALETTE["htb"])
+    return _DOMAIN_PALETTE.get(domain, _DOMAIN_PALETTE["auto"])
 
 
 def print_banner(domain: str, version: str = "v3.0.0 (Agentic)") -> None:

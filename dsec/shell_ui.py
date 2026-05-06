@@ -318,27 +318,45 @@ if _PROMPT_TOOLKIT_AVAILABLE:
 
 _DSEC_STYLE = None
 if _PROMPT_TOOLKIT_AVAILABLE:
+    # Calm dark palette — Tokyo-Night-ish. Bottom toolbar uses `noreverse`
+    # so per-segment colors render as fg-on-dark-bg rather than the
+    # inverted look that prompt_toolkit's default `bottom-toolbar` style
+    # (which is `reverse`) produces.
     _DSEC_STYLE = Style.from_dict({
         # prompt
-        "dsec":    "#00afff bold",
-        "session": "#888888",
-        "arrow":   "#555555",
-        # ghost-text suggestion (gray, like fish shell)
-        "auto-suggestion": "#555555 italic",
-        # completion dropdown
-        "completion-menu.completion":         "bg:#1c1c1c #aaaaaa",
-        "completion-menu.completion.current": "bg:#005f87 #ffffff bold",
-        "completion-menu.meta.completion":    "bg:#1c1c1c #666666",
-        "completion-menu.meta.current":       "bg:#005f87 #aaaaaa",
-        # multi-line continuation indicator
-        "continuation": "#555555",
-        # toolbar
-        "bottom-toolbar":      "bg:#1c1c1c #555555",
-        "bottom-toolbar.text": "bg:#1c1c1c #888888",
-        "tb.session": "#00afff",
-        "tb.domain":  "#ffaf00",
-        "tb.model":   "#5faf5f",
-        "tb.sep":     "#333333",
+        "dsec":     "#7aa2f7 bold",
+        "session":  "#a9b1d6",
+        "session-dim": "#565f89",
+        "arrow":    "#7aa2f7 bold",
+        "bar":      "#7aa2f7",
+
+        "auto-suggestion": "#3b4261 italic",
+
+        "completion-menu":                       "bg:#1a1b26",
+        "completion-menu.completion":            "bg:#1a1b26 #c0caf5",
+        "completion-menu.completion.current":    "bg:#3d59a1 #ffffff bold",
+        "completion-menu.meta.completion":       "bg:#1a1b26 #565f89",
+        "completion-menu.meta.current":          "bg:#3d59a1 #a9b1d6",
+
+        "continuation": "#414868",
+
+        # Bottom toolbar — `noreverse` cancels prompt_toolkit's default
+        # reverse-video, so segment fg colors stay on the dark bg.
+        "bottom-toolbar":      "noreverse bg:#1a1b26 #a9b1d6",
+        "bottom-toolbar.text": "noreverse bg:#1a1b26 #a9b1d6",
+
+        # Segment fg colors only — bg inherited from bottom-toolbar.
+        "tb.bar":       "noreverse #7aa2f7 bold",
+        "tb.sep":       "noreverse #414868",
+        "tb.domain":    "noreverse #f7768e bold",
+        "tb.model":     "noreverse #9ece6a",
+        "tb.brain":     "noreverse #7dcfff",
+        "tb.brain-low": "noreverse #f7768e bold",
+        "tb.auto-on":   "noreverse #9ece6a bold",
+        "tb.auto-off":  "noreverse #565f89",
+        "tb.cwd":       "noreverse #c0caf5",
+        "tb.session":   "noreverse #bb9af7 bold",
+        "tb.dim":       "noreverse #565f89",
     })
 
 
@@ -416,9 +434,10 @@ def build_prompt_session(state: Dict[str, Any]) -> Optional["PromptSession"]:  #
     def _force_submit(event: Any) -> None:  # noqa: ANN001
         event.current_buffer.validate_and_handle()
 
-    # bottom_toolbar = single-line, static-height statusline. Single-line with
-    # multiline=False resizes cleanly; the prior issue was multi-line + toolbar
-    # racing on SIGWINCH, which we still avoid.
+    # bottom_toolbar = single-line, static-height statusline. Segment style:
+    #   ▍ DOMAIN · model · 🧠 8/8 · auto:ON · ~/cwd · ◉ session ▍
+    # Each segment self-styled; separators dim so the eye lands on accents.
+    # Single-line with multiline=False resizes cleanly.
     def _bottom_toolbar() -> "HTML":  # type: ignore[name-defined]
         try:
             import os as _os
@@ -429,33 +448,50 @@ def build_prompt_session(state: Dict[str, Any]) -> Optional["PromptSession"]:  #
                       or state.get("domain_override")
                       or "auto")
             dom_cfg = _get_domain(domain) if domain != "auto" else {}
-            dom_color = dom_cfg.get("color", "white")
             dom_label = dom_cfg.get("display", domain.upper())
 
-            model = state.get("model_override") or "default"
+            model_short = state.get("model_override") or "default"
 
             brain_pool = _ppool.get_pool("brain_pool") or {}
             brain_eps = list(brain_pool.get("endpoints") or [])
             brain_alive = sum(1 for e in brain_eps if not _ppool._is_dead("brain_pool", e))
             brain_total = len(brain_eps)
-            brain_model = brain_pool.get("model", "")
+            brain_model = brain_pool.get("model", "") or model_short
+            brain_cls = "tb.brain" if brain_alive == brain_total else "tb.brain-low"
 
-            cwd = _os.getcwd().replace(_os.path.expanduser("~"), "~", 1)
+            home = _os.path.expanduser("~")
+            cwd = _os.getcwd()
+            if cwd.startswith(home):
+                cwd = "~" + cwd[len(home):]
+            # Truncate long cwd so the toolbar doesn't push other segments off
+            if len(cwd) > 32:
+                cwd = "…" + cwd[-31:]
+
             sess = state.get("session_name", "?")
-            ae = "ON" if state.get("auto_exec") else "OFF"
-            ae_color = "ansigreen" if state.get("auto_exec") else "ansired"
+            if len(sess) > 24:
+                sess = sess[:21] + "…"
+
+            ae = state.get("auto_exec")
+            ae_text = " auto:ON " if ae else " auto:OFF"
+            ae_cls = "tb.auto-on" if ae else "tb.auto-off"
+
+            sep = '<tb.sep>  •  </tb.sep>'
+            edge_l = '<tb.bar>▎</tb.bar>'
+            edge_r = '<tb.bar>▕</tb.bar>'
+            short_brain_model = brain_model.split(":")[0] if brain_model else ""
 
             return HTML(
-                f' <{dom_color}>{dom_label}</{dom_color}>'
-                f' │ <ansicyan>{model}</ansicyan>'
-                f' │ <ansiblue>brain={brain_alive}/{brain_total}</ansiblue>'
-                f' <ansiyellow>{brain_model}</ansiyellow>'
-                f' │ <{ae_color}>auto={ae}</{ae_color}>'
-                f' │ <ansiwhite>{cwd}</ansiwhite>'
-                f' │ <session>{sess}</session> '
+                f'{edge_l} '
+                f'<tb.domain>{dom_label}</tb.domain>'
+                f'{sep}<tb.model>{short_brain_model or model_short}</tb.model>'
+                f'{sep}<{brain_cls}>🧠 {brain_alive}/{brain_total}</{brain_cls}>'
+                f'{sep}<{ae_cls}>{ae_text.strip()}</{ae_cls}>'
+                f'{sep}<tb.session>◉ {sess}</tb.session>'
+                f'{sep}<tb.cwd>{cwd}</tb.cwd>'
+                f' {edge_r}'
             )
         except Exception:
-            return HTML(' dsec ')
+            return HTML(' <tb.bar>▎</tb.bar> dsec <tb.bar>▕</tb.bar> ')
 
     return PromptSession(
         completer=DsecCompleter(),
@@ -478,10 +514,13 @@ def prompt_available() -> bool:
 
 def format_prompt(session_name: str, domain: str = "htb") -> "HTML | str":  # type: ignore[return]
     if _PROMPT_TOOLKIT_AVAILABLE:
-        from dsec.domain import get_domain
-        color = get_domain(domain).get("color", "white")
+        # Minimal two-glyph prompt: │ <session> ❯  — left-bar accent +
+        # session name (soft fg) + colored arrow. No domain noise here;
+        # the domain badge lives in the bottom toolbar so the input line
+        # stays calm and readable.
         return HTML(
-            f"<session>{session_name}</session>"
-            f' <style fg="{color}">❯</style> '
+            "<bar>▎</bar>"
+            f" <session>{session_name}</session>"
+            " <arrow>❯</arrow> "
         )
-    return f"{session_name} ❯ "
+    return f"▎ {session_name} ❯ "
